@@ -3,7 +3,7 @@
 **Log-based Asynchronous Networked Compute Engine**
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 > A high-performance, non-blocking stream engine designed to replace Kafka-heavy workloads with zero-copy efficiency and deterministic memory management.
 
@@ -272,7 +272,7 @@ pre-commit run --all-files
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+Apache License 2.0 - see [LICENSE](LICENSE) for details.
 
 ---
 
@@ -286,6 +286,6 @@ LANCE draws inspiration from:
 
 ---
 
-<p align="center">
+<p style="text-align: center;">
   <strong>Built with 🦀 Rust for deterministic performance</strong>
 </p>

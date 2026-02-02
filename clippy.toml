@@ -1,0 +1,29 @@
+# Clippy configuration for LANCE
+# https://doc.rust-lang.org/clippy/configuration.html
+
+# Cognitive complexity threshold for functions
+cognitive-complexity-threshold = 25
+
+# Maximum lines in a function
+too-many-lines-threshold = 100
+
+# Maximum number of arguments
+too-many-arguments-threshold = 7
+
+# Minimum size for type complexity warning
+type-complexity-threshold = 250
+
+# MSRV - Minimum Supported Rust Version
+msrv = "1.75.0"
+
+# Allow certain patterns we use intentionally
+allowed-duplicate-crates = []
+
+# Large types that are OK to pass by value
+pass-by-value-size-limit = 256
+
+# Disallowed methods (enforced via deny in CI)
+# disallowed-methods = []
+
+# Disallowed types (enforced via deny in CI)
+# disallowed-types = []

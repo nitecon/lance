@@ -1,0 +1,298 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g., v1.0.0)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  DOCKERHUB_IMAGE: nitecon/lance
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # Run tests before building release
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features --workspace
+
+  # Build for Linux x86_64
+  build-linux-x86_64:
+    name: Build Linux x86_64
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+        
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/lance dist/
+          cd dist
+          tar -czvf lance-linux-x86_64.tar.gz lance
+          rm lance
+          
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lance-linux-x86_64
+          path: dist/lance-linux-x86_64.tar.gz
+
+  # Build for Linux ARM64
+  build-linux-aarch64:
+    name: Build Linux ARM64
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      
+      - name: Install cross-compilation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          
+      - name: Build
+        run: |
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          cargo build --release --target aarch64-unknown-linux-gnu
+        
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-gnu/release/lance dist/
+          cd dist
+          tar -czvf lance-linux-aarch64.tar.gz lance
+          rm lance
+          
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lance-linux-aarch64
+          path: dist/lance-linux-aarch64.tar.gz
+
+  # Build for macOS x86_64
+  build-macos-x86_64:
+    name: Build macOS x86_64
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      
+      - name: Build
+        run: cargo build --release --target x86_64-apple-darwin
+        
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/x86_64-apple-darwin/release/lance dist/
+          cd dist
+          tar -czvf lance-macos-x86_64.tar.gz lance
+          rm lance
+          
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lance-macos-x86_64
+          path: dist/lance-macos-x86_64.tar.gz
+
+  # Build for macOS ARM64 (Apple Silicon)
+  build-macos-aarch64:
+    name: Build macOS ARM64
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      
+      - name: Build
+        run: cargo build --release --target aarch64-apple-darwin
+        
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/lance dist/
+          cd dist
+          tar -czvf lance-macos-aarch64.tar.gz lance
+          rm lance
+          
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lance-macos-aarch64
+          path: dist/lance-macos-aarch64.tar.gz
+
+  # Build Docker image and push to Docker Hub + GHCR
+  build-docker:
+    name: Build Docker Image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine Docker tags
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+            VERSION=${TAG_NAME#v}
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+            echo "is_tag=true" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "is_tag=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.DOCKERHUB_IMAGE }}
+            ${{ env.GHCR_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ steps.tag.outputs.is_tag == 'true' }}
+            type=sha,enable=${{ steps.tag.outputs.is_tag != 'true' }}
+            
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=${{ steps.tag.outputs.tag_name || github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+  # Create GitHub Release
+  release:
+    name: Create Release
+    needs:
+      - build-linux-x86_64
+      - build-linux-aarch64
+      - build-macos-x86_64
+      - build-macos-aarch64
+      - build-docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          cp artifacts/lance-linux-x86_64/lance-linux-x86_64.tar.gz release/
+          cp artifacts/lance-linux-aarch64/lance-linux-aarch64.tar.gz release/
+          cp artifacts/lance-macos-x86_64/lance-macos-x86_64.tar.gz release/
+          cp artifacts/lance-macos-aarch64/lance-macos-aarch64.tar.gz release/
+          
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: LANCE ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+          generate_release_notes: true
+          files: |
+            release/lance-linux-x86_64.tar.gz
+            release/lance-linux-aarch64.tar.gz
+            release/lance-macos-x86_64.tar.gz
+            release/lance-macos-aarch64.tar.gz
+            release/SHA256SUMS.txt
+          body: |
+            ## LANCE ${{ github.ref_name }}
+            
+            High-performance, non-blocking stream engine for 100Gbps ingestion.
+            
+            ### Downloads
+            
+            | Platform | Architecture | File |
+            |----------|--------------|------|
+            | Linux | x86_64 | `lance-linux-x86_64.tar.gz` |
+            | Linux | ARM64 | `lance-linux-aarch64.tar.gz` |
+            | macOS | Intel | `lance-macos-x86_64.tar.gz` |
+            | macOS | Apple Silicon | `lance-macos-aarch64.tar.gz` |
+            
+            ### Docker
+            
+            ```bash
+            # Docker Hub
+            docker pull nitecon/lance:${{ github.ref_name }}
+            
+            # GitHub Container Registry
+            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ```
+            
+            ### Verify Checksums
+            
+            ```bash
+            sha256sum -c SHA256SUMS.txt
+            ```
+            
+            ### Requirements
+            
+            - **Linux**: Kernel 5.15+ for io_uring support
+            - **macOS**: macOS 11+
+            
+            See [documentation](https://github.com/${{ github.repository }}/blob/main/docs/Architecture.md) for deployment guide.

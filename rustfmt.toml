@@ -1,0 +1,45 @@
+# Rustfmt configuration for LANCE
+# https://rust-lang.github.io/rustfmt/
+
+edition = "2021"
+
+# Line width
+max_width = 100
+use_small_heuristics = "Default"
+
+# Imports
+imports_granularity = "Module"
+group_imports = "StdExternalCrate"
+reorder_imports = true
+reorder_modules = true
+
+# Comments
+wrap_comments = true
+comment_width = 100
+normalize_comments = true
+normalize_doc_attributes = true
+
+# Formatting
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
+
+# Match arms
+match_arm_blocks = true
+match_block_trailing_comma = true
+
+# Functions
+fn_params_layout = "Tall"
+
+# Structs
+struct_lit_single_line = true
+
+# Chains
+chain_width = 60
+
+# Control flow
+control_brace_style = "AlwaysSameLine"
+
+# Macros
+format_macro_matchers = true
+format_macro_bodies = true

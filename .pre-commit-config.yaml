@@ -1,0 +1,88 @@
+# Pre-commit hooks for LANCE
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+# https://pre-commit.com
+
+repos:
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+
+  # Rust formatting
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        description: Format Rust code with rustfmt
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-check
+        name: cargo check
+        description: Check Rust code compiles
+        entry: cargo check --all-targets --all-features
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        description: Lint Rust code with Clippy
+        entry: cargo clippy --all-targets --all-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # Mechanical integrity checks from CodingGuidelines
+      - id: no-mutex-hot-path
+        name: No Mutex on hot path
+        description: Prevent Mutex usage in hot path crates
+        entry: bash -c 'if grep -rE "std::sync::Mutex|parking_lot::Mutex" --include="*.rs" lnc-core lnc-io 2>/dev/null; then echo "❌ Mutex found in hot path crates"; exit 1; fi'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: no-to-vec-network
+        name: No to_vec() in network code
+        description: Prevent to_vec() allocation in network path
+        entry: bash -c 'if grep -rE "\.to_vec\(\)" --include="*.rs" lnc-network 2>/dev/null; then echo "❌ to_vec() found in network code"; exit 1; fi'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: no-dynamic-dispatch
+        name: No dynamic dispatch on data plane
+        description: Prevent Box<dyn> and &dyn in data plane
+        entry: bash -c 'if grep -rE "Box<dyn|&dyn" --include="*.rs" lnc-core lnc-io lnc-network 2>/dev/null; then echo "❌ Dynamic dispatch found in data plane"; exit 1; fi'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+  # Commit message format (Conventional Commits)
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.1.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: [feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert, deps]
+
+# CI configuration
+ci:
+  autofix_commit_msg: "style: auto-fix from pre-commit hooks"
+  autofix_prs: true
+  autoupdate_branch: "main"
+  autoupdate_commit_msg: "chore: update pre-commit hooks"
+  autoupdate_schedule: monthly

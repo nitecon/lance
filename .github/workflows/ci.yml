@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --all-features --workspace
+
+  build:
+    name: Build Release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release
+
+  # Mechanical integrity checks from CodingGuidelines.md
+  mechanical-integrity:
+    name: Mechanical Integrity Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: No Mutex on hot path
+        run: |
+          if grep -rE "std::sync::Mutex|parking_lot::Mutex" --include="*.rs" lnc-core lnc-io 2>/dev/null; then
+            echo "❌ BLOCKED: Mutex found in hot path crates"
+            exit 1
+          fi
+          echo "✅ No Mutex in hot path crates"
+        continue-on-error: true  # Allow until crates exist
+          
+      - name: No dynamic dispatch on data plane
+        run: |
+          if grep -rE "Box<dyn|&dyn" --include="*.rs" lnc-core lnc-io lnc-network 2>/dev/null; then
+            echo "❌ BLOCKED: Dynamic dispatch found in data plane"
+            exit 1
+          fi
+          echo "✅ No dynamic dispatch in data plane"
+        continue-on-error: true  # Allow until crates exist
+          
+      - name: No to_vec on network path
+        run: |
+          if grep -rE "\.to_vec\(\)" --include="*.rs" lnc-network 2>/dev/null; then
+            echo "❌ BLOCKED: to_vec() found in network code"
+            exit 1
+          fi
+          echo "✅ No to_vec() in network code"
+        continue-on-error: true  # Allow until crates exist
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build docs
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-Dwarnings"

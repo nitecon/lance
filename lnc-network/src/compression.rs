@@ -296,6 +296,7 @@ pub fn parse_compression_header(data: &[u8]) -> Option<(CompressionAlgorithm, us
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::len_zero)]
 mod tests {
     use super::*;
 

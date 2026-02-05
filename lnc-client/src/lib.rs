@@ -40,4 +40,5 @@ pub use standalone::{StandaloneConfig, StandaloneConsumer, StandaloneConsumerBui
 pub use tls::TlsClientConfig;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests;

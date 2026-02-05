@@ -386,6 +386,7 @@ pub fn encode_record_with_type(type_byte: u8, payload: &[u8]) -> Bytes {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

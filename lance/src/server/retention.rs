@@ -308,6 +308,7 @@ fn collect_segments(topic_dir: &Path) -> Result<Vec<SegmentInfo>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::fs::File;

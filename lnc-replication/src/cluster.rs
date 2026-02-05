@@ -1064,6 +1064,7 @@ async fn handle_peer_connection(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

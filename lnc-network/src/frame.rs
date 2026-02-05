@@ -359,6 +359,7 @@ fn determine_frame_type(header: &LwpHeader) -> FrameType {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -288,6 +288,7 @@ fn process_request_sync(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::identity_op)]
 mod tests {
     use super::*;
 

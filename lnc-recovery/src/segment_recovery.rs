@@ -177,6 +177,7 @@ pub fn find_segments_needing_recovery(data_dir: &Path) -> Result<Vec<std::path::
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::io::Write;

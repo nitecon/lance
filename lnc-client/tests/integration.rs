@@ -812,7 +812,7 @@ async fn test_consumer_offset_store_persistence() {
                 .unwrap();
 
         // Poll to ensure consumer is ready
-        let _ = consumer.poll();
+        drop(consumer.poll());
         println!("2. Consumer created and polled");
 
         // Seek to offset 10 and commit

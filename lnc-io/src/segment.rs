@@ -462,6 +462,7 @@ impl<'a> BorrowedSlice<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -839,6 +840,7 @@ fn parse_segment_name(name: &str) -> (u64, u64) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod compaction_tests {
     use super::*;
 

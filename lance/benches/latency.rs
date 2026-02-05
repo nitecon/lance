@@ -6,7 +6,6 @@
 //! - P999 < 50μs
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use std::time::Instant;
 
 /// Simulate ingestion batch processing
 fn process_batch(data: &[u8]) -> u64 {
@@ -64,6 +63,7 @@ fn bench_buffer_slice(c: &mut Criterion) {
 
 /// Manual latency assertion test (can be run as unit test)
 #[cfg(test)]
+#[allow(dead_code, unexpected_cfgs, unused_imports)]
 mod latency_gates {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -154,6 +154,7 @@ pub fn rebuild_missing_indexes(data_dir: &Path) -> Result<Vec<RebuildResult>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::io::Write;

@@ -1064,6 +1064,7 @@ impl std::fmt::Debug for GroupedConsumer {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

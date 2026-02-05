@@ -61,6 +61,7 @@ pub fn probe_io_uring() -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -1,5 +1,3 @@
-#![cfg(target_os = "linux")]
-
 use crate::backend::{IoBackend, IoBackendType};
 use io_uring::{IoUring, opcode, types};
 use lnc_core::{LanceError, Result};
@@ -52,10 +50,7 @@ impl IoUringBackend {
         self.ring.submit_and_wait(1)?;
 
         let cqe = self.ring.completion().next().ok_or_else(|| {
-            LanceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "No completion entry",
-            ))
+            LanceError::Io(std::io::Error::other("No completion entry"))
         })?;
 
         let result = cqe.result();
@@ -78,7 +73,7 @@ impl IoBackend for IoUringBackend {
         // until the operation completes (we wait synchronously)
         unsafe {
             self.ring.submission().push(&write_op).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 
@@ -99,7 +94,7 @@ impl IoBackend for IoUringBackend {
         // until the operation completes (we wait synchronously)
         unsafe {
             self.ring.submission().push(&read_op).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 
@@ -118,7 +113,7 @@ impl IoBackend for IoUringBackend {
         // SAFETY: The submission queue entry is valid
         unsafe {
             self.ring.submission().push(&fsync_op).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 
@@ -250,7 +245,7 @@ impl IoUringPoller {
         // SAFETY: Caller must ensure data remains valid until completion is harvested
         unsafe {
             self.ring.submission().push(&write_op).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 
@@ -275,7 +270,7 @@ impl IoUringPoller {
         // SAFETY: Caller must ensure buffer remains valid until completion
         unsafe {
             self.ring.submission().push(&read_op).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 
@@ -318,7 +313,7 @@ impl IoUringPoller {
         // SAFETY: Caller must ensure buffer is registered and remains valid
         unsafe {
             self.ring.submission().push(&read_op).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 
@@ -348,7 +343,7 @@ impl IoUringPoller {
         // SAFETY: Caller must ensure buffer is registered and remains valid
         unsafe {
             self.ring.submission().push(&write_op).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 
@@ -551,10 +546,7 @@ impl RegisteredBufferPool {
         // for the lifetime of the io_uring instance
         unsafe {
             ring.submitter().register_buffers(&iovecs).map_err(|e| {
-                LanceError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to register buffers: {}", e),
-                ))
+                LanceError::Io(std::io::Error::other(format!("Failed to register buffers: {}", e)))
             })?;
         }
 
@@ -621,6 +613,7 @@ impl RegisteredBufferPool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1065,7 +1058,7 @@ impl ZeroCopySender {
         // SAFETY: Caller ensures data remains valid until completion
         unsafe {
             self.ring.submission().push(&send_op).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 
@@ -1083,7 +1076,7 @@ impl ZeroCopySender {
         // SAFETY: Caller ensures data remains valid until completion
         unsafe {
             self.ring.submission().push(&send_op).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 
@@ -1107,7 +1100,7 @@ impl ZeroCopySender {
         // SAFETY: Caller ensures msghdr and referenced buffers remain valid
         unsafe {
             self.ring.submission().push(&sendmsg_op).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 
@@ -1183,14 +1176,14 @@ pub fn probe_splice() -> SpliceSupport {
     match IoUring::new(8) {
         Ok(ring) => {
             let mut probe = io_uring::Probe::new();
-            if ring.submitter().register_probe(&mut probe).is_ok() {
-                if probe.is_supported(opcode::Splice::CODE) {
-                    tracing::info!(
-                        target: "lance::io",
-                        "IORING_OP_SPLICE enabled"
-                    );
-                    return SpliceSupport::Supported;
-                }
+            if ring.submitter().register_probe(&mut probe).is_ok()
+                && probe.is_supported(opcode::Splice::CODE)
+            {
+                tracing::info!(
+                    target: "lance::io",
+                    "IORING_OP_SPLICE enabled"
+                );
+                return SpliceSupport::Supported;
             }
             tracing::info!(
                 target: "lance::io",
@@ -1304,14 +1297,14 @@ impl SpliceForwarder {
             -1,
             len,
         )
-        .flags(libc::SPLICE_F_MOVE as u32)
+        .flags(libc::SPLICE_F_MOVE)
         .build()
         .user_data(user_data);
 
         // SAFETY: File descriptors must be valid
         unsafe {
             self.ring.submission().push(&splice_op).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 
@@ -1330,14 +1323,14 @@ impl SpliceForwarder {
     ) -> Result<()> {
         let splice_op =
             opcode::Splice::new(types::Fd(pipe.read_fd()), -1, types::Fd(dest_fd), -1, len)
-                .flags(libc::SPLICE_F_MOVE as u32)
+                .flags(libc::SPLICE_F_MOVE)
                 .build()
                 .user_data(user_data);
 
         // SAFETY: File descriptors must be valid
         unsafe {
             self.ring.submission().push(&splice_op).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 
@@ -1370,7 +1363,7 @@ impl SpliceForwarder {
             -1,
             len,
         )
-        .flags(libc::SPLICE_F_MOVE as u32)
+        .flags(libc::SPLICE_F_MOVE)
         .build()
         .flags(io_uring::squeue::Flags::IO_LINK) // Link to next operation
         .user_data(user_data);
@@ -1378,17 +1371,17 @@ impl SpliceForwarder {
         // Second splice: pipe → destination
         let splice_out =
             opcode::Splice::new(types::Fd(pipe.read_fd()), -1, types::Fd(dest_fd), -1, len)
-                .flags(libc::SPLICE_F_MOVE as u32)
+                .flags(libc::SPLICE_F_MOVE)
                 .build()
                 .user_data(user_data | 0x8000_0000_0000_0000); // Mark as second part
 
         // SAFETY: File descriptors must be valid
         unsafe {
             self.ring.submission().push(&splice_in).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
             self.ring.submission().push(&splice_out).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 
@@ -1554,7 +1547,7 @@ impl TeeForwarder {
         // SAFETY: File descriptors must be valid pipes
         unsafe {
             self.ring.submission().push(&tee_op).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 
@@ -1582,6 +1575,7 @@ impl TeeForwarder {
     /// * `pipe2` - Secondary pipe for local processing path
     /// * `len` - Number of bytes to forward
     /// * `user_data` - Base user data (operations use user_data | 0..3)
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_forward_with_tee(
         &mut self,
         source_fd: RawFd,
@@ -1600,7 +1594,7 @@ impl TeeForwarder {
             -1,
             len,
         )
-        .flags(libc::SPLICE_F_MOVE as u32)
+        .flags(libc::SPLICE_F_MOVE)
         .build()
         .flags(io_uring::squeue::Flags::IO_LINK)
         .user_data(user_data);
@@ -1619,7 +1613,7 @@ impl TeeForwarder {
             -1,
             len,
         )
-        .flags(libc::SPLICE_F_MOVE as u32)
+        .flags(libc::SPLICE_F_MOVE)
         .build()
         .flags(io_uring::squeue::Flags::IO_LINK)
         .user_data(user_data | 0x2000_0000_0000_0000);
@@ -1627,23 +1621,23 @@ impl TeeForwarder {
         // Operation 4: Splice from pipe2 → local processor (final)
         let splice_local =
             opcode::Splice::new(types::Fd(pipe2.read_fd()), -1, types::Fd(local_fd), -1, len)
-                .flags(libc::SPLICE_F_MOVE as u32)
+                .flags(libc::SPLICE_F_MOVE)
                 .build()
                 .user_data(user_data | 0x3000_0000_0000_0000);
 
         // SAFETY: File descriptors must be valid
         unsafe {
             self.ring.submission().push(&splice_in).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
             self.ring.submission().push(&tee_op).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
             self.ring.submission().push(&splice_leader).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
             self.ring.submission().push(&splice_local).map_err(|_| {
-                LanceError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))
+                LanceError::Io(std::io::Error::other("SQ full"))
             })?;
         }
 

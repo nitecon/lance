@@ -49,6 +49,7 @@ impl std::fmt::Display for FencingToken {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -59,6 +59,7 @@ impl std::str::FromStr for ReplicationMode {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

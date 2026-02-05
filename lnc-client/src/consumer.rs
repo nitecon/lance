@@ -762,6 +762,7 @@ impl std::fmt::Debug for StreamingConsumer {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

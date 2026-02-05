@@ -642,6 +642,7 @@ fn find_active_segment(topic_dir: &std::path::Path) -> Option<std::path::PathBuf
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use lnc_network::ControlCommand;
 

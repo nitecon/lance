@@ -663,6 +663,7 @@ impl std::fmt::Debug for Producer {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

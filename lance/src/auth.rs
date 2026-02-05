@@ -200,6 +200,7 @@ impl std::fmt::Display for AuthError {
 impl std::error::Error for AuthError {}
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -221,6 +221,7 @@ pub fn read_segment_zero_copy(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

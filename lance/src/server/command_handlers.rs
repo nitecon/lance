@@ -507,6 +507,7 @@ pub fn handle_invalid_client_command() -> Frame {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

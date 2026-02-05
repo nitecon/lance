@@ -173,6 +173,7 @@ pub fn create_replication_channel(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

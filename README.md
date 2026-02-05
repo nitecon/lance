@@ -4,6 +4,8 @@
 
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Docker](https://img.shields.io/docker/v/nitecon/lance?label=docker&logo=docker)](https://hub.docker.com/r/nitecon/lance)
+[![Docker Pulls](https://img.shields.io/docker/pulls/nitecon/lance)](https://hub.docker.com/r/nitecon/lance)
 
 > A high-performance, non-blocking stream engine designed to replace Kafka-heavy workloads with zero-copy efficiency and deterministic memory management.
 
@@ -428,11 +430,13 @@ cargo add lnc-client
 
 ## Documentation
 
-| Document | Description |
-|----------|-------------|
-| [Architecture](docs/Architecture.md) | Deep-dive into system design |
-| [Coding Guidelines](docs/CodingGuidelines.md) | Engineering standards and patterns |
-| [Operations](docs/Operations.md) | Deployment and monitoring guide |
+| Document                                          | Description                             |
+|---------------------------------------------------|-----------------------------------------|
+| [Architecture](docs/Architecture.md)              | Deep-dive into system design            |
+| [Coding Guidelines](docs/CodingGuidelines.md)     | Engineering standards and requirements  |
+| [LWP Specification](docs/LWP-Specification.md)    | Lance Wire Protocol (LWP) Specification |
+| [Monitoring](docs/Monitoring.md)                  | Monitoring and Observability            |
+| [Recovery](docs/Recoveryprocedures.md) | Recovery Procedures                     |
 
 ---
 

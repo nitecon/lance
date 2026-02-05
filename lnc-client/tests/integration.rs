@@ -807,13 +807,9 @@ async fn test_consumer_offset_store_persistence() {
         let client2 = LanceClient::connect(test_config()).await.unwrap();
         let offset_store = LockFileOffsetStore::open(offset_dir, consumer_name).unwrap();
         let config = ConsumerConfig::new(topic_id);
-        let mut consumer = Consumer::with_offset_store(
-            client2,
-            config,
-            consumer_id,
-            Arc::new(offset_store),
-        )
-        .unwrap();
+        let mut consumer =
+            Consumer::with_offset_store(client2, config, consumer_id, Arc::new(offset_store))
+                .unwrap();
 
         // Poll to ensure consumer is ready
         let _ = consumer.poll();
@@ -832,11 +828,7 @@ async fn test_consumer_offset_store_persistence() {
     {
         let offset_store = LockFileOffsetStore::open(offset_dir, consumer_name).unwrap();
         let stored = offset_store.load(topic_id, consumer_id).unwrap();
-        assert_eq!(
-            stored,
-            Some(10),
-            "Offset should be persisted to file"
-        );
+        assert_eq!(stored, Some(10), "Offset should be persisted to file");
         println!("5. Verified persisted offset = 10");
     }
 
@@ -859,7 +851,10 @@ async fn test_consumer_offset_store_persistence() {
             10,
             "Consumer should resume from stored offset"
         );
-        println!("6. New consumer resumed at offset {}", consumer.current_offset());
+        println!(
+            "6. New consumer resumed at offset {}",
+            consumer.current_offset()
+        );
     }
 
     // Cleanup
@@ -1175,8 +1170,6 @@ async fn test_cluster_concurrent_writes_multiple_nodes() {
     client2.close().await.unwrap();
 }
 
-
-
 // ============================================================================
 // Retention Policy Tests
 // ============================================================================
@@ -1197,7 +1190,11 @@ async fn test_set_retention_policy() {
     let result = client
         .set_retention(topic.id, max_age_secs, max_bytes)
         .await;
-    assert!(result.is_ok(), "Failed to set retention: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to set retention: {:?}",
+        result.err()
+    );
     println!(
         "Set retention policy: max_age={}s, max_bytes={}",
         max_age_secs, max_bytes
@@ -1310,7 +1307,11 @@ async fn test_cluster_retention_replication() {
 
     // Set retention on node 1
     let result = client1.set_retention(topic.id, 3600, 100_000_000).await;
-    assert!(result.is_ok(), "Failed to set retention: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to set retention: {:?}",
+        result.err()
+    );
     println!("Set retention on node 1");
 
     // Wait for replication
@@ -1330,7 +1331,6 @@ async fn test_cluster_retention_replication() {
     client1.close().await.unwrap();
     client2.close().await.unwrap();
 }
-
 
 // ============================================================================
 // Cluster Status Tests
@@ -1415,9 +1415,13 @@ async fn test_cluster_failover_write_continuity() {
     // Write data before simulated failover
     let test_data = bytes::Bytes::from_static(b"pre-failover data");
     let write_result = if status1.is_leader {
-        client1.send_ingest_to_topic_sync(topic.id, test_data.clone(), 1, None).await
+        client1
+            .send_ingest_to_topic_sync(topic.id, test_data.clone(), 1, None)
+            .await
     } else {
-        client2.send_ingest_to_topic_sync(topic.id, test_data, 1, None).await
+        client2
+            .send_ingest_to_topic_sync(topic.id, test_data, 1, None)
+            .await
     };
     assert!(write_result.is_ok(), "Pre-failover write should succeed");
     println!("Pre-failover write succeeded");
@@ -1465,8 +1469,10 @@ async fn test_write_forwarding_from_follower() {
 
     // Write to follower - should be forwarded to leader
     let test_data = bytes::Bytes::from_static(b"forwarded write data");
-    let result = follower_client.send_ingest_to_topic_sync(topic.id, test_data, 1, None).await;
-    
+    let result = follower_client
+        .send_ingest_to_topic_sync(topic.id, test_data, 1, None)
+        .await;
+
     // Write forwarding should either succeed or return NotLeader with redirect
     match &result {
         Ok(_) => println!("Write forwarded successfully"),
@@ -1497,7 +1503,9 @@ async fn test_wal_replay_after_restart() {
     // Write multiple batches
     for i in 0..10 {
         let data = bytes::Bytes::from(format!("wal_test_batch_{}", i));
-        let result = client.send_ingest_to_topic_sync(topic.id, data, 1, None).await;
+        let result = client
+            .send_ingest_to_topic_sync(topic.id, data, 1, None)
+            .await;
         assert!(result.is_ok(), "Write {} should succeed", i);
     }
     println!("Wrote 10 batches to topic");
@@ -1535,7 +1543,10 @@ async fn test_backpressure_under_load() {
     // Write 1000 small messages as fast as possible
     let data = bytes::Bytes::from(vec![0u8; 256]); // 256 byte payload
     for i in 0..1000 {
-        match client.send_ingest_to_topic_sync(topic.id, data.clone(), 1, None).await {
+        match client
+            .send_ingest_to_topic_sync(topic.id, data.clone(), 1, None)
+            .await
+        {
             Ok(_) => success_count += 1,
             Err(e) => {
                 // Check if it's a backpressure signal
@@ -1545,13 +1556,15 @@ async fn test_backpressure_under_load() {
                 } else {
                     println!("Write {} failed: {:?}", i, e);
                 }
-            }
+            },
         }
     }
 
-    println!("Backpressure test: {} succeeded, {} backpressured", 
-             success_count, backpressure_count);
-    
+    println!(
+        "Backpressure test: {} succeeded, {} backpressured",
+        success_count, backpressure_count
+    );
+
     // At minimum, some writes should succeed
     assert!(success_count > 0, "At least some writes should succeed");
 
@@ -1571,34 +1584,47 @@ async fn test_tls_encrypted_connection() {
     // - LANCE server running with TLS enabled
     // - Valid certificate and key files
     // - CA certificate for client verification
-    
+
     let config = test_config();
-    
+
     let result = LanceClient::connect(config).await;
     match result {
         Ok(mut client) => {
             // Test basic operations over TLS connection
             let topic_name = unique_topic_name("tls_test");
             let topic_result = client.create_topic(&topic_name).await;
-            assert!(topic_result.is_ok(), "Should create topic over TLS: {:?}", topic_result.err());
-            
+            assert!(
+                topic_result.is_ok(),
+                "Should create topic over TLS: {:?}",
+                topic_result.err()
+            );
+
             let topic = topic_result.unwrap();
             println!("Created topic {} over TLS connection", topic.id);
-            
+
             // Write data over TLS
             let test_data = bytes::Bytes::from_static(b"TLS encrypted data");
-            let write_result = client.send_ingest_to_topic_sync(topic.id, test_data, 1, None).await;
-            assert!(write_result.is_ok(), "Should write over TLS: {:?}", write_result.err());
+            let write_result = client
+                .send_ingest_to_topic_sync(topic.id, test_data, 1, None)
+                .await;
+            assert!(
+                write_result.is_ok(),
+                "Should write over TLS: {:?}",
+                write_result.err()
+            );
             println!("Wrote data over TLS connection");
-            
+
             // Cleanup
             client.delete_topic(topic.id).await.unwrap();
             client.close().await.unwrap();
             println!("TLS connection test passed");
-        }
+        },
         Err(e) => {
-            println!("TLS connection failed (expected if server not TLS-enabled): {:?}", e);
-        }
+            println!(
+                "TLS connection failed (expected if server not TLS-enabled): {:?}",
+                e
+            );
+        },
     }
 }
 
@@ -1606,24 +1632,24 @@ async fn test_tls_encrypted_connection() {
 #[ignore = "requires LANCE server with mTLS enabled"]
 async fn test_mtls_client_certificate() {
     // This test validates mutual TLS where client presents certificate
-    
+
     let config = test_config();
-    
+
     let result = LanceClient::connect(config).await;
     match result {
         Ok(mut client) => {
             println!("mTLS connection established");
-            
+
             // Verify connection works
             let ping_result = client.ping().await;
             assert!(ping_result.is_ok(), "Ping should succeed over mTLS");
             println!("Ping latency: {:?}", ping_result.unwrap());
-            
+
             client.close().await.unwrap();
-        }
+        },
         Err(e) => {
             println!("mTLS connection failed: {:?}", e);
-        }
+        },
     }
 }
 
@@ -1632,14 +1658,14 @@ async fn test_mtls_client_certificate() {
 async fn test_tls_with_client_config_integration() {
     use lnc_client::TlsClientConfig;
     use std::net::SocketAddr;
-    
+
     // Test TLS configuration via ClientConfig.with_tls()
     let addr: SocketAddr = get_test_addr();
     let tls = TlsClientConfig::new();
     let config = ClientConfig::new(addr).with_tls(tls);
-    
+
     assert!(config.is_tls_enabled(), "TLS should be enabled in config");
-    
+
     // Connect using unified config (auto-detects TLS)
     match LanceClient::connect(config).await {
         Ok(mut client) => {
@@ -1648,10 +1674,10 @@ async fn test_tls_with_client_config_integration() {
             assert!(ping.is_ok(), "Ping over TLS should succeed");
             println!("TLS via ClientConfig integration: ping {:?}", ping.unwrap());
             client.close().await.unwrap();
-        }
+        },
         Err(e) => {
             println!("TLS connection via ClientConfig failed: {:?}", e);
-        }
+        },
     }
 }
 
@@ -1660,16 +1686,15 @@ async fn test_tls_with_client_config_integration() {
 async fn test_tls_certificate_validation() {
     use lnc_client::TlsClientConfig;
     use std::net::SocketAddr;
-    
+
     // Test that invalid CA certificate fails validation
     let addr: SocketAddr = get_test_addr();
-    let tls = TlsClientConfig::new()
-        .with_ca_cert("/nonexistent/ca.pem");
-    
+    let tls = TlsClientConfig::new().with_ca_cert("/nonexistent/ca.pem");
+
     let config = ClientConfig::new(addr).with_tls(tls);
-    
+
     let result = LanceClient::connect(config).await;
-    
+
     // Should fail because CA cert doesn't exist
     assert!(result.is_err(), "Connection with invalid CA should fail");
     println!("Certificate validation correctly rejected invalid CA");
@@ -1680,26 +1705,28 @@ async fn test_tls_certificate_validation() {
 async fn test_tls_cluster_communication() {
     // Test TLS works with cluster status queries
     let config = test_config();
-    
+
     match LanceClient::connect(config).await {
         Ok(mut client) => {
             // Query cluster status over TLS
             let status = client.get_cluster_status().await;
             match status {
                 Ok(cluster) => {
-                    println!("Cluster status over TLS: {} nodes, leader: {:?}", 
-                        cluster.node_count, cluster.leader_id);
+                    println!(
+                        "Cluster status over TLS: {} nodes, leader: {:?}",
+                        cluster.node_count, cluster.leader_id
+                    );
                     assert!(cluster.node_count >= 1, "Should have at least one node");
-                }
+                },
                 Err(e) => {
                     println!("Cluster query failed (may be single-node): {:?}", e);
-                }
+                },
             }
             client.close().await.unwrap();
-        }
+        },
         Err(e) => {
             println!("Cluster TLS connection failed: {:?}", e);
-        }
+        },
     }
 }
 
@@ -1711,29 +1738,32 @@ async fn test_tls_cluster_communication() {
 #[ignore = "requires running LANCE server"]
 async fn test_connection_pool_basic() {
     use lnc_client::{ConnectionPool, ConnectionPoolConfig};
-    
+
     let addr = format!("{}", get_test_addr());
     let config = ConnectionPoolConfig::new()
         .with_max_connections(5)
         .with_min_idle(1);
-    
+
     let pool = ConnectionPool::new(&addr, config).await.unwrap();
-    
+
     // Get a connection from pool
     let mut conn = pool.get().await.unwrap();
-    
+
     // Verify connection works
     let latency = conn.ping().await.unwrap();
     println!("Pool connection ping latency: {:?}", latency);
-    
+
     // Check pool stats
     let stats = pool.stats();
-    assert!(stats.connections_created >= 1, "Should have created at least one connection");
+    assert!(
+        stats.connections_created >= 1,
+        "Should have created at least one connection"
+    );
     println!("Pool stats: {:?}", stats);
-    
+
     // Connection returned to pool on drop
     drop(conn);
-    
+
     // Close pool
     pool.close().await;
 }
@@ -1743,14 +1773,14 @@ async fn test_connection_pool_basic() {
 async fn test_connection_pool_concurrent_access() {
     use lnc_client::{ConnectionPool, ConnectionPoolConfig};
     use std::sync::Arc;
-    
+
     let addr = format!("{}", get_test_addr());
     let config = ConnectionPoolConfig::new()
         .with_max_connections(3)
         .with_acquire_timeout(Duration::from_secs(5));
-    
+
     let pool = Arc::new(ConnectionPool::new(&addr, config).await.unwrap());
-    
+
     // Spawn multiple tasks that use connections concurrently
     let mut handles = vec![];
     for i in 0..5 {
@@ -1761,15 +1791,15 @@ async fn test_connection_pool_concurrent_access() {
             println!("Task {} ping latency: {:?}", i, latency);
         }));
     }
-    
+
     // Wait for all tasks
     for handle in handles {
         handle.await.unwrap();
     }
-    
+
     let stats = pool.stats();
     println!("Concurrent access stats: {:?}", stats);
-    
+
     pool.close().await;
 }
 
@@ -1777,15 +1807,15 @@ async fn test_connection_pool_concurrent_access() {
 #[ignore = "requires running LANCE server"]
 async fn test_reconnecting_client_basic() {
     use lnc_client::ReconnectingClient;
-    
+
     let addr = format!("{}", get_test_addr());
     let mut client = ReconnectingClient::connect(&addr).await.unwrap();
-    
+
     // Use the client
     let inner = client.client().await.unwrap();
     let latency = inner.ping().await.unwrap();
     println!("ReconnectingClient ping latency: {:?}", latency);
-    
+
     // Check original address tracking
     assert_eq!(client.original_addr(), &addr);
     assert_eq!(client.reconnect_attempts(), 0);
@@ -1796,18 +1826,18 @@ async fn test_reconnecting_client_basic() {
 async fn test_reconnecting_client_leader_failover() {
     use lnc_client::ReconnectingClient;
     use std::net::SocketAddr;
-    
+
     let addr = format!("{}", get_test_addr());
     let mut client = ReconnectingClient::connect(&addr)
         .await
         .unwrap()
         .with_max_attempts(3)
         .with_follow_leader(true);
-    
+
     // Simulate leader address update
     let new_leader: SocketAddr = "127.0.0.1:1993".parse().unwrap();
     client.set_leader_addr(new_leader);
-    
+
     assert_eq!(client.leader_addr(), Some(new_leader));
     println!("Leader address updated to {:?}", client.leader_addr());
 }
@@ -1823,7 +1853,7 @@ async fn test_connection_to_invalid_address() {
         keepalive_interval: Duration::from_secs(10),
         tls: None,
     };
-    
+
     let result = LanceClient::connect(config).await;
     assert!(result.is_err(), "Should fail to connect to invalid address");
     println!("Connection to invalid address correctly failed");
@@ -1853,7 +1883,10 @@ async fn test_producer_connect_and_send() {
 
     // Send some records
     for i in 0..10 {
-        let ack = producer.send(topic_id, format!("message-{}", i).as_bytes()).await.unwrap();
+        let ack = producer
+            .send(topic_id, format!("message-{}", i).as_bytes())
+            .await
+            .unwrap();
         assert!(ack.batch_id > 0);
         assert_eq!(ack.topic_id, topic_id);
     }
@@ -1876,7 +1909,7 @@ async fn test_producer_batching_and_flush() {
 
     let config = ProducerConfig::new()
         .with_batch_size(16 * 1024)  // Large batch
-        .with_linger_ms(1000);       // Long linger
+        .with_linger_ms(1000); // Long linger
 
     let addr = format!("{}", get_test_addr());
     let producer = Producer::connect(&addr, config).await.unwrap();
@@ -1890,9 +1923,12 @@ async fn test_producer_batching_and_flush() {
     // Send records (should batch due to long linger)
     let start = Instant::now();
     for i in 0..5 {
-        producer.send_async(topic_id, format!("batch-message-{}", i).as_bytes()).await.unwrap();
+        producer
+            .send_async(topic_id, format!("batch-message-{}", i).as_bytes())
+            .await
+            .unwrap();
     }
-    
+
     // Should be quick since async send doesn't wait for batch
     assert!(start.elapsed() < Duration::from_millis(100));
 

@@ -1,7 +1,9 @@
 use crate::error::{ClientError, Result};
 use crate::tls::TlsClientConfig;
 use bytes::Bytes;
-use lnc_network::{encode_frame, parse_frame, ControlCommand, Frame, FrameType, TlsConnector, LWP_HEADER_SIZE};
+use lnc_network::{
+    ControlCommand, Frame, FrameType, LWP_HEADER_SIZE, TlsConnector, encode_frame, parse_frame,
+};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,7 +62,6 @@ impl AsyncWrite for ClientStream {
     }
 }
 
-
 /// Helper to extract error message from a frame payload
 fn extract_error_message(frame: &Frame) -> String {
     frame
@@ -72,16 +73,12 @@ fn extract_error_message(frame: &Frame) -> String {
 
 /// Helper to validate frame type and extract error if present
 #[allow(dead_code)] // Reserved for future protocol extensions
-fn expect_frame_type(
-    frame: Frame,
-    expected: ControlCommand,
-    expected_name: &str,
-) -> Result<Frame> {
+fn expect_frame_type(frame: Frame, expected: ControlCommand, expected_name: &str) -> Result<Frame> {
     match frame.frame_type {
         FrameType::Control(cmd) if cmd == expected => Ok(frame),
         FrameType::Control(ControlCommand::ErrorResponse) => {
             Err(ClientError::ServerError(extract_error_message(&frame)))
-        }
+        },
         other => Err(ClientError::InvalidResponse(format!(
             "Expected {}, got {:?}",
             expected_name, other
@@ -95,14 +92,13 @@ fn expect_success_response(frame: Frame) -> Result<()> {
         FrameType::Control(ControlCommand::TopicResponse) => Ok(()),
         FrameType::Control(ControlCommand::ErrorResponse) => {
             Err(ClientError::ServerError(extract_error_message(&frame)))
-        }
+        },
         other => Err(ClientError::InvalidResponse(format!(
             "Expected TopicResponse, got {:?}",
             other
         ))),
     }
 }
-
 
 #[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
@@ -267,20 +263,18 @@ impl LanceClient {
         debug!(addr = %config.addr, "Connecting to LANCE server with TLS");
 
         // First establish TCP connection
-        let tcp_stream = tokio::time::timeout(
-            config.connect_timeout,
-            TcpStream::connect(config.addr),
-        )
-        .await
-        .map_err(|_| ClientError::Timeout)?
-        .map_err(ClientError::ConnectionFailed)?;
+        let tcp_stream =
+            tokio::time::timeout(config.connect_timeout, TcpStream::connect(config.addr))
+                .await
+                .map_err(|_| ClientError::Timeout)?
+                .map_err(ClientError::ConnectionFailed)?;
 
         tcp_stream.set_nodelay(true)?;
 
         // Create TLS connector
         let network_config = tls_config.to_network_config();
-        let connector = TlsConnector::new(network_config)
-            .map_err(|e| ClientError::TlsError(e.to_string()))?;
+        let connector =
+            TlsConnector::new(network_config).map_err(|e| ClientError::TlsError(e.to_string()))?;
 
         // Determine server name for SNI
         let server_name = tls_config
@@ -553,7 +547,10 @@ impl LanceClient {
         let frame = Frame::new_set_retention(topic_id, max_age_secs, max_bytes);
         let frame_bytes = encode_frame(&frame);
 
-        trace!(topic_id, max_age_secs, max_bytes, "Setting retention policy");
+        trace!(
+            topic_id,
+            max_age_secs, max_bytes, "Setting retention policy"
+        );
 
         tokio::time::timeout(
             self.config.write_timeout,
@@ -581,7 +578,10 @@ impl LanceClient {
         let frame = Frame::new_create_topic_with_retention(name, max_age_secs, max_bytes);
         let frame_bytes = encode_frame(&frame);
 
-        trace!(name, max_age_secs, max_bytes, "Creating topic with retention");
+        trace!(
+            name,
+            max_age_secs, max_bytes, "Creating topic with retention"
+        );
 
         tokio::time::timeout(
             self.config.write_timeout,
@@ -593,7 +593,6 @@ impl LanceClient {
         let response = self.recv_frame().await?;
         self.parse_topic_response(response)
     }
-
 
     /// Get cluster status and health information
     pub async fn get_cluster_status(&mut self) -> Result<ClusterStatus> {
@@ -625,7 +624,9 @@ impl LanceClient {
                     .map(|obj| {
                         obj.iter()
                             .filter_map(|(k, v)| {
-                                k.parse::<u16>().ok().map(|id| (id, v.as_str().unwrap_or("unknown").to_string()))
+                                k.parse::<u16>()
+                                    .ok()
+                                    .map(|id| (id, v.as_str().unwrap_or("unknown").to_string()))
                             })
                             .collect()
                     })
@@ -655,7 +656,6 @@ impl LanceClient {
             ))),
         }
     }
-
 
     /// Fetch data from a topic starting at the given offset
     /// Returns (data, next_offset, record_count)
@@ -962,8 +962,12 @@ impl LanceClient {
                             .map(|t| {
                                 let retention = if t.get("retention").is_some() {
                                     Some(RetentionInfo {
-                                        max_age_secs: t["retention"]["max_age_secs"].as_u64().unwrap_or(0),
-                                        max_bytes: t["retention"]["max_bytes"].as_u64().unwrap_or(0),
+                                        max_age_secs: t["retention"]["max_age_secs"]
+                                            .as_u64()
+                                            .unwrap_or(0),
+                                        max_bytes: t["retention"]["max_bytes"]
+                                            .as_u64()
+                                            .unwrap_or(0),
                                     })
                                 } else {
                                     None

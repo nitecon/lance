@@ -17,7 +17,8 @@ mod raft;
 
 pub mod schema;
 
-pub use actor::{create_replication_channel, ReplicationActor};
+pub use actor::{ReplicationActor, create_replication_channel};
+pub use audit::{AuditConfig, AuditEntryHeader, AuditError, AuditLogWriter, AuditOperation};
 pub use cluster::{ClusterCoordinator, ClusterEvent};
 pub use codec::{
     AppendEntriesRequest, AppendEntriesResponse, ClusterConfig, ConfigNode, EntryType,
@@ -30,14 +31,11 @@ pub use discovery::{
 };
 pub use follower::{FollowerHealth, FollowerStatus};
 pub use forward::{
-    check_tee_support, create_leader_pool, ForwardConfig, ForwardError, LeaderConnectionPool,
-    LocalWriteError, LocalWriteProcessor, NoOpLocalProcessor, TeeForwardingStatus,
+    ForwardConfig, ForwardError, LeaderConnectionPool, LocalWriteError, LocalWriteProcessor,
+    NoOpLocalProcessor, TeeForwardingStatus, check_tee_support, create_leader_pool,
 };
-pub use audit::{
-    AuditConfig, AuditEntryHeader, AuditError, AuditLogWriter, AuditOperation,
-};
+pub use log_store::{LogStore, PersistentState};
 pub use mode::ReplicationMode;
 pub use peer::{PeerConfig, PeerConnection, PeerManager, PeerState};
 pub use quorum::{AsyncQuorumManager, QuorumConfig, QuorumResult};
-pub use log_store::{LogStore, PersistentState};
 pub use raft::{FencingToken, RaftConfig, RaftNode, RaftState};

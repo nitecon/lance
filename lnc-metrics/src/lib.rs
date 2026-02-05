@@ -9,6 +9,39 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use golden_signals::{
+    ERRORS_BY_TYPE,
+    ERRORS_TOTAL,
+    // Errors
+    ErrorType,
+    // Snapshot
+    GoldenSignalsSnapshot,
+    LATENCY_FETCH,
+    LATENCY_INGEST,
+    LATENCY_IO,
+    LATENCY_NETWORK,
+    LATENCY_REPLICATION,
+    LATENCY_SAMPLE_RATE,
+    // Latency
+    LatencyHistogram,
+    LatencySnapshot,
+    LatencyTimer,
+    RATE_INGEST_BYTES,
+    RATE_INGEST_OPS,
+    RATE_READ_BYTES,
+    RATE_READ_OPS,
+    // Traffic
+    RateTracker,
+    SATURATION_BUFFER_POOL_TOTAL,
+    SATURATION_BUFFER_POOL_USED,
+    SATURATION_CONNECTIONS_MAX,
+    SATURATION_CONNECTIONS_USED,
+    SATURATION_MEMORY_TOTAL,
+    SATURATION_MEMORY_USED,
+    SATURATION_PENDING_IO,
+    SATURATION_QUEUE_CAPACITY,
+    SATURATION_QUEUE_DEPTH,
+    // Latency - SAMPLED (use these on hot paths)
+    SampledTimer,
     buffer_pool_saturation,
     get_error_count,
     get_total_errors,
@@ -39,41 +72,8 @@ pub use golden_signals::{
     time_io,
     time_io_sampled,
     update_rates,
-    // Errors
-    ErrorType,
-    // Snapshot
-    GoldenSignalsSnapshot,
-    // Latency
-    LatencyHistogram,
-    LatencySnapshot,
-    LatencyTimer,
-    // Traffic
-    RateTracker,
-    // Latency - SAMPLED (use these on hot paths)
-    SampledTimer,
-    ERRORS_BY_TYPE,
-    ERRORS_TOTAL,
-    LATENCY_FETCH,
-    LATENCY_INGEST,
-    LATENCY_IO,
-    LATENCY_NETWORK,
-    LATENCY_REPLICATION,
-    LATENCY_SAMPLE_RATE,
-    RATE_INGEST_BYTES,
-    RATE_INGEST_OPS,
-    RATE_READ_BYTES,
-    RATE_READ_OPS,
-    SATURATION_BUFFER_POOL_TOTAL,
-    SATURATION_BUFFER_POOL_USED,
-    SATURATION_CONNECTIONS_MAX,
-    SATURATION_CONNECTIONS_USED,
-    SATURATION_MEMORY_TOTAL,
-    SATURATION_MEMORY_USED,
-    SATURATION_PENDING_IO,
-    SATURATION_QUEUE_CAPACITY,
-    SATURATION_QUEUE_DEPTH,
 };
-pub use tracing_export::{init_tracing, LocalSpan, OperationType, SpanContext, TracingConfig};
+pub use tracing_export::{LocalSpan, OperationType, SpanContext, TracingConfig, init_tracing};
 
 pub static RECORDS_INGESTED: AtomicU64 = AtomicU64::new(0);
 pub static BYTES_INGESTED: AtomicU64 = AtomicU64::new(0);
@@ -550,10 +550,7 @@ pub fn init_prometheus_exporter(
         "lance_consumer_throttled_total",
         "Consumer rate limit events"
     );
-    metrics::describe_counter!(
-        "lance_zero_copy_sends_total",
-        "Zero-copy sends completed"
-    );
+    metrics::describe_counter!("lance_zero_copy_sends_total", "Zero-copy sends completed");
 
     // ==========================================================================
     // 4 GOLDEN SIGNALS METRICS

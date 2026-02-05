@@ -1,5 +1,5 @@
 use crate::{LanceError, Result};
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{Layout, alloc, dealloc};
 use std::ptr::NonNull;
 
 const PAGE_SIZE: usize = 4096;
@@ -124,9 +124,12 @@ impl AlignedBuffer {
     #[cfg(target_os = "linux")]
     pub fn mlock(&self) -> Result<()> {
         // SAFETY: ptr is valid and capacity is the correct size
-        let result = unsafe { libc::mlock(self.ptr.as_ptr() as *const libc::c_void, self.capacity) };
+        let result =
+            unsafe { libc::mlock(self.ptr.as_ptr() as *const libc::c_void, self.capacity) };
         if result != 0 {
-            return Err(LanceError::MlockFailed(std::io::Error::last_os_error().to_string()));
+            return Err(LanceError::MlockFailed(
+                std::io::Error::last_os_error().to_string(),
+            ));
         }
         Ok(())
     }
@@ -215,7 +218,7 @@ impl NumaAlignedBuffer {
                 raw,
                 aligned_capacity,
                 1i32,
-                &nodemask as *const u64,
+                std::ptr::addr_of!(nodemask),
                 64usize,
                 0i32,
             );
@@ -225,7 +228,7 @@ impl NumaAlignedBuffer {
                 return Err(LanceError::NumaAllocFailed(numa_node));
             }
 
-            NonNull::new(raw as *mut u8).ok_or(LanceError::NumaAllocFailed(numa_node))?
+            NonNull::new(raw.cast::<u8>()).ok_or(LanceError::NumaAllocFailed(numa_node))?
         };
 
         Ok(Self {
@@ -340,7 +343,7 @@ impl Drop for NumaAlignedBuffer {
     fn drop(&mut self) {
         unsafe {
             libc::munmap(
-                self.inner.ptr.as_ptr() as *mut libc::c_void,
+                self.inner.ptr.as_ptr().cast::<libc::c_void>(),
                 self.inner.capacity,
             );
         }

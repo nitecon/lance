@@ -157,17 +157,25 @@ impl fmt::Display for RecordParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RecordParseError::InsufficientHeader { needed, available } => {
-                write!(f, "Insufficient data for header: need {} bytes, have {}", needed, available)
-            }
+                write!(
+                    f,
+                    "Insufficient data for header: need {} bytes, have {}",
+                    needed, available
+                )
+            },
             RecordParseError::InsufficientPayload { needed, available } => {
-                write!(f, "Insufficient data for payload: need {} bytes, have {}", needed, available)
-            }
+                write!(
+                    f,
+                    "Insufficient data for payload: need {} bytes, have {}",
+                    needed, available
+                )
+            },
             RecordParseError::InvalidType(t) => {
                 write!(f, "Invalid record type: 0x{:02X}", t)
-            }
+            },
             RecordParseError::PayloadTooLarge { length, max } => {
                 write!(f, "Payload too large: {} bytes (max: {})", length, max)
-            }
+            },
         }
     }
 }
@@ -237,12 +245,12 @@ impl RecordIterator {
     /// Parse a single record at the current position
     fn parse_record(&mut self) -> std::result::Result<Option<Record>, RecordParseError> {
         let remaining = self.remaining();
-        
+
         // Check if we have enough for header
         if remaining == 0 {
             return Ok(None);
         }
-        
+
         if remaining < TLV_HEADER_SIZE {
             return Err(RecordParseError::InsufficientHeader {
                 needed: TLV_HEADER_SIZE,
@@ -251,11 +259,11 @@ impl RecordIterator {
         }
 
         let start_offset = self.offset;
-        
+
         // Parse type byte
         let type_byte = self.data[self.offset];
         let record_type = RecordType::from(type_byte);
-        
+
         // Parse length (4 bytes little-endian per Architecture §2.2)
         let length = u32::from_le_bytes([
             self.data[self.offset + 1],
@@ -273,7 +281,7 @@ impl RecordIterator {
         }
 
         let payload_len = length as usize;
-        
+
         // Check if we have enough for payload
         if remaining < TLV_HEADER_SIZE + payload_len {
             return Err(RecordParseError::InsufficientPayload {
@@ -290,7 +298,12 @@ impl RecordIterator {
         // Advance offset
         self.offset = payload_end;
 
-        Ok(Some(Record::new(record_type, type_byte, payload, start_offset)))
+        Ok(Some(Record::new(
+            record_type,
+            type_byte,
+            payload,
+            start_offset,
+        )))
     }
 }
 
@@ -326,7 +339,7 @@ pub fn parse_record(data: &[u8]) -> std::result::Result<(Record, usize), RecordP
 
     let type_byte = data[0];
     let record_type = RecordType::from(type_byte);
-    
+
     let length = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
     let payload_len = length as usize;
 
@@ -346,29 +359,29 @@ pub fn parse_record(data: &[u8]) -> std::result::Result<(Record, usize), RecordP
 /// Encode a record to TLV format
 pub fn encode_record(record_type: RecordType, payload: &[u8]) -> Bytes {
     let mut buf = Vec::with_capacity(TLV_HEADER_SIZE + payload.len());
-    
+
     // Type byte
     buf.push(record_type as u8);
-    
+
     // Length (4 bytes little-endian per Architecture §2.2)
     let length = payload.len() as u32;
     buf.extend_from_slice(&length.to_le_bytes());
-    
+
     // Payload
     buf.extend_from_slice(payload);
-    
+
     Bytes::from(buf)
 }
 
 /// Encode a record with custom type byte
 pub fn encode_record_with_type(type_byte: u8, payload: &[u8]) -> Bytes {
     let mut buf = Vec::with_capacity(TLV_HEADER_SIZE + payload.len());
-    
+
     buf.push(type_byte);
     let length = payload.len() as u32;
     buf.extend_from_slice(&length.to_le_bytes());
     buf.extend_from_slice(payload);
-    
+
     Bytes::from(buf)
 }
 
@@ -388,10 +401,10 @@ mod tests {
     fn test_encode_decode_record() {
         let payload = b"hello world";
         let encoded = encode_record(RecordType::Data, payload);
-        
+
         assert_eq!(encoded.len(), TLV_HEADER_SIZE + payload.len());
         assert_eq!(encoded[0], 0x01); // Data type
-        
+
         let (record, size) = parse_record(&encoded).unwrap();
         assert_eq!(size, encoded.len());
         assert_eq!(record.record_type, RecordType::Data);
@@ -405,11 +418,11 @@ mod tests {
         data.extend_from_slice(&encode_record(RecordType::Data, b"record1"));
         data.extend_from_slice(&encode_record(RecordType::Data, b"record2"));
         data.extend_from_slice(&encode_record(RecordType::Tombstone, b""));
-        
+
         let records: Vec<_> = RecordIterator::new(Bytes::from(data))
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-        
+
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].as_str(), Some("record1"));
         assert_eq!(records[1].as_str(), Some("record2"));
@@ -420,9 +433,12 @@ mod tests {
     fn test_insufficient_header() {
         let data = Bytes::from(vec![0x01, 0x00]); // Only 2 bytes
         let mut iter = RecordIterator::new(data);
-        
+
         let result = iter.next();
-        assert!(matches!(result, Some(Err(RecordParseError::InsufficientHeader { .. }))));
+        assert!(matches!(
+            result,
+            Some(Err(RecordParseError::InsufficientHeader { .. }))
+        ));
     }
 
     #[test]
@@ -431,17 +447,20 @@ mod tests {
         // Length is little-endian: 100 = 0x64 0x00 0x00 0x00
         let mut data = vec![0x01, 0x64, 0x00, 0x00, 0x00]; // type + length (100 LE)
         data.extend_from_slice(b"short"); // Only 5 bytes
-        
+
         let mut iter = RecordIterator::new(Bytes::from(data));
         let result = iter.next();
-        assert!(matches!(result, Some(Err(RecordParseError::InsufficientPayload { .. }))));
+        assert!(matches!(
+            result,
+            Some(Err(RecordParseError::InsufficientPayload { .. }))
+        ));
     }
 
     #[test]
     fn test_empty_record() {
         let encoded = encode_record(RecordType::Tombstone, b"");
         let (record, _) = parse_record(&encoded).unwrap();
-        
+
         assert!(record.is_tombstone());
         assert!(record.payload.is_empty());
     }
@@ -453,11 +472,11 @@ mod tests {
         let rec2 = encode_record(RecordType::Data, b"second");
         data.extend_from_slice(&rec1);
         data.extend_from_slice(&rec2);
-        
+
         let records: Vec<_> = RecordIterator::new(Bytes::from(data))
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-        
+
         assert_eq!(records[0].offset, 0);
         assert_eq!(records[1].offset, rec1.len());
     }

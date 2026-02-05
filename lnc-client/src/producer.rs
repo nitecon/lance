@@ -43,12 +43,12 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::interval;
 
 use crate::client::{ClientConfig, LanceClient};
@@ -236,13 +236,13 @@ pub struct Producer {
 impl Producer {
     /// Connect to a LANCE server and create a producer
     pub async fn connect(addr: &str, config: ProducerConfig) -> Result<Self> {
-        let socket_addr = addr.parse().map_err(|e| {
-            ClientError::ProtocolError(format!("Invalid address: {}", e))
-        })?;
-        
+        let socket_addr = addr
+            .parse()
+            .map_err(|e| ClientError::ProtocolError(format!("Invalid address: {}", e)))?;
+
         let mut client_config = ClientConfig::new(socket_addr);
         client_config.connect_timeout = config.connect_timeout;
-        
+
         let client = LanceClient::connect(client_config).await?;
         Self::from_client(client, config).await
     }
@@ -253,7 +253,7 @@ impl Producer {
         let batches = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(ProducerMetrics::default());
         let running = Arc::new(AtomicBool::new(true));
-        
+
         let (flush_tx, mut flush_rx) = mpsc::channel::<oneshot::Sender<Result<()>>>(16);
 
         // Spawn background linger task
@@ -265,7 +265,7 @@ impl Producer {
 
         tokio::spawn(async move {
             let mut linger_interval = interval(Duration::from_millis(linger_ms.max(1)));
-            
+
             loop {
                 tokio::select! {
                     _ = linger_interval.tick() => {
@@ -309,7 +309,7 @@ impl Producer {
     /// when the record has been acknowledged by the server.
     pub async fn send(&self, topic_id: u32, data: &[u8]) -> Result<SendAck> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        
+
         // Check buffer memory limit
         let current_buffer = self.metrics.buffer_size.load(Ordering::Relaxed);
         if current_buffer + data.len() as u64 > self.config.buffer_memory as u64 {
@@ -319,9 +319,13 @@ impl Producer {
         // Add to batch
         let should_flush = {
             let mut batches = self.batches.write().await;
-            let batch = batches.entry(topic_id).or_insert_with(|| RecordBatch::new(topic_id));
+            let batch = batches
+                .entry(topic_id)
+                .or_insert_with(|| RecordBatch::new(topic_id));
             batch.add(Bytes::copy_from_slice(data), ack_tx);
-            self.metrics.buffer_size.fetch_add(data.len() as u64, Ordering::Relaxed);
+            self.metrics
+                .buffer_size
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
             batch.size() >= self.config.batch_size
         };
 
@@ -339,7 +343,7 @@ impl Producer {
     /// Returns immediately after buffering. Use `flush()` to ensure delivery.
     pub async fn send_async(&self, topic_id: u32, data: &[u8]) -> Result<()> {
         let (ack_tx, _ack_rx) = oneshot::channel();
-        
+
         // Check buffer memory limit
         let current_buffer = self.metrics.buffer_size.load(Ordering::Relaxed);
         if current_buffer + data.len() as u64 > self.config.buffer_memory as u64 {
@@ -349,9 +353,13 @@ impl Producer {
         // Add to batch
         let should_flush = {
             let mut batches = self.batches.write().await;
-            let batch = batches.entry(topic_id).or_insert_with(|| RecordBatch::new(topic_id));
+            let batch = batches
+                .entry(topic_id)
+                .or_insert_with(|| RecordBatch::new(topic_id));
             batch.add(Bytes::copy_from_slice(data), ack_tx);
-            self.metrics.buffer_size.fetch_add(data.len() as u64, Ordering::Relaxed);
+            self.metrics
+                .buffer_size
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
             batch.size() >= self.config.batch_size
         };
 
@@ -374,7 +382,8 @@ impl Producer {
     /// * `callback` - Callback invoked with send result
     ///
     /// # Example
-    /// ```rust,no_run
+    /// ```rust,ignore
+    /// // Assuming `producer` is an initialized Producer and `topic_id` is set
     /// producer.send_callback(topic_id, b"data", |result| {
     ///     match result {
     ///         Ok(ack) => println!("Sent with batch_id: {}", ack.batch_id),
@@ -387,7 +396,7 @@ impl Producer {
         F: FnOnce(SendResult) + Send + 'static,
     {
         let (ack_tx, ack_rx) = oneshot::channel();
-        
+
         // Check buffer memory limit
         let current_buffer = self.metrics.buffer_size.load(Ordering::Relaxed);
         if current_buffer + data.len() as u64 > self.config.buffer_memory as u64 {
@@ -397,9 +406,13 @@ impl Producer {
         // Add to batch
         let should_flush = {
             let mut batches = self.batches.write().await;
-            let batch = batches.entry(topic_id).or_insert_with(|| RecordBatch::new(topic_id));
+            let batch = batches
+                .entry(topic_id)
+                .or_insert_with(|| RecordBatch::new(topic_id));
             batch.add(Bytes::copy_from_slice(data), ack_tx);
-            self.metrics.buffer_size.fetch_add(data.len() as u64, Ordering::Relaxed);
+            self.metrics
+                .buffer_size
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
             batch.size() >= self.config.batch_size
         };
 
@@ -422,7 +435,9 @@ impl Producer {
     /// Blocks until all buffered records have been sent and acknowledged.
     pub async fn flush(&self) -> Result<()> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.flush_tx.send(ack_tx).await
+        self.flush_tx
+            .send(ack_tx)
+            .await
             .map_err(|_| ClientError::ConnectionClosed)?;
         ack_rx.await.map_err(|_| ClientError::ConnectionClosed)?
     }
@@ -454,16 +469,24 @@ impl Producer {
         // Send to server
         let result = {
             let mut client = self.client.lock().await;
-            client.send_ingest_to_topic_sync(topic_id, data.clone(), record_count as u32, None).await
+            client
+                .send_ingest_to_topic_sync(topic_id, data.clone(), record_count as u32, None)
+                .await
         };
 
         // Update metrics
-        self.metrics.buffer_size.fetch_sub(byte_count as u64, Ordering::Relaxed);
+        self.metrics
+            .buffer_size
+            .fetch_sub(byte_count as u64, Ordering::Relaxed);
 
         match result {
             Ok(batch_id) => {
-                self.metrics.records_sent.fetch_add(record_count as u64, Ordering::Relaxed);
-                self.metrics.bytes_sent.fetch_add(byte_count as u64, Ordering::Relaxed);
+                self.metrics
+                    .records_sent
+                    .fetch_add(record_count as u64, Ordering::Relaxed);
+                self.metrics
+                    .bytes_sent
+                    .fetch_add(byte_count as u64, Ordering::Relaxed);
                 self.metrics.batches_sent.fetch_add(1, Ordering::Relaxed);
 
                 // Notify all senders
@@ -478,7 +501,7 @@ impl Producer {
                 }
 
                 Ok(())
-            }
+            },
             Err(e) => {
                 self.metrics.errors.fetch_add(1, Ordering::Relaxed);
 
@@ -488,7 +511,7 @@ impl Producer {
                 }
 
                 Err(e)
-            }
+            },
         }
     }
 
@@ -568,16 +591,24 @@ impl Producer {
         // Send to server
         let result = {
             let mut client_guard = client.lock().await;
-            client_guard.send_ingest_to_topic_sync(topic_id, data.clone(), record_count as u32, None).await
+            client_guard
+                .send_ingest_to_topic_sync(topic_id, data.clone(), record_count as u32, None)
+                .await
         };
 
         // Update metrics
-        metrics.buffer_size.fetch_sub(byte_count as u64, Ordering::Relaxed);
+        metrics
+            .buffer_size
+            .fetch_sub(byte_count as u64, Ordering::Relaxed);
 
         match result {
             Ok(batch_id) => {
-                metrics.records_sent.fetch_add(record_count as u64, Ordering::Relaxed);
-                metrics.bytes_sent.fetch_add(byte_count as u64, Ordering::Relaxed);
+                metrics
+                    .records_sent
+                    .fetch_add(record_count as u64, Ordering::Relaxed);
+                metrics
+                    .bytes_sent
+                    .fetch_add(byte_count as u64, Ordering::Relaxed);
                 metrics.batches_sent.fetch_add(1, Ordering::Relaxed);
 
                 // Notify all senders
@@ -592,7 +623,7 @@ impl Producer {
                 }
 
                 Ok(())
-            }
+            },
             Err(e) => {
                 metrics.errors.fetch_add(1, Ordering::Relaxed);
 
@@ -602,7 +633,7 @@ impl Producer {
                 }
 
                 Err(e)
-            }
+            },
         }
     }
 
@@ -638,7 +669,7 @@ mod tests {
     #[test]
     fn test_producer_config_defaults() {
         let config = ProducerConfig::new();
-        
+
         assert_eq!(config.batch_size, 16 * 1024);
         assert_eq!(config.linger_ms, 5);
         assert_eq!(config.max_in_flight, 5);
@@ -652,7 +683,7 @@ mod tests {
             .with_linger_ms(10)
             .with_max_in_flight(10)
             .with_compression(true);
-        
+
         assert_eq!(config.batch_size, 32 * 1024);
         assert_eq!(config.linger_ms, 10);
         assert_eq!(config.max_in_flight, 10);
@@ -667,7 +698,7 @@ mod tests {
 
         let (tx, _rx) = oneshot::channel();
         batch.add(Bytes::from_static(b"hello"), tx);
-        
+
         assert!(!batch.is_empty());
         assert_eq!(batch.size(), 5);
         assert_eq!(batch.record_count, 1);
@@ -678,7 +709,7 @@ mod tests {
         let metrics = ProducerMetrics::default();
         metrics.records_sent.fetch_add(100, Ordering::Relaxed);
         metrics.bytes_sent.fetch_add(1000, Ordering::Relaxed);
-        
+
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.records_sent, 100);
         assert_eq!(snapshot.bytes_sent, 1000);
@@ -690,7 +721,8 @@ mod tests {
         fn assert_callback_traits<F>(_f: F)
         where
             F: FnOnce(SendResult) + Send + 'static,
-        {}
+        {
+        }
 
         // Simple callback
         assert_callback_traits(|_result| {});

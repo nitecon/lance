@@ -50,7 +50,7 @@ pub fn in_flight_count() -> u64 {
 pub fn install_signal_handlers(
     shutdown_tx: broadcast::Sender<()>,
 ) -> impl std::future::Future<Output = ()> {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
 
     let mut sigterm = signal(SignalKind::terminate())
         .unwrap_or_else(|e| panic!("Failed to install SIGTERM handler: {}", e));
@@ -124,10 +124,7 @@ pub async fn drain_with_timeout(timeout: Duration) -> bool {
 }
 
 /// Wait for all in-flight operations to complete
-async fn wait_for_in_flight_operations(
-    start: &std::time::Instant,
-    timeout: Duration,
-) -> bool {
+async fn wait_for_in_flight_operations(start: &std::time::Instant, timeout: Duration) -> bool {
     loop {
         let count = in_flight_count();
         if count == 0 {
@@ -156,7 +153,7 @@ async fn wait_for_in_flight_operations(
 }
 
 /// Drain coordinator for managing graceful shutdown
-/// 
+///
 /// Per Architecture §9, implements:
 /// 1. Stop accepting new connections (via SHUTDOWN_REQUESTED flag)
 /// 2. Drain in-flight batches
@@ -209,10 +206,10 @@ impl DrainCoordinator {
             match registry.flush_all_indexes() {
                 Ok(count) => {
                     info!(target: "lance::shutdown", flushed = count, "Index flush complete");
-                }
+                },
                 Err(e) => {
                     warn!(target: "lance::shutdown", error = %e, "Index flush failed");
-                }
+                },
             }
         }
 
@@ -223,10 +220,10 @@ impl DrainCoordinator {
             match registry.seal_all_segments() {
                 Ok(count) => {
                     info!(target: "lance::shutdown", sealed = count, "Segment sealing complete");
-                }
+                },
                 Err(e) => {
                     warn!(target: "lance::shutdown", error = %e, "Segment sealing failed");
-                }
+                },
             }
         }
 
@@ -282,11 +279,14 @@ mod tests {
     #[test]
     fn test_drain_phase_transitions() {
         // Test DrainPhase enum values and ordering
-        assert_eq!(DrainPhase::WaitingForOperations, DrainPhase::WaitingForOperations);
+        assert_eq!(
+            DrainPhase::WaitingForOperations,
+            DrainPhase::WaitingForOperations
+        );
         assert_eq!(DrainPhase::FlushingIndexes, DrainPhase::FlushingIndexes);
         assert_eq!(DrainPhase::SealingSegments, DrainPhase::SealingSegments);
         assert_eq!(DrainPhase::Complete, DrainPhase::Complete);
-        
+
         // Phases are distinct
         assert_ne!(DrainPhase::WaitingForOperations, DrainPhase::Complete);
     }
@@ -301,10 +301,10 @@ mod tests {
     async fn test_drain_coordinator_phase_progression() {
         // Reset state
         IN_FLIGHT_OPS.store(0, Ordering::SeqCst);
-        
+
         let mut coordinator = DrainCoordinator::new(Duration::from_secs(5));
         assert_eq!(coordinator.phase(), DrainPhase::WaitingForOperations);
-        
+
         // Execute should complete when no in-flight ops
         let result = coordinator.execute().await;
         assert!(result, "Should complete successfully with no in-flight ops");
@@ -315,18 +315,18 @@ mod tests {
     fn test_concurrent_operations() {
         // Reset counter
         IN_FLIGHT_OPS.store(0, Ordering::SeqCst);
-        
+
         // Simulate multiple concurrent operations
         for _ in 0..100 {
             begin_operation();
         }
         assert_eq!(in_flight_count(), 100);
-        
+
         for _ in 0..50 {
             end_operation();
         }
         assert_eq!(in_flight_count(), 50);
-        
+
         for _ in 0..50 {
             end_operation();
         }

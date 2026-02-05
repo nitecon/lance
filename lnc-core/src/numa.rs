@@ -25,6 +25,7 @@ pub struct NumaTopology {
 impl NumaTopology {
     /// Detect NUMA topology from the system
     #[cfg(target_os = "linux")]
+    #[must_use]
     pub fn detect() -> Self {
         let node_count = Self::detect_node_count();
         let cpu_count = Self::detect_cpu_count();
@@ -57,12 +58,11 @@ impl NumaTopology {
         // Try reading from sysfs
         if let Ok(entries) = std::fs::read_dir("/sys/devices/system/node") {
             entries
-                .filter_map(|e| e.ok())
+                .filter_map(std::result::Result::ok)
                 .filter(|e| {
                     e.file_name()
                         .to_str()
-                        .map(|s| s.starts_with("node"))
-                        .unwrap_or(false)
+                        .is_some_and(|s| s.starts_with("node"))
                 })
                 .count()
                 .max(1)
@@ -74,7 +74,7 @@ impl NumaTopology {
     #[cfg(target_os = "linux")]
     fn detect_cpu_count() -> usize {
         std::thread::available_parallelism()
-            .map(|p| p.get())
+            .map(std::num::NonZero::get)
             .unwrap_or(1)
     }
 
@@ -82,15 +82,15 @@ impl NumaTopology {
     fn detect_cpus_per_node(node_count: usize, cpu_count: usize) -> Vec<Vec<usize>> {
         let mut result = vec![Vec::new(); node_count];
 
-        for node in 0..node_count {
-            let path = format!("/sys/devices/system/node/node{}/cpulist", node);
+        for (node, node_cpus) in result.iter_mut().enumerate().take(node_count) {
+            let path = format!("/sys/devices/system/node/node{node}/cpulist");
             if let Ok(content) = std::fs::read_to_string(&path) {
-                result[node] = Self::parse_cpu_list(&content);
+                *node_cpus = Self::parse_cpu_list(&content);
             }
         }
 
         // Fallback: distribute CPUs evenly if sysfs reading failed
-        if result.iter().all(|v| v.is_empty()) {
+        if result.iter().all(std::vec::Vec::is_empty) {
             let cpus_per = cpu_count / node_count.max(1);
             for (node, cpus) in result.iter_mut().enumerate() {
                 let start = node * cpus_per;
@@ -183,15 +183,16 @@ impl NumaAllocator {
 
 /// Get the NUMA node for the current thread
 #[cfg(target_os = "linux")]
+#[must_use]
 pub fn get_current_numa_node() -> usize {
     // SAFETY: getcpu syscall with valid output pointers returns current CPU/node
-    let cpu = unsafe {
+    unsafe {
         let mut cpu: u32 = 0;
         let mut node: u32 = 0;
         if libc::syscall(
             libc::SYS_getcpu,
-            &mut cpu as *mut u32,
-            &mut node as *mut u32,
+            std::ptr::addr_of_mut!(cpu),
+            std::ptr::addr_of_mut!(node),
             std::ptr::null::<libc::c_void>(),
         ) == 0
         {
@@ -199,8 +200,7 @@ pub fn get_current_numa_node() -> usize {
         } else {
             0
         }
-    };
-    cpu
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -209,7 +209,10 @@ pub fn get_current_numa_node() -> usize {
     0
 }
 
-/// Pin the current thread to a specific CPU
+/// Pin the current thread to a specific CPU.
+///
+/// # Errors
+/// Returns an error if thread pinning fails.
 #[cfg(target_os = "linux")]
 pub fn pin_thread_to_cpu(cpu: usize) -> Result<()> {
     use std::mem::MaybeUninit;

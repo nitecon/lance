@@ -92,9 +92,18 @@ impl TlsClientConfig {
     pub fn to_network_config(&self) -> lnc_network::TlsConfig {
         if self.is_mtls() {
             lnc_network::TlsConfig::mtls(
-                self.client_cert_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
-                self.client_key_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
-                self.ca_cert_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+                self.client_cert_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                self.client_key_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                self.ca_cert_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default(),
             )
         } else if let Some(ref ca_path) = self.ca_cert_path {
             lnc_network::TlsConfig::client(Some(ca_path.to_string_lossy().to_string()))
@@ -118,10 +127,12 @@ mod tests {
 
     #[test]
     fn test_tls_config_with_ca() {
-        let config = TlsClientConfig::new()
-            .with_ca_cert("/path/to/ca.pem");
-        
-        assert_eq!(config.ca_cert_path.as_ref().map(|p| p.to_str()), Some(Some("/path/to/ca.pem")));
+        let config = TlsClientConfig::new().with_ca_cert("/path/to/ca.pem");
+
+        assert_eq!(
+            config.ca_cert_path.as_ref().map(|p| p.to_str()),
+            Some(Some("/path/to/ca.pem"))
+        );
         assert!(!config.is_mtls());
     }
 
@@ -130,15 +141,14 @@ mod tests {
         let config = TlsClientConfig::new()
             .with_ca_cert("/path/to/ca.pem")
             .with_client_cert("/path/to/cert.pem", "/path/to/key.pem");
-        
+
         assert!(config.is_mtls());
     }
 
     #[test]
     fn test_tls_config_with_server_name() {
-        let config = TlsClientConfig::new()
-            .with_server_name("lance.example.com");
-        
+        let config = TlsClientConfig::new().with_server_name("lance.example.com");
+
         assert_eq!(config.server_name, Some("lance.example.com".to_string()));
     }
 
@@ -148,14 +158,16 @@ mod tests {
         use std::net::SocketAddr;
 
         let addr: SocketAddr = "127.0.0.1:1992".parse().unwrap();
-        let tls = TlsClientConfig::new()
-            .with_server_name("lance.example.com");
+        let tls = TlsClientConfig::new().with_server_name("lance.example.com");
 
         let config = ClientConfig::new(addr).with_tls(tls);
 
         assert!(config.is_tls_enabled());
         assert!(config.tls.is_some());
-        assert_eq!(config.tls.as_ref().unwrap().server_name, Some("lance.example.com".to_string()));
+        assert_eq!(
+            config.tls.as_ref().unwrap().server_name,
+            Some("lance.example.com".to_string())
+        );
     }
 
     #[test]

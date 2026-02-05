@@ -251,7 +251,7 @@ impl BackpressureMonitor {
         let now = Self::now_ns();
         let last = self.last_sample_ns.load(Ordering::Relaxed);
         let interval_ns = self.config.sample_interval.as_nanos() as u64;
-        
+
         if now.saturating_sub(last) >= interval_ns {
             // Try to atomically update the last sample time
             // If another thread beat us, that's fine - we skip this sample

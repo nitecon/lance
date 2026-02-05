@@ -4,14 +4,14 @@
 //! Uses crossbeam::ArrayQueue for lock-free MPMC communication per CodingGuidelines §3.3.
 
 use super::ingestion::IngestionRequest;
-use super::writer::{create_topic_writer, rotate_topic_segment, TopicWriter};
+use super::writer::{TopicWriter, create_topic_writer, rotate_topic_segment};
 use crate::config::Config;
 use crate::topic::TopicRegistry;
 use crossbeam::queue::ArrayQueue;
-use lnc_core::{pin_thread_to_cpu, LanceError, Result, SortKey};
+use lnc_core::{LanceError, Result, SortKey, pin_thread_to_cpu};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use tracing::{debug, info, warn};
 
@@ -169,7 +169,7 @@ impl MultiActorSender {
                         return Err(LanceError::Protocol("Ingestion queue full".into()));
                     }
                     std::hint::spin_loop();
-                }
+                },
             }
         }
     }
@@ -196,12 +196,9 @@ fn run_ingestion_actor_sync(
             Some(request) => {
                 let topic_id = request.topic_id;
 
-                if let Err(e) = process_request_sync(
-                    &config,
-                    &topic_registry,
-                    &mut topic_writers,
-                    request,
-                ) {
+                if let Err(e) =
+                    process_request_sync(&config, &topic_registry, &mut topic_writers, request)
+                {
                     warn!(
                         target: "lance::ingestion",
                         actor_id,
@@ -211,7 +208,7 @@ fn run_ingestion_actor_sync(
                     );
                     topic_writers.remove(&topic_id);
                 }
-            }
+            },
             None => {
                 // Check if queue is dropped (shutdown signal)
                 if Arc::strong_count(&queue) == 1 {
@@ -219,7 +216,7 @@ fn run_ingestion_actor_sync(
                 }
                 // Brief spin before retrying
                 std::hint::spin_loop();
-            }
+            },
         }
     }
 
@@ -268,7 +265,7 @@ fn process_request_sync(
             topic_writers
                 .get_mut(&topic_id)
                 .ok_or_else(|| LanceError::Protocol("Failed to get topic writer".into()))?
-        }
+        },
     };
 
     let seq = SEQUENCE_COUNTER.fetch_add(1, Ordering::Relaxed);

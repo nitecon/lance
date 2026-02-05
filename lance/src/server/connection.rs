@@ -7,13 +7,13 @@
 use super::command_handlers::{self, CommandContext};
 use super::{IngestionRequest, IngestionSender};
 use crate::auth::TokenValidator;
-use crate::consumer::{read_segment_zero_copy, ConsumerRateLimiter, FetchRequest, FetchResponse};
+use crate::consumer::{ConsumerRateLimiter, FetchRequest, FetchResponse, read_segment_zero_copy};
 use crate::shutdown::{begin_operation, end_operation, is_shutdown_requested};
 use crate::subscription::SubscriptionManager;
 use crate::topic::TopicRegistry;
 use bytes::Bytes;
 use lnc_core::{BatchPool, LanceError, Result};
-use lnc_network::{parse_frame, ControlCommand, FrameType, LWP_HEADER_SIZE};
+use lnc_network::{ControlCommand, FrameType, LWP_HEADER_SIZE, parse_frame};
 use lnc_replication::{ClusterCoordinator, LeaderConnectionPool};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -183,14 +183,14 @@ where
                         buffer.copy_within(consumed..read_offset, 0);
                         read_offset -= consumed;
                         maybe_shrink_buffer(buffer, read_offset);
-                    }
+                    },
                     FrameAction::Forwarded => {
                         // Buffer already adjusted by forwarding logic
                         read_offset -= consumed;
-                    }
+                    },
                     FrameAction::Error(e) => return Err(e),
                 }
-            }
+            },
             None => break,
         }
     }
@@ -209,19 +209,15 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     match frame.frame_type {
-        FrameType::Ingest => {
-            handle_ingest_frame(ctx, frame, buffer, consumed, read_offset).await
-        }
+        FrameType::Ingest => handle_ingest_frame(ctx, frame, buffer, consumed, read_offset).await,
         FrameType::Control(command) => {
             handle_control_frame(ctx, frame, command, buffer, consumed, read_offset).await
-        }
-        FrameType::Keepalive => {
-            handle_keepalive_frame(ctx).await
-        }
+        },
+        FrameType::Keepalive => handle_keepalive_frame(ctx).await,
         FrameType::Backpressure => {
             lnc_metrics::increment_backpressure();
             FrameAction::Continue
-        }
+        },
         _ => FrameAction::Continue,
     }
 }
@@ -248,7 +244,10 @@ where
         if !ctx.token_validator.is_write_only() {
             // All operations require auth, reject unauthenticated
             warn!(target: "lance::server", batch_id, "Write rejected: not authenticated");
-            if send_error(ctx.stream, "Authentication required").await.is_err() {
+            if send_error(ctx.stream, "Authentication required")
+                .await
+                .is_err()
+            {
                 end_operation();
                 return FrameAction::Error(LanceError::Io(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -331,7 +330,9 @@ where
 
     // Check if write command needs forwarding
     if command_handlers::is_write_operation(command) {
-        if let Some(action) = try_forward_control_to_leader(ctx, buffer, consumed, read_offset).await {
+        if let Some(action) =
+            try_forward_control_to_leader(ctx, buffer, consumed, read_offset).await
+        {
             return action;
         }
     }
@@ -379,23 +380,25 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let token = match &frame.payload {
-        Some(payload) => {
-            match std::str::from_utf8(payload) {
-                Ok(t) => t,
-                Err(_) => {
-                    let response = lnc_network::Frame::new_authenticate_response(false, Some("Invalid token encoding"));
-                    let response_bytes = lnc_network::encode_frame(&response);
-                    let _ = ctx.stream.write_all(&response_bytes).await;
-                    return FrameAction::Continue;
-                }
-            }
-        }
+        Some(payload) => match std::str::from_utf8(payload) {
+            Ok(t) => t,
+            Err(_) => {
+                let response = lnc_network::Frame::new_authenticate_response(
+                    false,
+                    Some("Invalid token encoding"),
+                );
+                let response_bytes = lnc_network::encode_frame(&response);
+                let _ = ctx.stream.write_all(&response_bytes).await;
+                return FrameAction::Continue;
+            },
+        },
         None => {
-            let response = lnc_network::Frame::new_authenticate_response(false, Some("No token provided"));
+            let response =
+                lnc_network::Frame::new_authenticate_response(false, Some("No token provided"));
             let response_bytes = lnc_network::encode_frame(&response);
             let _ = ctx.stream.write_all(&response_bytes).await;
             return FrameAction::Continue;
-        }
+        },
     };
 
     // Validate token
@@ -437,13 +440,13 @@ where
                     buffer.copy_within(consumed..read_offset, 0);
                     return Some(FrameAction::Forwarded);
                 }
-            }
+            },
             Err(e) => {
                 warn!(target: "lance::server", error = %e, "Write forwarding to leader failed");
                 let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
                 buffer.copy_within(consumed..read_offset, 0);
                 return Some(FrameAction::Forwarded);
-            }
+            },
         }
     } else {
         // No leader pool, send redirect
@@ -481,13 +484,13 @@ where
                     buffer.copy_within(consumed..read_offset, 0);
                     return Some(FrameAction::Forwarded);
                 }
-            }
+            },
             Err(e) => {
                 warn!(target: "lance::server", error = %e, "Control command forwarding to leader failed");
                 let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
                 buffer.copy_within(consumed..read_offset, 0);
                 return Some(FrameAction::Forwarded);
-            }
+            },
         }
     }
 
@@ -533,7 +536,8 @@ where
     if command_handlers::is_write_operation(command) {
         if let Some(coord) = cluster {
             if !coord.is_leader() {
-                return send_not_leader_error(stream, coord.leader_addr().map(|a| a.to_string())).await;
+                return send_not_leader_error(stream, coord.leader_addr().map(|a| a.to_string()))
+                    .await;
             }
         }
     }
@@ -556,10 +560,7 @@ where
 }
 
 /// Send NOT_LEADER error response
-async fn send_not_leader_error<S>(
-    stream: &mut S,
-    leader_addr: Option<String>,
-) -> Result<()>
+async fn send_not_leader_error<S>(stream: &mut S, leader_addr: Option<String>) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {

@@ -1,6 +1,6 @@
 use crate::secondary::SecondaryIndexWriter;
 use crate::sparse::SparseIndexWriter;
-use lnc_core::{Result, SortKey, DEFAULT_SPARSE_INDEX_INTERVAL};
+use lnc_core::{DEFAULT_SPARSE_INDEX_INTERVAL, Result, SortKey};
 use std::path::Path;
 
 pub struct IndexBuilder {
@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn test_index_builder_empty() {
         let builder = IndexBuilder::with_defaults();
-        
+
         assert_eq!(builder.record_count(), 0);
         assert_eq!(builder.sparse_entry_count(), 0);
         assert_eq!(builder.secondary_entry_count(), 0);
@@ -164,18 +164,18 @@ mod tests {
     #[test]
     fn test_index_builder_clear() {
         let mut builder = IndexBuilder::with_defaults();
-        
+
         // Add some records
         for i in 0..100 {
             let sort_key = SortKey::from_timestamp_ns(i * 1000, i as u32);
             builder.add_record(sort_key, i * 1000, i * 100);
         }
-        
+
         assert!(builder.record_count() > 0);
-        
+
         // Clear and verify
         builder.clear();
-        
+
         assert_eq!(builder.record_count(), 0);
         assert_eq!(builder.sparse_entry_count(), 0);
         assert_eq!(builder.secondary_entry_count(), 0);
@@ -185,12 +185,12 @@ mod tests {
     fn test_index_builder_sparse_interval() {
         // With sparse_interval=10, we get 1 sparse entry per 10 records
         let mut builder = IndexBuilder::new(10, 1_000_000_000);
-        
+
         for i in 0..100 {
             let sort_key = SortKey::from_timestamp_ns(i * 1_000_000, i as u32);
             builder.add_record(sort_key, i * 1_000_000, i * 100);
         }
-        
+
         // 100 records / 10 interval = 10 sparse entries
         assert_eq!(builder.record_count(), 100);
         assert_eq!(builder.sparse_entry_count(), 10);
@@ -200,21 +200,21 @@ mod tests {
     fn test_index_builder_timestamp_buckets() {
         // With 1ms buckets (1_000_000 ns), records in same bucket share secondary entry
         let mut builder = IndexBuilder::new(1000, 1_000_000);
-        
+
         // Add 10 records in same 1ms bucket
         for i in 0..10 {
-            let sort_key = SortKey::from_timestamp_ns(i * 100, i as u32);  // < 1ms apart
+            let sort_key = SortKey::from_timestamp_ns(i * 100, i as u32); // < 1ms apart
             builder.add_record(sort_key, i * 100, i * 100);
         }
-        
+
         // All 10 records should be in 1 secondary bucket
         assert_eq!(builder.record_count(), 10);
         assert_eq!(builder.secondary_entry_count(), 1);
-        
+
         // Add record in next bucket
         let sort_key = SortKey::from_timestamp_ns(2_000_000, 10);
         builder.add_record(sort_key, 2_000_000, 1000);
-        
+
         // Now 2 secondary buckets
         assert_eq!(builder.record_count(), 11);
         assert_eq!(builder.secondary_entry_count(), 2);
@@ -224,19 +224,19 @@ mod tests {
     fn test_index_builder_write_empty() {
         let dir = tempdir().unwrap();
         let segment_path = dir.path().join("empty.lnc");
-        
+
         let builder = IndexBuilder::with_defaults();
-        
+
         // Writing empty builder should still create valid (empty) index files
         let (sparse_path, secondary_path) = builder.write_indexes(&segment_path).unwrap();
-        
+
         assert!(sparse_path.exists());
         assert!(secondary_path.exists());
-        
+
         // Files should be empty or minimal
         let sparse_size = std::fs::metadata(&sparse_path).unwrap().len();
         let secondary_size = std::fs::metadata(&secondary_path).unwrap().len();
-        
+
         assert_eq!(sparse_size, 0);
         assert_eq!(secondary_size, 0);
     }
@@ -244,13 +244,13 @@ mod tests {
     #[test]
     fn test_index_builder_large_dataset() {
         let mut builder = IndexBuilder::new(1000, 1_000_000_000);
-        
+
         // Add 100k records to test scaling
         for i in 0u64..100_000 {
             let sort_key = SortKey::from_timestamp_ns(i * 1_000_000, (i % 1000) as u32);
             builder.add_record(sort_key, i * 1_000_000, i * 100);
         }
-        
+
         assert_eq!(builder.record_count(), 100_000);
         // 100k records / 1000 interval = 100 sparse entries
         assert_eq!(builder.sparse_entry_count(), 100);

@@ -1,4 +1,4 @@
-use crate::{LanceError, Result, SortKey, DEFAULT_BATCH_SIZE};
+use crate::{DEFAULT_BATCH_SIZE, LanceError, Result, SortKey};
 use bytes::Bytes;
 use crossbeam::queue::ArrayQueue;
 use std::sync::Arc;

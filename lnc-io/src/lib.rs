@@ -8,11 +8,11 @@ mod segment;
 mod tier;
 mod wal;
 
-pub use backend::{probe_io_uring, IoBackend, IoBackendType};
+pub use backend::{IoBackend, IoBackendType, probe_io_uring};
 pub use priority::{IoPriority, IoPriorityQueue, IoPriorityStats, PrioritizedIoRequest};
 pub use segment::{
-    close_unclosed_segments, BorrowedSlice, CompactionConfig, CompactionResult, SegmentCompactor,
-    SegmentMetadata, SegmentReader, SegmentState, SegmentWriter, ZeroCopyReader,
+    BorrowedSlice, CompactionConfig, CompactionResult, SegmentCompactor, SegmentMetadata,
+    SegmentReader, SegmentState, SegmentWriter, ZeroCopyReader, close_unclosed_segments,
 };
 pub use tier::{
     StorageTier, TierConfig, TierMoveResult, TierStats, TierableSegment, TieredStorageConfig,
@@ -25,8 +25,8 @@ pub mod uring;
 
 #[cfg(target_os = "linux")]
 pub use uring::{
-    probe_send_zc, probe_splice, probe_tee, SendZcSupport, SpliceForwarder, SplicePipe,
-    SpliceSupport, TeeForwarder, TeeSupport, ZeroCopySender,
+    SendZcSupport, SpliceForwarder, SplicePipe, SpliceSupport, TeeForwarder, TeeSupport,
+    ZeroCopySender, probe_send_zc, probe_splice, probe_tee,
 };
 
 pub mod fallback;

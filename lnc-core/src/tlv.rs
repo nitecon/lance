@@ -11,7 +11,7 @@
 //! - Extended type: 2 bytes (little-endian)
 //! - Length: 4 bytes (little-endian)
 
-use crate::{LanceError, Result, EXTENDED_TLV_HEADER_SIZE, EXTENDED_TYPE_MARKER, TLV_HEADER_SIZE};
+use crate::{EXTENDED_TLV_HEADER_SIZE, EXTENDED_TYPE_MARKER, LanceError, Result, TLV_HEADER_SIZE};
 
 /// Standard record types (0x00-0xFE)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

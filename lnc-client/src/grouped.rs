@@ -70,12 +70,12 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 
 use crate::client::{ClientConfig, LanceClient};
 use crate::consumer::{PollResult, SeekPosition};
@@ -125,9 +125,9 @@ impl GroupConfig {
             assignment_strategy: AssignmentStrategy::RoundRobin,
             heartbeat_interval: Duration::from_secs(3),
             session_timeout: Duration::from_secs(30),
-            coordinator_addr: "127.0.0.1:19920".parse().unwrap_or_else(|_| {
-                SocketAddr::from(([127, 0, 0, 1], 19920))
-            }),
+            coordinator_addr: "127.0.0.1:19920"
+                .parse()
+                .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 19920))),
             server_addr: "127.0.0.1:1992".to_string(),
             offset_dir: None,
         }
@@ -249,7 +249,7 @@ impl GroupCoordinator {
     /// Start the coordinator and begin listening for workers
     pub async fn start(server_addr: &str, mut config: GroupConfig) -> Result<Self> {
         config.server_addr = server_addr.to_string();
-        
+
         // Discover topics if not specified
         if config.topics.is_empty() {
             let socket_addr: SocketAddr = config.server_addr.parse().map_err(|e| {
@@ -266,11 +266,11 @@ impl GroupCoordinator {
         let running = Arc::new(AtomicBool::new(true));
         let (shutdown_tx, _) = broadcast::channel(1);
 
-        let listener = TcpListener::bind(config.coordinator_addr).await
+        let listener = TcpListener::bind(config.coordinator_addr)
+            .await
             .map_err(ClientError::ConnectionFailed)?;
-        
-        let join_addr = listener.local_addr()
-            .map_err(ClientError::IoError)?;
+
+        let join_addr = listener.local_addr().map_err(ClientError::IoError)?;
 
         let coordinator = Self {
             config: config.clone(),
@@ -392,7 +392,7 @@ impl GroupCoordinator {
         // Simple protocol: length-prefixed JSON messages
         // In production, use proper framing like LWP
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        
+
         let (mut reader, mut writer) = stream.into_split();
         let mut buf = vec![0u8; 4096];
 
@@ -406,13 +406,8 @@ impl GroupCoordinator {
             // Parse message (simplified - in production use proper serialization)
             let msg_str = std::str::from_utf8(&buf[..n])
                 .map_err(|e| ClientError::ProtocolError(e.to_string()))?;
-            
-            let response = Self::process_message(
-                msg_str,
-                &workers,
-                &generation,
-                &config,
-            ).await;
+
+            let response = Self::process_message(msg_str, &workers, &generation, &config).await;
 
             // Send response
             let response_bytes = format!("{:?}", response);
@@ -431,16 +426,32 @@ impl GroupCoordinator {
     ) -> CoordinatorResponse {
         // Parse message (simplified)
         if msg.starts_with("JOIN:") {
-            let worker_id = msg.strip_prefix("JOIN:").unwrap_or("unknown").trim().to_string();
+            let worker_id = msg
+                .strip_prefix("JOIN:")
+                .unwrap_or("unknown")
+                .trim()
+                .to_string();
             Self::handle_join(worker_id, workers, generation, config).await
         } else if msg.starts_with("LEAVE:") {
-            let worker_id = msg.strip_prefix("LEAVE:").unwrap_or("unknown").trim().to_string();
+            let worker_id = msg
+                .strip_prefix("LEAVE:")
+                .unwrap_or("unknown")
+                .trim()
+                .to_string();
             Self::handle_leave(worker_id, workers, generation, config).await
         } else if msg.starts_with("HEARTBEAT:") {
-            let worker_id = msg.strip_prefix("HEARTBEAT:").unwrap_or("unknown").trim().to_string();
+            let worker_id = msg
+                .strip_prefix("HEARTBEAT:")
+                .unwrap_or("unknown")
+                .trim()
+                .to_string();
             Self::handle_heartbeat(worker_id, workers, generation).await
         } else if msg.starts_with("GET_ASSIGNMENTS:") {
-            let worker_id = msg.strip_prefix("GET_ASSIGNMENTS:").unwrap_or("unknown").trim().to_string();
+            let worker_id = msg
+                .strip_prefix("GET_ASSIGNMENTS:")
+                .unwrap_or("unknown")
+                .trim()
+                .to_string();
             Self::handle_get_assignments(worker_id, workers, generation).await
         } else {
             CoordinatorResponse::Error {
@@ -457,7 +468,7 @@ impl GroupCoordinator {
         config: &GroupConfig,
     ) -> CoordinatorResponse {
         let new_gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
-        
+
         {
             let mut workers_lock = workers.write().await;
             workers_lock.insert(
@@ -473,7 +484,7 @@ impl GroupCoordinator {
 
         // Rebalance assignments
         let _assignments = Self::rebalance(workers, config).await;
-        
+
         // Get this worker's assignments
         let worker_assignments = {
             let workers_lock = workers.read().await;
@@ -503,7 +514,7 @@ impl GroupCoordinator {
         }
 
         generation.fetch_add(1, Ordering::SeqCst);
-        
+
         // Rebalance remaining workers
         Self::rebalance(workers, config).await;
 
@@ -517,7 +528,7 @@ impl GroupCoordinator {
         generation: &Arc<AtomicU64>,
     ) -> CoordinatorResponse {
         let current_gen = generation.load(Ordering::Relaxed);
-        
+
         let mut workers_lock = workers.write().await;
         if let Some(worker) = workers_lock.get_mut(&worker_id) {
             worker.last_heartbeat = Instant::now();
@@ -539,7 +550,7 @@ impl GroupCoordinator {
     ) -> CoordinatorResponse {
         let current_gen = generation.load(Ordering::Relaxed);
         let workers_lock = workers.read().await;
-        
+
         if let Some(worker) = workers_lock.get(&worker_id) {
             CoordinatorResponse::Assignments {
                 generation: current_gen,
@@ -588,18 +599,14 @@ impl GroupCoordinator {
     ) -> HashMap<String, Vec<u32>> {
         let mut workers_lock = workers.write().await;
         let worker_ids: Vec<String> = workers_lock.keys().cloned().collect();
-        
+
         if worker_ids.is_empty() {
             return HashMap::new();
         }
 
         let assignments = match config.assignment_strategy {
-            AssignmentStrategy::RoundRobin => {
-                Self::assign_round_robin(&config.topics, &worker_ids)
-            }
-            AssignmentStrategy::Range => {
-                Self::assign_range(&config.topics, &worker_ids)
-            }
+            AssignmentStrategy::RoundRobin => Self::assign_round_robin(&config.topics, &worker_ids),
+            AssignmentStrategy::Range => Self::assign_range(&config.topics, &worker_ids),
             AssignmentStrategy::Sticky => {
                 // For sticky, we try to maintain existing assignments
                 let existing: HashMap<String, Vec<u32>> = workers_lock
@@ -607,7 +614,7 @@ impl GroupCoordinator {
                     .map(|(id, state)| (id.clone(), state.assignments.clone()))
                     .collect();
                 Self::assign_sticky(&config.topics, &worker_ids, &existing)
-            }
+            },
         };
 
         // Update worker states
@@ -622,10 +629,8 @@ impl GroupCoordinator {
 
     /// Round-robin assignment strategy
     fn assign_round_robin(topics: &[u32], workers: &[String]) -> HashMap<String, Vec<u32>> {
-        let mut assignments: HashMap<String, Vec<u32>> = workers
-            .iter()
-            .map(|w| (w.clone(), Vec::new()))
-            .collect();
+        let mut assignments: HashMap<String, Vec<u32>> =
+            workers.iter().map(|w| (w.clone(), Vec::new())).collect();
 
         for (i, topic) in topics.iter().enumerate() {
             let worker = &workers[i % workers.len()];
@@ -639,10 +644,8 @@ impl GroupCoordinator {
 
     /// Range assignment strategy
     fn assign_range(topics: &[u32], workers: &[String]) -> HashMap<String, Vec<u32>> {
-        let mut assignments: HashMap<String, Vec<u32>> = workers
-            .iter()
-            .map(|w| (w.clone(), Vec::new()))
-            .collect();
+        let mut assignments: HashMap<String, Vec<u32>> =
+            workers.iter().map(|w| (w.clone(), Vec::new())).collect();
 
         let topics_per_worker = topics.len() / workers.len();
         let remainder = topics.len() % workers.len();
@@ -651,7 +654,7 @@ impl GroupCoordinator {
         for (worker_idx, worker) in workers.iter().enumerate() {
             let extra = if worker_idx < remainder { 1 } else { 0 };
             let count = topics_per_worker + extra;
-            
+
             if let Some(worker_topics) = assignments.get_mut(worker) {
                 for _ in 0..count {
                     if topic_idx < topics.len() {
@@ -671,10 +674,8 @@ impl GroupCoordinator {
         workers: &[String],
         existing: &HashMap<String, Vec<u32>>,
     ) -> HashMap<String, Vec<u32>> {
-        let mut assignments: HashMap<String, Vec<u32>> = workers
-            .iter()
-            .map(|w| (w.clone(), Vec::new()))
-            .collect();
+        let mut assignments: HashMap<String, Vec<u32>> =
+            workers.iter().map(|w| (w.clone(), Vec::new())).collect();
 
         let topic_set: HashSet<u32> = topics.iter().copied().collect();
         let mut assigned: HashSet<u32> = HashSet::new();
@@ -797,7 +798,8 @@ impl GroupedConsumer {
         config: WorkerConfig,
     ) -> Result<Self> {
         // Connect to coordinator
-        let mut stream = TcpStream::connect(coordinator_addr).await
+        let mut stream = TcpStream::connect(coordinator_addr)
+            .await
             .map_err(ClientError::ConnectionFailed)?;
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -828,11 +830,13 @@ impl GroupedConsumer {
             let standalone_config = StandaloneConfig::new(&config.worker_id, *topic_id)
                 .with_max_fetch_bytes(config.max_fetch_bytes)
                 .with_start_position(config.start_position);
-            
+
             if let Some(ref dir) = config.offset_dir {
-                let consumer = StandaloneConsumer::connect(server_addr, 
-                    standalone_config.with_offset_dir(dir)
-                ).await?;
+                let consumer = StandaloneConsumer::connect(
+                    server_addr,
+                    standalone_config.with_offset_dir(dir),
+                )
+                .await?;
                 consumers.insert(*topic_id, consumer);
             } else {
                 let consumer = StandaloneConsumer::connect(server_addr, standalone_config).await?;
@@ -896,7 +900,8 @@ impl GroupedConsumer {
 
     /// Send heartbeat to coordinator
     pub async fn heartbeat(&mut self) -> Result<u64> {
-        let mut stream = TcpStream::connect(self.coordinator_addr).await
+        let mut stream = TcpStream::connect(self.coordinator_addr)
+            .await
             .map_err(ClientError::ConnectionFailed)?;
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -911,7 +916,7 @@ impl GroupedConsumer {
 
         // Check if generation changed (rebalance needed)
         let new_gen = Self::parse_heartbeat_response(response)?;
-        
+
         if new_gen > self.generation {
             // Fetch new assignments
             self.refresh_assignments().await?;
@@ -922,7 +927,8 @@ impl GroupedConsumer {
 
     /// Refresh assignments from coordinator
     async fn refresh_assignments(&mut self) -> Result<()> {
-        let mut stream = TcpStream::connect(self.coordinator_addr).await
+        let mut stream = TcpStream::connect(self.coordinator_addr)
+            .await
             .map_err(ClientError::ConnectionFailed)?;
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -953,15 +959,17 @@ impl GroupedConsumer {
             let standalone_config = StandaloneConfig::new(&self.config.worker_id, *topic_id)
                 .with_max_fetch_bytes(self.config.max_fetch_bytes)
                 .with_start_position(self.config.start_position);
-            
+
             let consumer = if let Some(ref dir) = self.config.offset_dir {
-                StandaloneConsumer::connect(&self.server_addr, 
-                    standalone_config.with_offset_dir(dir)
-                ).await?
+                StandaloneConsumer::connect(
+                    &self.server_addr,
+                    standalone_config.with_offset_dir(dir),
+                )
+                .await?
             } else {
                 StandaloneConsumer::connect(&self.server_addr, standalone_config).await?
             };
-            
+
             self.consumers.insert(*topic_id, consumer);
         }
 
@@ -977,7 +985,8 @@ impl GroupedConsumer {
         self.commit_all().await?;
 
         // Notify coordinator
-        let mut stream = TcpStream::connect(self.coordinator_addr).await
+        let mut stream = TcpStream::connect(self.coordinator_addr)
+            .await
             .map_err(ClientError::ConnectionFailed)?;
 
         use tokio::io::AsyncWriteExt;
@@ -998,7 +1007,7 @@ impl GroupedConsumer {
     fn parse_join_response(response: &str) -> Result<(u64, Vec<u32>)> {
         // Format: "JoinAccepted { worker_id: ..., generation: N, assignments: [1, 2, 3] }"
         // This is a simplified parser - production would use proper serialization
-        
+
         let generation = response
             .find("generation: ")
             .and_then(|i| {
@@ -1029,7 +1038,9 @@ impl GroupedConsumer {
             .find("generation: ")
             .and_then(|i| {
                 let start = i + 12;
-                let end = response[start..].find([',', ' ', '}']).unwrap_or(response.len() - start);
+                let end = response[start..]
+                    .find([',', ' ', '}'])
+                    .unwrap_or(response.len() - start);
                 response[start..start + end].parse().ok()
             })
             .ok_or_else(|| ClientError::ProtocolError("Invalid heartbeat response".to_string()))
@@ -1059,7 +1070,7 @@ mod tests {
     #[test]
     fn test_group_config_defaults() {
         let config = GroupConfig::new("test-group");
-        
+
         assert_eq!(config.group_id, "test-group");
         assert!(config.topics.is_empty());
         assert_eq!(config.assignment_strategy, AssignmentStrategy::RoundRobin);
@@ -1068,7 +1079,7 @@ mod tests {
     #[test]
     fn test_worker_config_defaults() {
         let config = WorkerConfig::new("worker-1");
-        
+
         assert_eq!(config.worker_id, "worker-1");
         assert_eq!(config.max_fetch_bytes, 1_048_576);
     }
@@ -1077,9 +1088,9 @@ mod tests {
     fn test_round_robin_assignment() {
         let topics = vec![1, 2, 3, 4, 5, 6];
         let workers = vec!["w1".to_string(), "w2".to_string(), "w3".to_string()];
-        
+
         let assignments = GroupCoordinator::assign_round_robin(&topics, &workers);
-        
+
         assert_eq!(assignments.get("w1"), Some(&vec![1, 4]));
         assert_eq!(assignments.get("w2"), Some(&vec![2, 5]));
         assert_eq!(assignments.get("w3"), Some(&vec![3, 6]));
@@ -1089,9 +1100,9 @@ mod tests {
     fn test_range_assignment() {
         let topics = vec![1, 2, 3, 4, 5, 6, 7];
         let workers = vec!["w1".to_string(), "w2".to_string(), "w3".to_string()];
-        
+
         let assignments = GroupCoordinator::assign_range(&topics, &workers);
-        
+
         // 7 topics / 3 workers = 2 each + 1 remainder
         // w1 gets 3, w2 gets 2, w3 gets 2
         assert_eq!(assignments.get("w1").map(|v| v.len()), Some(3));
@@ -1103,13 +1114,13 @@ mod tests {
     fn test_sticky_assignment_preserves_existing() {
         let topics = vec![1, 2, 3, 4];
         let workers = vec!["w1".to_string(), "w2".to_string()];
-        
+
         let mut existing = HashMap::new();
         existing.insert("w1".to_string(), vec![1, 2]);
         existing.insert("w2".to_string(), vec![3, 4]);
-        
+
         let assignments = GroupCoordinator::assign_sticky(&topics, &workers, &existing);
-        
+
         // Should preserve existing assignments
         assert_eq!(assignments.get("w1"), Some(&vec![1, 2]));
         assert_eq!(assignments.get("w2"), Some(&vec![3, 4]));
@@ -1117,6 +1128,9 @@ mod tests {
 
     #[test]
     fn test_assignment_strategy_default() {
-        assert_eq!(AssignmentStrategy::default(), AssignmentStrategy::RoundRobin);
+        assert_eq!(
+            AssignmentStrategy::default(),
+            AssignmentStrategy::RoundRobin
+        );
     }
 }

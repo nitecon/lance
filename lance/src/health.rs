@@ -14,8 +14,8 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info};
@@ -179,7 +179,10 @@ async fn handle_request(
         (&Method::DELETE, "/admin/ready") => {
             // Set not ready (for maintenance)
             state.set_ready(false);
-            json_response(StatusCode::OK, r#"{"status":"not_ready","action":"disabled"}"#)
+            json_response(
+                StatusCode::OK,
+                r#"{"status":"not_ready","action":"disabled"}"#,
+            )
         },
         _ => json_response(StatusCode::NOT_FOUND, r#"{"error":"not_found"}"#),
     };

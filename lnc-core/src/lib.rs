@@ -21,17 +21,17 @@ pub use backpressure::{
 pub use batch::{BatchPool, IngestionBatch, LoanableBatch};
 pub use buffer::{AlignedBuffer, NumaAlignedBuffer};
 pub use chaos::{
-    shared_injector, ChaosConfig, ChaosInjector, ChaosScenario, FaultType, SharedChaosInjector,
+    ChaosConfig, ChaosInjector, ChaosScenario, FaultType, SharedChaosInjector, shared_injector,
 };
 pub use checksum::crc32c;
 pub use error::{LanceError, Result};
 pub use hlc::{ClockHealth, HlcTimestamp, HybridLogicalClock};
 pub use numa::{
-    get_current_numa_node, pin_thread_to_cpu, pin_thread_to_numa_node, NumaAllocator,
-    NumaThreadPoolConfig, NumaTopology,
+    NumaAllocator, NumaThreadPoolConfig, NumaTopology, get_current_numa_node, pin_thread_to_cpu,
+    pin_thread_to_numa_node,
 };
 pub use sort_key::SortKey;
-pub use tlv::{parse_header, Header};
+pub use tlv::{Header, parse_header};
 
 pub const LANCE_MAGIC: [u8; 4] = [0x4C, 0x41, 0x4E, 0x43]; // 'LANC'
 pub const TLV_HEADER_SIZE: usize = 5;

@@ -1,13 +1,13 @@
 //! Ingestion actor - batch processing and record ingestion
 
-use super::writer::{create_topic_writer, rotate_topic_segment, TopicWriter};
+use super::writer::{TopicWriter, create_topic_writer, rotate_topic_segment};
 use crate::config::Config;
 use crate::topic::TopicRegistry;
 use bytes::Bytes;
 use lnc_core::{BatchPool, LanceError, Result, SortKey};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
 
 static SEQUENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -38,12 +38,9 @@ pub async fn run_ingestion_actor(
         let topic_id = request.topic_id;
 
         // Process request, handling errors gracefully without crashing the actor
-        if let Err(e) = process_ingestion_request(
-            &config,
-            &topic_registry,
-            &mut topic_writers,
-            request,
-        ) {
+        if let Err(e) =
+            process_ingestion_request(&config, &topic_registry, &mut topic_writers, request)
+        {
             // Log error but continue processing other requests
             tracing::warn!(
                 target: "lance::ingestion",

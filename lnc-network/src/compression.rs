@@ -55,8 +55,7 @@ impl CompressionAlgorithm {
 }
 
 /// Compression error types
-#[derive(Debug, Clone)]
-#[derive(PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CompressionError {
     /// Compression failed
     CompressionFailed(String),
@@ -79,7 +78,7 @@ impl std::fmt::Display for CompressionError {
             Self::UnsupportedAlgorithm(alg) => write!(f, "Unsupported algorithm: 0x{:02x}", alg),
             Self::SizeExceeded { actual, limit } => {
                 write!(f, "Decompressed size {} exceeds limit {}", actual, limit)
-            }
+            },
         }
     }
 }
@@ -204,22 +203,18 @@ impl Compressor {
         match self.algorithm {
             CompressionAlgorithm::None => Ok(data.to_vec()),
             #[cfg(feature = "lz4")]
-            CompressionAlgorithm::Lz4 => {
-                Ok(lz4_flex::compress_prepend_size(data))
-            }
+            CompressionAlgorithm::Lz4 => Ok(lz4_flex::compress_prepend_size(data)),
             #[cfg(not(feature = "lz4"))]
             CompressionAlgorithm::Lz4 => {
                 Err(CompressionError::UnsupportedAlgorithm(self.algorithm as u8))
-            }
+            },
             #[cfg(feature = "zstd")]
-            CompressionAlgorithm::Zstd => {
-                zstd::encode_all(std::io::Cursor::new(data), self.level)
-                    .map_err(|e| CompressionError::CompressionFailed(e.to_string()))
-            }
+            CompressionAlgorithm::Zstd => zstd::encode_all(std::io::Cursor::new(data), self.level)
+                .map_err(|e| CompressionError::CompressionFailed(e.to_string())),
             #[cfg(not(feature = "zstd"))]
             CompressionAlgorithm::Zstd => {
                 Err(CompressionError::UnsupportedAlgorithm(self.algorithm as u8))
-            }
+            },
         }
     }
 
@@ -233,25 +228,21 @@ impl Compressor {
         match algorithm {
             CompressionAlgorithm::None => Ok(Bytes::copy_from_slice(data)),
             #[cfg(feature = "lz4")]
-            CompressionAlgorithm::Lz4 => {
-                lz4_flex::decompress_size_prepended(data)
-                    .map(Bytes::from)
-                    .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))
-            }
+            CompressionAlgorithm::Lz4 => lz4_flex::decompress_size_prepended(data)
+                .map(Bytes::from)
+                .map_err(|e| CompressionError::DecompressionFailed(e.to_string())),
             #[cfg(not(feature = "lz4"))]
             CompressionAlgorithm::Lz4 => {
                 Err(CompressionError::UnsupportedAlgorithm(algorithm as u8))
-            }
+            },
             #[cfg(feature = "zstd")]
-            CompressionAlgorithm::Zstd => {
-                zstd::decode_all(std::io::Cursor::new(data))
-                    .map(Bytes::from)
-                    .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))
-            }
+            CompressionAlgorithm::Zstd => zstd::decode_all(std::io::Cursor::new(data))
+                .map(Bytes::from)
+                .map_err(|e| CompressionError::DecompressionFailed(e.to_string())),
             #[cfg(not(feature = "zstd"))]
             CompressionAlgorithm::Zstd => {
                 Err(CompressionError::UnsupportedAlgorithm(algorithm as u8))
-            }
+            },
         }
     }
 
@@ -342,7 +333,10 @@ mod tests {
         let result = compressor.decompress(&data);
         assert!(matches!(
             result,
-            Err(CompressionError::SizeExceeded { actual: 1000, limit: 100 })
+            Err(CompressionError::SizeExceeded {
+                actual: 1000,
+                limit: 100
+            })
         ));
     }
 
@@ -351,12 +345,18 @@ mod tests {
     fn test_lz4_compress_decompress_roundtrip() {
         let compressor = Compressor::lz4();
         let original = b"Hello, this is a test payload for LZ4 compression roundtrip testing!";
-        
+
         let compressed = compressor.compress(original).expect("compression failed");
         assert!(compressed.len() > 0, "compressed data should not be empty");
-        
-        let decompressed = compressor.decompress(&compressed).expect("decompression failed");
-        assert_eq!(decompressed.as_ref(), original, "roundtrip should preserve data");
+
+        let decompressed = compressor
+            .decompress(&compressed)
+            .expect("decompression failed");
+        assert_eq!(
+            decompressed.as_ref(),
+            original,
+            "roundtrip should preserve data"
+        );
     }
 
     #[cfg(feature = "zstd")]
@@ -364,12 +364,18 @@ mod tests {
     fn test_zstd_compress_decompress_roundtrip() {
         let compressor = Compressor::zstd(3);
         let original = b"Hello, this is a test payload for ZSTD compression roundtrip testing!";
-        
+
         let compressed = compressor.compress(original).expect("compression failed");
         assert!(compressed.len() > 0, "compressed data should not be empty");
-        
-        let decompressed = compressor.decompress(&compressed).expect("decompression failed");
-        assert_eq!(decompressed.as_ref(), original, "roundtrip should preserve data");
+
+        let decompressed = compressor
+            .decompress(&compressed)
+            .expect("decompression failed");
+        assert_eq!(
+            decompressed.as_ref(),
+            original,
+            "roundtrip should preserve data"
+        );
     }
 
     #[cfg(feature = "lz4")]
@@ -378,12 +384,17 @@ mod tests {
         let compressor = Compressor::lz4();
         // Create a 64KB payload with repeating pattern (compresses well)
         let original: Vec<u8> = (0..65536).map(|i| (i % 256) as u8).collect();
-        
+
         let compressed = compressor.compress(&original).expect("compression failed");
         // LZ4 should achieve significant compression on repetitive data
-        assert!(compressed.len() < original.len(), "LZ4 should compress repetitive data");
-        
-        let decompressed = compressor.decompress(&compressed).expect("decompression failed");
+        assert!(
+            compressed.len() < original.len(),
+            "LZ4 should compress repetitive data"
+        );
+
+        let decompressed = compressor
+            .decompress(&compressed)
+            .expect("decompression failed");
         assert_eq!(decompressed.as_ref(), original.as_slice());
     }
 
@@ -393,17 +404,22 @@ mod tests {
         let compressor = Compressor::zstd(3);
         // Create a 64KB payload with repeating pattern (compresses well)
         let original: Vec<u8> = (0..65536).map(|i| (i % 256) as u8).collect();
-        
+
         let compressed = compressor.compress(&original).expect("compression failed");
         // ZSTD should achieve significant compression on repetitive data
-        assert!(compressed.len() < original.len(), "ZSTD should compress repetitive data");
-        
-        let decompressed = compressor.decompress(&compressed).expect("decompression failed");
+        assert!(
+            compressed.len() < original.len(),
+            "ZSTD should compress repetitive data"
+        );
+
+        let decompressed = compressor
+            .decompress(&compressed)
+            .expect("decompression failed");
         assert_eq!(decompressed.as_ref(), original.as_slice());
     }
 
     /// Benchmark: Measure to_vec() overhead for CompressionAlgorithm::None
-    /// 
+    ///
     /// This test measures the cost of the data.to_vec() call in compress_raw()
     /// when compression is disabled. This is important for understanding the
     /// performance impact on the hot path when compression is not used.
@@ -412,28 +428,32 @@ mod tests {
         use std::time::Instant;
 
         let compressor = Compressor::default(); // None algorithm
-        
+
         // Test various payload sizes typical in LANCE
         let sizes = [1024, 4096, 16384, 65536, 262144]; // 1KB, 4KB, 16KB, 64KB, 256KB
         let iterations = 1000;
 
         println!("\n=== to_vec() Overhead Benchmark (CompressionAlgorithm::None) ===");
-        println!("{:<12} {:>12} {:>12} {:>12}", "Size", "Total (µs)", "Per-op (ns)", "Throughput");
+        println!(
+            "{:<12} {:>12} {:>12} {:>12}",
+            "Size", "Total (µs)", "Per-op (ns)", "Throughput"
+        );
         println!("{}", "-".repeat(52));
 
         for size in sizes {
             let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
-            
+
             let start = Instant::now();
             for _ in 0..iterations {
                 let _ = compressor.compress(&data);
             }
             let elapsed = start.elapsed();
-            
+
             let total_us = elapsed.as_micros();
             let per_op_ns = elapsed.as_nanos() / iterations as u128;
-            let throughput_mbps = (size as f64 * iterations as f64) / elapsed.as_secs_f64() / 1_000_000.0;
-            
+            let throughput_mbps =
+                (size as f64 * iterations as f64) / elapsed.as_secs_f64() / 1_000_000.0;
+
             println!(
                 "{:<12} {:>12} {:>12} {:>10.2} MB/s",
                 format!("{}B", size),
@@ -441,12 +461,12 @@ mod tests {
                 per_op_ns,
                 throughput_mbps
             );
-            
+
             // Verify the copy happened correctly
             let result = compressor.compress(&data).unwrap();
             assert_eq!(result.len(), data.len());
         }
-        
+
         println!("\nNote: to_vec() creates a full copy. Consider Bytes::copy_from_slice()");
         println!("or Cow<[u8]> if zero-copy passthrough is needed on hot path.\n");
     }

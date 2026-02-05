@@ -38,8 +38,8 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -261,9 +261,9 @@ pub struct ConnectionPool {
 impl ConnectionPool {
     /// Create a new connection pool
     pub async fn new(addr: &str, config: ConnectionPoolConfig) -> Result<Self> {
-        let socket_addr: SocketAddr = addr.parse().map_err(|e| {
-            ClientError::ProtocolError(format!("Invalid address: {}", e))
-        })?;
+        let socket_addr: SocketAddr = addr
+            .parse()
+            .map_err(|e| ClientError::ProtocolError(format!("Invalid address: {}", e)))?;
 
         let pool = Self {
             addr: socket_addr,
@@ -279,7 +279,9 @@ impl ConnectionPool {
             if let Ok(conn) = pool.create_connection().await {
                 let mut connections = pool.connections.lock().await;
                 connections.push_back(conn);
-                pool.metrics.idle_connections.fetch_add(1, Ordering::Relaxed);
+                pool.metrics
+                    .idle_connections
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -303,7 +305,9 @@ impl ConnectionPool {
 
     /// Get a connection from the pool
     pub async fn get(&self) -> Result<PooledClient> {
-        self.metrics.acquire_attempts.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .acquire_attempts
+            .fetch_add(1, Ordering::Relaxed);
 
         // Acquire permit with timeout
         let permit = tokio::time::timeout(
@@ -312,11 +316,15 @@ impl ConnectionPool {
         )
         .await
         .map_err(|_| {
-            self.metrics.acquire_failures.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .acquire_failures
+                .fetch_add(1, Ordering::Relaxed);
             ClientError::Timeout
         })?
         .map_err(|_| {
-            self.metrics.acquire_failures.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .acquire_failures
+                .fetch_add(1, Ordering::Relaxed);
             ClientError::ConnectionClosed
         })?;
 
@@ -326,17 +334,21 @@ impl ConnectionPool {
             loop {
                 match connections.pop_front() {
                     Some(conn) => {
-                        self.metrics.idle_connections.fetch_sub(1, Ordering::Relaxed);
-                        
+                        self.metrics
+                            .idle_connections
+                            .fetch_sub(1, Ordering::Relaxed);
+
                         // Check if connection is still valid
                         if conn.is_expired(self.config.max_lifetime)
                             || conn.is_idle_too_long(self.config.idle_timeout)
                         {
-                            self.metrics.connections_closed.fetch_add(1, Ordering::Relaxed);
+                            self.metrics
+                                .connections_closed
+                                .fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
                         break Some(conn);
-                    }
+                    },
                     None => break None,
                 }
             }
@@ -346,15 +358,19 @@ impl ConnectionPool {
             Some(mut c) => {
                 c.last_used = Instant::now();
                 c
-            }
+            },
             None => {
                 // Create a new connection
                 self.create_connection().await?
-            }
+            },
         };
 
-        self.metrics.active_connections.fetch_add(1, Ordering::Relaxed);
-        self.metrics.acquire_successes.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .acquire_successes
+            .fetch_add(1, Ordering::Relaxed);
 
         Ok(PooledClient {
             conn: Some(conn),
@@ -371,14 +387,12 @@ impl ConnectionPool {
         client_config.connect_timeout = self.config.connect_timeout;
 
         let client = match &self.config.tls_config {
-            Some(tls_config) => {
-                LanceClient::connect_tls(client_config, tls_config.clone()).await?
-            }
-            None => {
-                LanceClient::connect(client_config).await?
-            }
+            Some(tls_config) => LanceClient::connect_tls(client_config, tls_config.clone()).await?,
+            None => LanceClient::connect(client_config).await?,
         };
-        self.metrics.connections_created.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .connections_created
+            .fetch_add(1, Ordering::Relaxed);
 
         Ok(PooledConnection::new(client))
     }
@@ -391,11 +405,13 @@ impl ConnectionPool {
     /// Close the pool
     pub async fn close(&self) {
         self.running.store(false, Ordering::Relaxed);
-        
+
         let mut connections = self.connections.lock().await;
         let count = connections.len() as u64;
         connections.clear();
-        self.metrics.connections_closed.fetch_add(count, Ordering::Relaxed);
+        self.metrics
+            .connections_closed
+            .fetch_add(count, Ordering::Relaxed);
         self.metrics.idle_connections.store(0, Ordering::Relaxed);
     }
 
@@ -418,7 +434,9 @@ impl ConnectionPool {
             for mut conn in to_check.drain(..) {
                 // Check expiry
                 if conn.is_expired(self.config.max_lifetime) {
-                    self.metrics.connections_closed.fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .connections_closed
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
@@ -427,11 +445,15 @@ impl ConnectionPool {
                     Ok(_) => {
                         conn.last_used = Instant::now();
                         healthy.push_back(conn);
-                    }
+                    },
                     Err(_) => {
-                        self.metrics.health_check_failures.fetch_add(1, Ordering::Relaxed);
-                        self.metrics.connections_closed.fetch_add(1, Ordering::Relaxed);
-                    }
+                        self.metrics
+                            .health_check_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics
+                            .connections_closed
+                            .fetch_add(1, Ordering::Relaxed);
+                    },
                 }
             }
 
@@ -439,7 +461,9 @@ impl ConnectionPool {
             {
                 let mut connections = self.connections.lock().await;
                 connections.extend(healthy);
-                self.metrics.idle_connections.store(connections.len() as u64, Ordering::Relaxed);
+                self.metrics
+                    .idle_connections
+                    .store(connections.len() as u64, Ordering::Relaxed);
             }
         }
     }
@@ -477,7 +501,9 @@ impl PooledClient {
     /// Mark the connection as unhealthy (don't return to pool)
     pub fn mark_unhealthy(&mut self) {
         self.conn = None;
-        self.metrics.connections_closed.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .connections_closed
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -485,11 +511,11 @@ impl Drop for PooledClient {
     fn drop(&mut self) {
         if let Some(mut conn) = self.conn.take() {
             conn.last_used = Instant::now();
-            
+
             // Return to pool
             let pool = self.pool.clone();
             let metrics = self.metrics.clone();
-            
+
             tokio::spawn(async move {
                 let mut connections = pool.lock().await;
                 connections.push_back(conn);
@@ -497,9 +523,11 @@ impl Drop for PooledClient {
                 metrics.idle_connections.fetch_add(1, Ordering::Relaxed);
             });
         } else {
-            self.metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
+            self.metrics
+                .active_connections
+                .fetch_sub(1, Ordering::Relaxed);
         }
-        
+
         // Permit is released when dropped
     }
 }
@@ -524,10 +552,10 @@ pub struct ReconnectingClient {
 impl ReconnectingClient {
     /// Create a new reconnecting client
     pub async fn connect(addr: &str) -> Result<Self> {
-        let socket_addr: SocketAddr = addr.parse().map_err(|e| {
-            ClientError::ProtocolError(format!("Invalid address: {}", e))
-        })?;
-        
+        let socket_addr: SocketAddr = addr
+            .parse()
+            .map_err(|e| ClientError::ProtocolError(format!("Invalid address: {}", e)))?;
+
         let config = ClientConfig::new(socket_addr);
         let client = LanceClient::connect(config.clone()).await?;
 
@@ -547,10 +575,10 @@ impl ReconnectingClient {
 
     /// Create a new reconnecting client with TLS
     pub async fn connect_tls(addr: &str, tls_config: TlsClientConfig) -> Result<Self> {
-        let socket_addr: SocketAddr = addr.parse().map_err(|e| {
-            ClientError::ProtocolError(format!("Invalid address: {}", e))
-        })?;
-        
+        let socket_addr: SocketAddr = addr
+            .parse()
+            .map_err(|e| ClientError::ProtocolError(format!("Invalid address: {}", e)))?;
+
         let config = ClientConfig::new(socket_addr);
         let client = LanceClient::connect_tls(config.clone(), tls_config.clone()).await?;
 
@@ -629,7 +657,7 @@ impl ReconnectingClient {
                 Ok(client) => {
                     self.client = Some(client);
                     return Ok(());
-                }
+                },
                 Err(e) => {
                     if self.max_attempts > 0 && attempts >= self.max_attempts {
                         return Err(e);
@@ -640,7 +668,7 @@ impl ReconnectingClient {
                     let delay = delay.min(self.max_delay);
 
                     tokio::time::sleep(delay).await;
-                }
+                },
             }
         }
     }
@@ -648,17 +676,20 @@ impl ReconnectingClient {
     /// Execute an operation with automatic reconnection on failure
     pub async fn execute<F, T>(&mut self, op: F) -> Result<T>
     where
-        F: Fn(&mut LanceClient) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + '_>>,
+        F: Fn(
+            &mut LanceClient,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + '_>>,
     {
         loop {
             let client = self.client().await?;
-            
+
             match op(client).await {
                 Ok(result) => return Ok(result),
                 Err(ClientError::ConnectionClosed) | Err(ClientError::ConnectionFailed(_)) => {
                     self.client = None;
                     // Will reconnect on next iteration
-                }
+                },
                 Err(e) => return Err(e),
             }
         }
@@ -695,13 +726,12 @@ pub struct ClusterClient {
 impl ClusterClient {
     /// Create a new cluster client with seed nodes
     pub async fn connect(seed_addrs: &[&str]) -> Result<Self> {
-        let nodes: Vec<SocketAddr> = seed_addrs
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let nodes: Vec<SocketAddr> = seed_addrs.iter().filter_map(|s| s.parse().ok()).collect();
 
         if nodes.is_empty() {
-            return Err(ClientError::ProtocolError("No valid seed addresses".to_string()));
+            return Err(ClientError::ProtocolError(
+                "No valid seed addresses".to_string(),
+            ));
         }
 
         let config = ClientConfig::new(nodes[0]);
@@ -721,13 +751,12 @@ impl ClusterClient {
 
     /// Create a new cluster client with TLS
     pub async fn connect_tls(seed_addrs: &[&str], tls_config: TlsClientConfig) -> Result<Self> {
-        let nodes: Vec<SocketAddr> = seed_addrs
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let nodes: Vec<SocketAddr> = seed_addrs.iter().filter_map(|s| s.parse().ok()).collect();
 
         if nodes.is_empty() {
-            return Err(ClientError::ProtocolError("No valid seed addresses".to_string()));
+            return Err(ClientError::ProtocolError(
+                "No valid seed addresses".to_string(),
+            ));
         }
 
         let config = ClientConfig::new(nodes[0]).with_tls(tls_config.clone());
@@ -763,31 +792,33 @@ impl ClusterClient {
                         Ok(status) => {
                             self.primary = status.leader_id.map(|id| {
                                 // Try to find node in peer_states or use first node
-                                status.peer_states
+                                status
+                                    .peer_states
                                     .get(&id)
                                     .and_then(|s| s.parse().ok())
                                     .unwrap_or(node)
                             });
                             self.last_discovery = Some(Instant::now());
-                            
+
                             // Connect to primary if found
                             if let Some(primary_addr) = self.primary {
                                 self.config.addr = primary_addr;
-                                self.client = Some(LanceClient::connect(self.config.clone()).await?);
+                                self.client =
+                                    Some(LanceClient::connect(self.config.clone()).await?);
                             } else {
                                 self.client = Some(client);
                             }
                             return Ok(());
-                        }
+                        },
                         Err(_) => {
                             // Single-node mode or cluster not available
                             self.client = Some(client);
                             self.primary = Some(node);
                             self.last_discovery = Some(Instant::now());
                             return Ok(());
-                        }
+                        },
                     }
-                }
+                },
                 Err(_) => continue,
             }
         }
@@ -801,7 +832,8 @@ impl ClusterClient {
     /// Get a client connection, refreshing discovery if needed
     pub async fn client(&mut self) -> Result<&mut LanceClient> {
         // Check if discovery refresh is needed
-        let needs_refresh = self.last_discovery
+        let needs_refresh = self
+            .last_discovery
             .map(|t| t.elapsed() > self.discovery_interval)
             .unwrap_or(true);
 
@@ -845,7 +877,7 @@ mod tests {
     #[test]
     fn test_pool_config_defaults() {
         let config = ConnectionPoolConfig::new();
-        
+
         assert_eq!(config.max_connections, 10);
         assert_eq!(config.min_idle, 1);
         assert!(config.auto_reconnect);
@@ -858,7 +890,7 @@ mod tests {
             .with_min_idle(5)
             .with_health_check_interval(60)
             .with_auto_reconnect(false);
-        
+
         assert_eq!(config.max_connections, 20);
         assert_eq!(config.min_idle, 5);
         assert_eq!(config.health_check_interval, Duration::from_secs(60));
@@ -868,7 +900,7 @@ mod tests {
     #[test]
     fn test_pool_stats_default() {
         let stats = PoolStats::default();
-        
+
         assert_eq!(stats.connections_created, 0);
         assert_eq!(stats.active_connections, 0);
     }
@@ -880,9 +912,9 @@ mod tests {
         // Can't easily test without actual connection, just test the logic
         let max_lifetime = Duration::from_millis(10);
         let created_at = Instant::now();
-        
+
         sleep(Duration::from_millis(20));
-        
+
         assert!(created_at.elapsed() > max_lifetime);
     }
 
@@ -891,7 +923,7 @@ mod tests {
         // Test leader address tracking (without actual connection)
         let addr: SocketAddr = "127.0.0.1:1992".parse().unwrap();
         let leader: SocketAddr = "127.0.0.1:1993".parse().unwrap();
-        
+
         // Simulate leader address update logic
         let follow_leader = true;
         let mut config_addr = addr;

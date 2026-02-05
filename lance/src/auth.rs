@@ -241,9 +241,11 @@ mod tests {
 
         // Writes should require token
         assert!(!validator.validate_for_operation(None, true).is_allowed());
-        assert!(validator
-            .validate_for_operation(Some("valid_token"), true)
-            .is_allowed());
+        assert!(
+            validator
+                .validate_for_operation(Some("valid_token"), true)
+                .is_allowed()
+        );
     }
 
     #[test]

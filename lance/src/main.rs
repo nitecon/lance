@@ -167,7 +167,7 @@ async fn main() {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,lance=debug"));
@@ -320,9 +320,11 @@ fn log_startup_info() {
     {
         // Log NUMA node count if available
         let numa_nodes = std::fs::read_dir("/sys/devices/system/node")
-            .map(|d| d.filter_map(|e| e.ok()).filter(|e| {
-                e.file_name().to_string_lossy().starts_with("node")
-            }).count())
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("node"))
+                    .count()
+            })
             .unwrap_or(1);
         info!(target: "lance", "NUMA: {} node(s) detected", numa_nodes);
     }

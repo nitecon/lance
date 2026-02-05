@@ -159,19 +159,19 @@ impl TieredStorageManager {
     pub fn new(config: TieredStorageConfig) -> Result<Self> {
         // Ensure tier directories exist
         fs::create_dir_all(&config.hot.path)?;
-        
+
         if let Some(ref warm) = config.warm {
             if warm.enabled {
                 fs::create_dir_all(&warm.path)?;
             }
         }
-        
+
         if let Some(ref cold) = config.cold {
             if cold.enabled {
                 fs::create_dir_all(&cold.path)?;
             }
         }
-        
+
         if let Some(ref archive) = config.archive {
             if archive.enabled {
                 fs::create_dir_all(&archive.path)?;
@@ -241,7 +241,7 @@ impl TieredStorageManager {
                 } else {
                     None
                 }
-            }
+            },
             StorageTier::Warm => {
                 if self.config.cold.as_ref().is_some_and(|t| t.enabled) {
                     Some(StorageTier::Cold)
@@ -250,14 +250,14 @@ impl TieredStorageManager {
                 } else {
                     None
                 }
-            }
+            },
             StorageTier::Cold => {
                 if self.config.archive.as_ref().is_some_and(|t| t.enabled) {
                     Some(StorageTier::Archive)
                 } else {
                     None
                 }
-            }
+            },
             StorageTier::Archive => None,
         }
     }
@@ -321,13 +321,17 @@ impl TieredStorageManager {
 
     /// Move a segment to the next tier
     pub fn move_segment(&self, segment: &TierableSegment) -> Result<TierMoveResult> {
-        let next_tier = self.next_tier(segment.current_tier)
+        let next_tier = self
+            .next_tier(segment.current_tier)
             .ok_or_else(|| LanceError::InvalidData("No next tier available".into()))?;
 
-        let dest_path = self.tier_path(next_tier)
-            .ok_or_else(|| LanceError::InvalidData("Destination tier path not configured".into()))?;
+        let dest_path = self.tier_path(next_tier).ok_or_else(|| {
+            LanceError::InvalidData("Destination tier path not configured".into())
+        })?;
 
-        let file_name = segment.path.file_name()
+        let file_name = segment
+            .path
+            .file_name()
             .ok_or_else(|| LanceError::InvalidData("Invalid segment path".into()))?;
 
         let destination = dest_path.join(file_name);
@@ -385,7 +389,7 @@ impl TieredStorageManager {
                         error = %e,
                         "Failed to move segment"
                     );
-                }
+                },
             }
         }
 
@@ -412,22 +416,40 @@ impl TieredStorageManager {
         Ok(TierStats {
             hot_size: self.tier_size(StorageTier::Hot)?,
             hot_count: self.scan_tier(StorageTier::Hot)?.len(),
-            warm_size: self.config.warm.as_ref()
+            warm_size: self
+                .config
+                .warm
+                .as_ref()
                 .map(|_| self.tier_size(StorageTier::Warm))
                 .transpose()?,
-            warm_count: self.config.warm.as_ref()
+            warm_count: self
+                .config
+                .warm
+                .as_ref()
                 .map(|_| self.scan_tier(StorageTier::Warm).map(|s| s.len()))
                 .transpose()?,
-            cold_size: self.config.cold.as_ref()
+            cold_size: self
+                .config
+                .cold
+                .as_ref()
                 .map(|_| self.tier_size(StorageTier::Cold))
                 .transpose()?,
-            cold_count: self.config.cold.as_ref()
+            cold_count: self
+                .config
+                .cold
+                .as_ref()
                 .map(|_| self.scan_tier(StorageTier::Cold).map(|s| s.len()))
                 .transpose()?,
-            archive_size: self.config.archive.as_ref()
+            archive_size: self
+                .config
+                .archive
+                .as_ref()
                 .map(|_| self.tier_size(StorageTier::Archive))
                 .transpose()?,
-            archive_count: self.config.archive.as_ref()
+            archive_count: self
+                .config
+                .archive
+                .as_ref()
                 .map(|_| self.scan_tier(StorageTier::Archive).map(|s| s.len()))
                 .transpose()?,
         })
@@ -509,7 +531,7 @@ mod tests {
             PathBuf::from("/data/cold"),
             Duration::from_secs(86400),
         );
-        
+
         assert!(config.cold.is_some());
         assert_eq!(config.hot.max_age, Some(Duration::from_secs(86400)));
     }
@@ -527,10 +549,13 @@ mod tests {
         );
 
         let manager = TieredStorageManager::new(config).unwrap();
-        
+
         assert!(hot_path.exists());
         assert!(cold_path.exists());
-        assert_eq!(manager.tier_path(StorageTier::Hot), Some(hot_path.as_path()));
+        assert_eq!(
+            manager.tier_path(StorageTier::Hot),
+            Some(hot_path.as_path())
+        );
     }
 
     #[test]
@@ -565,4 +590,3 @@ mod tests {
         assert_eq!(stats.total_count(), 35);
     }
 }
-

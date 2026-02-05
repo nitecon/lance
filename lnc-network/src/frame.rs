@@ -1,7 +1,7 @@
-use crate::protocol::{ControlCommand, IngestHeader, LwpFlags, LwpHeader};
 use crate::LWP_HEADER_SIZE;
+use crate::protocol::{ControlCommand, IngestHeader, LwpFlags, LwpHeader};
 use bytes::Bytes;
-use lnc_core::{crc32c, Result};
+use lnc_core::{Result, crc32c};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
@@ -200,7 +200,10 @@ impl Frame {
         if let Some(msg) = message {
             payload.extend_from_slice(msg.as_bytes());
         }
-        Self::new_control(ControlCommand::AuthenticateResponse, Some(Bytes::from(payload)))
+        Self::new_control(
+            ControlCommand::AuthenticateResponse,
+            Some(Bytes::from(payload)),
+        )
     }
 
     /// Create a subscribe request frame

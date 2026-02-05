@@ -46,7 +46,6 @@ pub struct AuthSettings {
     pub write_only: bool,
 }
 
-
 /// TLS configuration for secure connections
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsSettings {
@@ -61,7 +60,6 @@ pub struct TlsSettings {
     /// Require client certificates (mTLS mode)
     pub require_client_cert: bool,
 }
-
 
 fn default_retention_cleanup_interval() -> u64 {
     60

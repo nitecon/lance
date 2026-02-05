@@ -268,7 +268,7 @@ fn enforce_topic_retention(
                     let secondary_idx = segment.path.with_extension("secondary.idx");
                     let _ = std::fs::remove_file(sparse_idx);
                     let _ = std::fs::remove_file(secondary_idx);
-                }
+                },
                 Err(e) => {
                     warn!(
                         target: "lance::retention",
@@ -278,7 +278,7 @@ fn enforce_topic_retention(
                         "Failed to delete segment"
                     );
                     continue;
-                }
+                },
             }
         }
 
@@ -343,7 +343,9 @@ mod tests {
     #[test]
     fn test_segment_expiry_ttl() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("0_1000000000000000000-1000000001000000000.lnc");
+        let path = dir
+            .path()
+            .join("0_1000000000000000000-1000000001000000000.lnc");
         File::create(&path).unwrap().write_all(b"test").unwrap();
 
         let info = SegmentInfo::from_path(&path).unwrap();

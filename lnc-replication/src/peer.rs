@@ -174,7 +174,9 @@ impl PeerConnection {
                     let tls_stream = connector
                         .connect(server_name.to_owned(), tcp_stream)
                         .await
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))?;
+                        .map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e)
+                        })?;
                     PeerStream::Tls(Box::new(tls_stream))
                 } else {
                     PeerStream::Tcp(tcp_stream)

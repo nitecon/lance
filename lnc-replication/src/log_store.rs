@@ -163,7 +163,13 @@ impl LogStore {
     pub fn save_state(&self, state: &PersistentState) -> Result<()> {
         let mut buf = Vec::with_capacity(16);
         buf.extend_from_slice(&state.current_term.to_le_bytes());
-        buf.extend_from_slice(&state.voted_for.map(|v| v as u64).unwrap_or(u64::MAX).to_le_bytes());
+        buf.extend_from_slice(
+            &state
+                .voted_for
+                .map(|v| v as u64)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
 
         // Write atomically via temp file
         let temp_path = self.state_path.with_extension("tmp");
@@ -227,7 +233,9 @@ impl LogStore {
             return Ok(());
         }
 
-        let file = self.log_file.as_mut()
+        let file = self
+            .log_file
+            .as_mut()
             .ok_or_else(|| LanceError::Protocol("Log file not open".into()))?;
 
         // Seek to end
@@ -242,10 +250,12 @@ impl LogStore {
         writer.flush()?;
 
         // Sync to disk for durability
-        let file = writer.into_inner()
-            .map_err(|e| LanceError::Io(std::io::Error::other(
-                format!("Failed to flush writer: {}", e)
-            )))?;
+        let file = writer.into_inner().map_err(|e| {
+            LanceError::Io(std::io::Error::other(format!(
+                "Failed to flush writer: {}",
+                e
+            )))
+        })?;
         file.sync_all()?;
 
         // Update in-memory state
@@ -297,7 +307,9 @@ impl LogStore {
 
         let offset = (to_index - self.first_index) as usize;
         if offset >= self.entries.len() {
-            return Err(LanceError::Protocol("Cannot compact beyond last entry".into()));
+            return Err(LanceError::Protocol(
+                "Cannot compact beyond last entry".into(),
+            ));
         }
 
         // Save snapshot metadata before compaction
@@ -396,7 +408,9 @@ impl LogStore {
 
     /// Write log file header
     fn write_header(&mut self) -> Result<()> {
-        let file = self.log_file.as_mut()
+        let file = self
+            .log_file
+            .as_mut()
             .ok_or_else(|| LanceError::Protocol("Log file not open".into()))?;
 
         file.seek(SeekFrom::Start(0))?;
@@ -430,21 +444,19 @@ impl LogStore {
 
         // Parse header fields - array slices are guaranteed by ENTRY_HEADER_SIZE
         let term = u64::from_le_bytes([
-            header[0], header[1], header[2], header[3],
-            header[4], header[5], header[6], header[7],
+            header[0], header[1], header[2], header[3], header[4], header[5], header[6], header[7],
         ]);
         let index = u64::from_le_bytes([
-            header[8], header[9], header[10], header[11],
-            header[12], header[13], header[14], header[15],
+            header[8], header[9], header[10], header[11], header[12], header[13], header[14],
+            header[15],
         ]);
         let hlc_raw = u64::from_le_bytes([
-            header[16], header[17], header[18], header[19],
-            header[20], header[21], header[22], header[23],
+            header[16], header[17], header[18], header[19], header[20], header[21], header[22],
+            header[23],
         ]);
         let entry_type_byte = header[24];
-        let data_len = u32::from_le_bytes([
-            header[25], header[26], header[27], header[28],
-        ]) as usize;
+        let data_len =
+            u32::from_le_bytes([header[25], header[26], header[27], header[28]]) as usize;
 
         let mut data = vec![0u8; data_len];
         reader.read_exact(&mut data)?;
@@ -517,10 +529,14 @@ impl LogStore {
             }
 
             writer.flush()?;
-            writer.into_inner()
-                .map_err(|e| LanceError::Io(std::io::Error::other(
-                    format!("Failed to flush writer: {}", e)
-                )))?
+            writer
+                .into_inner()
+                .map_err(|e| {
+                    LanceError::Io(std::io::Error::other(format!(
+                        "Failed to flush writer: {}",
+                        e
+                    )))
+                })?
                 .sync_all()?;
         }
 
@@ -528,10 +544,7 @@ impl LogStore {
         fs::rename(&temp_path, &log_path)?;
 
         // Reopen log file
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&log_path)?;
+        let file = OpenOptions::new().read(true).write(true).open(&log_path)?;
         self.log_file = Some(file);
 
         Ok(())
@@ -591,10 +604,12 @@ mod tests {
         // Write entries
         {
             let mut store = LogStore::open(dir.path()).unwrap();
-            store.append(vec![
-                make_entry(1, 1, b"persistent1"),
-                make_entry(1, 2, b"persistent2"),
-            ]).unwrap();
+            store
+                .append(vec![
+                    make_entry(1, 1, b"persistent1"),
+                    make_entry(1, 2, b"persistent2"),
+                ])
+                .unwrap();
         }
 
         // Reopen and verify
@@ -611,11 +626,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut store = LogStore::open(dir.path()).unwrap();
 
-        store.append(vec![
-            make_entry(1, 1, b"a"),
-            make_entry(1, 2, b"b"),
-            make_entry(1, 3, b"c"),
-        ]).unwrap();
+        store
+            .append(vec![
+                make_entry(1, 1, b"a"),
+                make_entry(1, 2, b"b"),
+                make_entry(1, 3, b"c"),
+            ])
+            .unwrap();
 
         store.truncate_from(2).unwrap();
 
@@ -628,10 +645,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut store = LogStore::open(dir.path()).unwrap();
 
-        store.append(vec![
-            make_entry(1, 1, b"a"),
-            make_entry(2, 2, b"b"),
-        ]).unwrap();
+        store
+            .append(vec![make_entry(1, 1, b"a"), make_entry(2, 2, b"b")])
+            .unwrap();
 
         assert!(store.matches(0, 0)); // Empty matches
         assert!(store.matches(1, 1)); // Correct term

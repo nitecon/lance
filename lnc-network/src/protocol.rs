@@ -1,4 +1,4 @@
-use lnc_core::{crc32c, LanceError, Result, LANCE_MAGIC};
+use lnc_core::{LANCE_MAGIC, LanceError, Result, crc32c};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 
@@ -402,7 +402,10 @@ mod tests {
     #[test]
     fn test_control_command_authentication() {
         assert_eq!(ControlCommand::from(0x08), ControlCommand::Authenticate);
-        assert_eq!(ControlCommand::from(0x09), ControlCommand::AuthenticateResponse);
+        assert_eq!(
+            ControlCommand::from(0x09),
+            ControlCommand::AuthenticateResponse
+        );
         assert_eq!(ControlCommand::Authenticate as u8, 0x08);
         assert_eq!(ControlCommand::AuthenticateResponse as u8, 0x09);
     }

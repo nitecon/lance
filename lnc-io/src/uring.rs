@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use crate::backend::{IoBackend, IoBackendType};
-use io_uring::{opcode, types, IoUring};
+use io_uring::{IoUring, opcode, types};
 use lnc_core::{LanceError, Result};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -285,11 +285,11 @@ impl IoUringPoller {
     }
 
     /// Submit a read operation using a registered buffer (IORING_OP_READ_FIXED)
-    /// 
+    ///
     /// Per Architecture §17.4: Uses pre-registered buffers to avoid per-operation
     /// page pinning overhead. The buffer must be registered with the kernel via
     /// `RegisteredBufferPool::register()`.
-    /// 
+    ///
     /// # Arguments
     /// * `fd` - File descriptor to read from
     /// * `buf_index` - Index of the registered buffer to read into
@@ -297,7 +297,7 @@ impl IoUringPoller {
     /// * `len` - Number of bytes to read
     /// * `offset` - File offset to read from
     /// * `user_data` - User data for completion identification
-    /// 
+    ///
     /// # Safety
     /// The buffer at `buf_index` must be registered with the kernel and must
     /// remain valid (not returned to pool) until the completion is harvested.
@@ -328,7 +328,7 @@ impl IoUringPoller {
     }
 
     /// Submit a write operation using a registered buffer (IORING_OP_WRITE_FIXED)
-    /// 
+    ///
     /// Similar to submit_read_fixed but for writes. Uses pre-registered buffers
     /// to avoid per-operation page pinning.
     pub fn submit_write_fixed(
@@ -395,7 +395,7 @@ impl IoUringPoller {
 // per-operation page pinning overhead.
 
 use crossbeam::queue::ArrayQueue;
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{Layout, alloc, dealloc};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Alignment for O_DIRECT buffers per standards §2.3
@@ -513,7 +513,8 @@ impl RegisteredBufferPool {
     /// Create a new buffer pool (not yet registered with io_uring)
     pub fn new(num_buffers: usize, buffer_size: usize) -> Result<Self> {
         let mut buffers = Vec::with_capacity(num_buffers);
-        let free_list = ArrayQueue::new(num_buffers);
+        // ArrayQueue requires non-zero capacity, use 1 as minimum
+        let free_list = ArrayQueue::new(num_buffers.max(1));
 
         for i in 0..num_buffers {
             buffers.push(AlignedBuffer::new(buffer_size)?);
@@ -549,12 +550,12 @@ impl RegisteredBufferPool {
         // SAFETY: iovecs point to valid, aligned memory that will remain valid
         // for the lifetime of the io_uring instance
         unsafe {
-            ring.submitter()
-                .register_buffers(&iovecs)
-                .map_err(|e| LanceError::Io(std::io::Error::new(
+            ring.submitter().register_buffers(&iovecs).map_err(|e| {
+                LanceError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("Failed to register buffers: {}", e),
-                )))?;
+                ))
+            })?;
         }
 
         self.registered.store(true, Ordering::SeqCst);
@@ -683,23 +684,23 @@ mod tests {
     #[test]
     fn test_buffer_content_write_read() {
         let mut pool = RegisteredBufferPool::new(2, 4096).unwrap();
-        
+
         // Acquire a buffer and write to it
         let handle = pool.acquire().unwrap();
         let idx = handle.index();
-        
+
         // Get mutable access and write data
         if let Some(buf) = pool.get_buffer_mut(idx) {
             let data = b"Hello, LANCE!";
             buf.as_mut_slice()[..data.len()].copy_from_slice(data);
         }
-        
+
         // Read back the data
         if let Some(buf) = pool.get_buffer(idx) {
             let slice = &buf.as_slice()[..13];
             assert_eq!(slice, b"Hello, LANCE!");
         }
-        
+
         drop(handle);
     }
 
@@ -723,19 +724,19 @@ mod tests {
         // Verify that multiple handles can coexist
         let pool = RegisteredBufferPool::new(8, 4096).unwrap();
         let mut handles = Vec::new();
-        
+
         // Acquire all
         for i in 0..8 {
             let h = pool.acquire();
             assert!(h.is_some(), "Failed to acquire buffer {}", i);
             handles.push(h.unwrap());
         }
-        
+
         // Verify indices are unique
         let indices: Vec<_> = handles.iter().map(|h| h.index()).collect();
         let unique: std::collections::HashSet<_> = indices.iter().collect();
         assert_eq!(unique.len(), 8, "Buffer indices should be unique");
-        
+
         // Release in reverse order
         while let Some(h) = handles.pop() {
             let prev_avail = pool.available();
@@ -747,7 +748,7 @@ mod tests {
     #[test]
     fn test_get_buffer_invalid_index() {
         let pool = RegisteredBufferPool::new(4, 4096).unwrap();
-        
+
         // Invalid indices should return None
         assert!(pool.get_buffer(100).is_none());
         assert!(pool.get_buffer(4).is_none()); // Out of range
@@ -757,7 +758,10 @@ mod tests {
     fn test_probe_splice_returns_valid_result() {
         // probe_splice should return either Supported or Unsupported
         let result = super::probe_splice();
-        assert!(result == super::SpliceSupport::Supported || result == super::SpliceSupport::Unsupported);
+        assert!(
+            result == super::SpliceSupport::Supported
+                || result == super::SpliceSupport::Unsupported
+        );
     }
 
     #[test]
@@ -772,12 +776,16 @@ mod tests {
         // SplicePipe::new should succeed on Linux
         let pipe = super::SplicePipe::new();
         assert!(pipe.is_ok(), "SplicePipe creation failed");
-        
+
         let pipe = pipe.unwrap();
         // File descriptors should be valid (positive)
         assert!(pipe.read_fd() >= 0, "Invalid read fd");
         assert!(pipe.write_fd() >= 0, "Invalid write fd");
-        assert_ne!(pipe.read_fd(), pipe.write_fd(), "Read and write fds should be different");
+        assert_ne!(
+            pipe.read_fd(),
+            pipe.write_fd(),
+            "Read and write fds should be different"
+        );
     }
 
     #[test]
@@ -785,9 +793,13 @@ mod tests {
         // SpliceForwarder should be creatable
         let forwarder = super::SpliceForwarder::new(32);
         assert!(forwarder.is_ok(), "SpliceForwarder creation failed");
-        
+
         let forwarder = forwarder.unwrap();
-        assert_eq!(forwarder.pending_ops(), 0, "New forwarder should have no pending ops");
+        assert_eq!(
+            forwarder.pending_ops(),
+            0,
+            "New forwarder should have no pending ops"
+        );
     }
 
     #[test]
@@ -795,9 +807,13 @@ mod tests {
         // TeeForwarder should be creatable
         let forwarder = super::TeeForwarder::new(32);
         assert!(forwarder.is_ok(), "TeeForwarder creation failed");
-        
+
         let forwarder = forwarder.unwrap();
-        assert_eq!(forwarder.pending_ops(), 0, "New forwarder should have no pending ops");
+        assert_eq!(
+            forwarder.pending_ops(),
+            0,
+            "New forwarder should have no pending ops"
+        );
         // is_fully_supported requires both tee and splice
         // We just verify the method doesn't panic
         let _ = forwarder.is_fully_supported();
@@ -808,19 +824,31 @@ mod tests {
     #[test]
     fn test_tee_support_enum_equality() {
         assert_eq!(super::TeeSupport::Supported, super::TeeSupport::Supported);
-        assert_eq!(super::TeeSupport::Unsupported, super::TeeSupport::Unsupported);
+        assert_eq!(
+            super::TeeSupport::Unsupported,
+            super::TeeSupport::Unsupported
+        );
         assert_ne!(super::TeeSupport::Supported, super::TeeSupport::Unsupported);
     }
 
     #[test]
     fn test_splice_support_enum_equality() {
-        assert_eq!(super::SpliceSupport::Supported, super::SpliceSupport::Supported);
-        assert_eq!(super::SpliceSupport::Unsupported, super::SpliceSupport::Unsupported);
-        assert_ne!(super::SpliceSupport::Supported, super::SpliceSupport::Unsupported);
+        assert_eq!(
+            super::SpliceSupport::Supported,
+            super::SpliceSupport::Supported
+        );
+        assert_eq!(
+            super::SpliceSupport::Unsupported,
+            super::SpliceSupport::Unsupported
+        );
+        assert_ne!(
+            super::SpliceSupport::Supported,
+            super::SpliceSupport::Unsupported
+        );
     }
 
     /// Benchmark: TEE vs Standard Forwarding Performance
-    /// 
+    ///
     /// Measures the overhead of TEE operations compared to standard splice forwarding.
     /// TEE allows duplicating pipe data without copying to userspace - critical for
     /// L2 sync quorum where we forward to leader AND process locally.
@@ -829,14 +857,14 @@ mod tests {
         use std::time::Instant;
 
         println!("\n=== TEE vs Splice Performance Benchmark ===");
-        
+
         // Check kernel support first
         let tee_support = super::probe_tee();
         let splice_support = super::probe_splice();
-        
+
         println!("TEE Support: {:?}", tee_support);
         println!("Splice Support: {:?}", splice_support);
-        
+
         if tee_support != super::TeeSupport::Supported {
             println!("\n⚠ TEE not supported on this kernel - skipping TEE benchmarks");
             println!("  Requires Linux kernel 5.8+ with io_uring TEE support");
@@ -846,7 +874,7 @@ mod tests {
         // Create forwarders
         let splice_forwarder = super::SpliceForwarder::new(256);
         let tee_forwarder = super::TeeForwarder::new(256);
-        
+
         if splice_forwarder.is_err() || tee_forwarder.is_err() {
             println!("Failed to create forwarders - skipping benchmark");
             return;
@@ -858,11 +886,14 @@ mod tests {
         println!("\nForwarder Status:");
         println!("  Splice Forwarder: created");
         println!("  TEE Forwarder: created");
-        println!("  TEE fully supported: {}", tee_forwarder.is_fully_supported());
+        println!(
+            "  TEE fully supported: {}",
+            tee_forwarder.is_fully_supported()
+        );
 
         // Benchmark pipe creation (common to both)
         let iterations = 10000;
-        
+
         println!("\n--- Pipe Creation Benchmark ---");
         let start = Instant::now();
         for _ in 0..iterations {
@@ -872,15 +903,26 @@ mod tests {
         }
         let elapsed = start.elapsed();
         let pipe_create_ns = elapsed.as_nanos() / iterations as u128;
-        println!("Pipe create+close: {} ns/op ({} ops/sec)", 
+        println!(
+            "Pipe create+close: {} ns/op ({} ops/sec)",
             pipe_create_ns,
-            1_000_000_000 / pipe_create_ns);
+            1_000_000_000 / pipe_create_ns
+        );
 
         // Memory overhead comparison
         println!("\n--- Memory Overhead ---");
-        println!("SpliceForwarder size: {} bytes", std::mem::size_of::<super::SpliceForwarder>());
-        println!("TeeForwarder size: {} bytes", std::mem::size_of::<super::TeeForwarder>());
-        println!("SplicePipe size: {} bytes", std::mem::size_of::<super::SplicePipe>());
+        println!(
+            "SpliceForwarder size: {} bytes",
+            std::mem::size_of::<super::SpliceForwarder>()
+        );
+        println!(
+            "TeeForwarder size: {} bytes",
+            std::mem::size_of::<super::TeeForwarder>()
+        );
+        println!(
+            "SplicePipe size: {} bytes",
+            std::mem::size_of::<super::SplicePipe>()
+        );
 
         // Pending ops tracking overhead
         println!("\n--- Operation Tracking ---");
@@ -891,30 +933,36 @@ mod tests {
         println!("TEE forwarding duplicates data in-kernel without userspace copies.");
         println!("For L2 sync quorum: forward to leader + local ACK = 2 destinations, 0 copies.");
         println!("Standard forwarding would require: read() + write() + write() = 2 copies.\n");
-        
+
         // Calculate theoretical savings
         let payload_sizes = [1024u64, 4096, 16384, 65536];
-        println!("{:<12} {:>15} {:>15} {:>12}", "Payload", "Std (2 copies)", "TEE (0 copy)", "Savings");
+        println!(
+            "{:<12} {:>15} {:>15} {:>12}",
+            "Payload", "Std (2 copies)", "TEE (0 copy)", "Savings"
+        );
         println!("{}", "-".repeat(58));
-        
+
         for size in payload_sizes {
             // Assume ~3ns/byte for memcpy (typical for modern CPUs with cache)
             let std_copy_ns = size * 2 * 3; // 2 copies
             let tee_overhead_ns = 500u64; // syscall overhead only, no copy
             let savings_pct = 100.0 * (1.0 - (tee_overhead_ns as f64 / std_copy_ns as f64));
-            
-            println!("{:<12} {:>12} ns {:>12} ns {:>10.1}%",
+
+            println!(
+                "{:<12} {:>12} ns {:>12} ns {:>10.1}%",
                 format!("{}B", size),
                 std_copy_ns,
                 tee_overhead_ns,
-                savings_pct);
+                savings_pct
+            );
         }
-        
-        println!("\nNote: Actual performance depends on kernel version, CPU, and memory bandwidth.");
+
+        println!(
+            "\nNote: Actual performance depends on kernel version, CPU, and memory bandwidth."
+        );
         println!("Run integration tests with --benchmark for end-to-end latency measurements.\n");
     }
 }
-
 
 // ============================================================================
 // Zero-Copy Network Send (IORING_OP_SEND_ZC)
@@ -954,7 +1002,7 @@ pub fn probe_send_zc() -> SendZcSupport {
                 "IORING_OP_SEND_ZC not available, using regular send"
             );
             SendZcSupport::Fallback
-        }
+        },
         Err(_) => SendZcSupport::Fallback,
     }
 }
@@ -991,21 +1039,16 @@ impl ZeroCopySender {
     }
 
     /// Submit a zero-copy send operation
-    /// 
+    ///
     /// # Arguments
     /// * `socket_fd` - The socket file descriptor
     /// * `data` - Data to send (must remain valid until completion)
     /// * `user_data` - User data to identify the completion
-    /// 
+    ///
     /// # Safety
     /// Caller must ensure `data` remains valid until the completion is harvested.
     /// For SEND_ZC, the kernel may hold references to the buffer until notification.
-    pub fn submit_send(
-        &mut self,
-        socket_fd: RawFd,
-        data: &[u8],
-        user_data: u64,
-    ) -> Result<()> {
+    pub fn submit_send(&mut self, socket_fd: RawFd, data: &[u8], user_data: u64) -> Result<()> {
         if self.send_zc_supported {
             self.submit_send_zc(socket_fd, data, user_data)
         } else {
@@ -1014,12 +1057,7 @@ impl ZeroCopySender {
     }
 
     /// Submit zero-copy send (IORING_OP_SEND_ZC)
-    fn submit_send_zc(
-        &mut self,
-        socket_fd: RawFd,
-        data: &[u8],
-        user_data: u64,
-    ) -> Result<()> {
+    fn submit_send_zc(&mut self, socket_fd: RawFd, data: &[u8], user_data: u64) -> Result<()> {
         let send_op = opcode::SendZc::new(types::Fd(socket_fd), data.as_ptr(), data.len() as u32)
             .build()
             .user_data(user_data);
@@ -1037,12 +1075,7 @@ impl ZeroCopySender {
     }
 
     /// Submit regular send (fallback when SEND_ZC not available)
-    fn submit_send_regular(
-        &mut self,
-        socket_fd: RawFd,
-        data: &[u8],
-        user_data: u64,
-    ) -> Result<()> {
+    fn submit_send_regular(&mut self, socket_fd: RawFd, data: &[u8], user_data: u64) -> Result<()> {
         let send_op = opcode::Send::new(types::Fd(socket_fd), data.as_ptr(), data.len() as u32)
             .build()
             .user_data(user_data);
@@ -1090,7 +1123,7 @@ impl ZeroCopySender {
     }
 
     /// Poll for completions
-    /// 
+    ///
     /// For SEND_ZC, there may be two completions per send:
     /// 1. The send completion (data accepted by kernel)
     /// 2. The notification that buffer can be reused (CQE_F_NOTIF flag)
@@ -1129,11 +1162,10 @@ impl ZeroCopySender {
     }
 }
 
-
 // ============================================================================
 // Zero-Copy Splice Forwarding (IORING_OP_SPLICE)
 // ============================================================================
-// Per WriteForwardingArchitecture.md Phase 2: Use IORING_OP_SPLICE for 
+// Per WriteForwardingArchitecture.md Phase 2: Use IORING_OP_SPLICE for
 // zero-copy forwarding of writes from followers to leader.
 // Data flow: client_socket → pipe → leader_socket (no userspace copies)
 
@@ -1165,7 +1197,7 @@ pub fn probe_splice() -> SpliceSupport {
                 "IORING_OP_SPLICE not available"
             );
             SpliceSupport::Unsupported
-        }
+        },
         Err(_) => SpliceSupport::Unsupported,
     }
 }
@@ -1188,26 +1220,26 @@ impl SplicePipe {
     /// Create a new pipe for splice operations
     pub fn new() -> Result<Self> {
         let mut fds = [0i32; 2];
-        
+
         // SAFETY: pipe2 is a standard POSIX function
         let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
-        
+
         if ret < 0 {
             return Err(LanceError::Io(std::io::Error::last_os_error()));
         }
-        
+
         Ok(Self {
             read_fd: fds[0],
             write_fd: fds[1],
         })
     }
-    
+
     /// Get the read end of the pipe
     #[inline]
     pub fn read_fd(&self) -> RawFd {
         self.read_fd
     }
-    
+
     /// Get the write end of the pipe
     #[inline]
     pub fn write_fd(&self) -> RawFd {
@@ -1249,13 +1281,13 @@ impl SpliceForwarder {
     }
 
     /// Submit a splice operation from source fd to pipe
-    /// 
+    ///
     /// # Arguments
     /// * `source_fd` - Source file descriptor (socket or file)
     /// * `pipe` - Pipe to splice into
     /// * `len` - Number of bytes to splice
     /// * `user_data` - User data for completion identification
-    /// 
+    ///
     /// # Safety
     /// Caller must ensure file descriptors are valid.
     pub fn submit_splice_to_pipe(
@@ -1296,16 +1328,11 @@ impl SpliceForwarder {
         len: u32,
         user_data: u64,
     ) -> Result<()> {
-        let splice_op = opcode::Splice::new(
-            types::Fd(pipe.read_fd()),
-            -1,
-            types::Fd(dest_fd),
-            -1,
-            len,
-        )
-        .flags(libc::SPLICE_F_MOVE as u32)
-        .build()
-        .user_data(user_data);
+        let splice_op =
+            opcode::Splice::new(types::Fd(pipe.read_fd()), -1, types::Fd(dest_fd), -1, len)
+                .flags(libc::SPLICE_F_MOVE as u32)
+                .build()
+                .user_data(user_data);
 
         // SAFETY: File descriptors must be valid
         unsafe {
@@ -1320,11 +1347,11 @@ impl SpliceForwarder {
     }
 
     /// Submit a linked splice operation for forwarding
-    /// 
+    ///
     /// This submits two linked operations:
     /// 1. Splice from source_fd to pipe
     /// 2. Splice from pipe to dest_fd
-    /// 
+    ///
     /// The operations are linked, so the second waits for the first.
     /// This is the core of zero-copy write forwarding.
     pub fn submit_forward_splice(
@@ -1349,16 +1376,11 @@ impl SpliceForwarder {
         .user_data(user_data);
 
         // Second splice: pipe → destination
-        let splice_out = opcode::Splice::new(
-            types::Fd(pipe.read_fd()),
-            -1,
-            types::Fd(dest_fd),
-            -1,
-            len,
-        )
-        .flags(libc::SPLICE_F_MOVE as u32)
-        .build()
-        .user_data(user_data | 0x8000_0000_0000_0000); // Mark as second part
+        let splice_out =
+            opcode::Splice::new(types::Fd(pipe.read_fd()), -1, types::Fd(dest_fd), -1, len)
+                .flags(libc::SPLICE_F_MOVE as u32)
+                .build()
+                .user_data(user_data | 0x8000_0000_0000_0000); // Mark as second part
 
         // SAFETY: File descriptors must be valid
         unsafe {
@@ -1449,7 +1471,7 @@ pub fn probe_tee() -> TeeSupport {
                 "IORING_OP_TEE not available"
             );
             TeeSupport::Unsupported
-        }
+        },
         Err(_) => TeeSupport::Unsupported,
     }
 }
@@ -1584,14 +1606,10 @@ impl TeeForwarder {
         .user_data(user_data);
 
         // Operation 2: Tee from pipe1 → pipe2 (duplicate, linked)
-        let tee_op = opcode::Tee::new(
-            types::Fd(pipe1.read_fd()),
-            types::Fd(pipe2.write_fd()),
-            len,
-        )
-        .build()
-        .flags(io_uring::squeue::Flags::IO_LINK)
-        .user_data(user_data | 0x1000_0000_0000_0000);
+        let tee_op = opcode::Tee::new(types::Fd(pipe1.read_fd()), types::Fd(pipe2.write_fd()), len)
+            .build()
+            .flags(io_uring::squeue::Flags::IO_LINK)
+            .user_data(user_data | 0x1000_0000_0000_0000);
 
         // Operation 3: Splice from pipe1 → leader (forward, linked)
         let splice_leader = opcode::Splice::new(
@@ -1607,16 +1625,11 @@ impl TeeForwarder {
         .user_data(user_data | 0x2000_0000_0000_0000);
 
         // Operation 4: Splice from pipe2 → local processor (final)
-        let splice_local = opcode::Splice::new(
-            types::Fd(pipe2.read_fd()),
-            -1,
-            types::Fd(local_fd),
-            -1,
-            len,
-        )
-        .flags(libc::SPLICE_F_MOVE as u32)
-        .build()
-        .user_data(user_data | 0x3000_0000_0000_0000);
+        let splice_local =
+            opcode::Splice::new(types::Fd(pipe2.read_fd()), -1, types::Fd(local_fd), -1, len)
+                .flags(libc::SPLICE_F_MOVE as u32)
+                .build()
+                .user_data(user_data | 0x3000_0000_0000_0000);
 
         // SAFETY: File descriptors must be valid
         unsafe {

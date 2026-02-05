@@ -2,8 +2,8 @@ use lnc_core::{LanceError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,22 +335,27 @@ impl TopicRegistry {
 
     /// Read data from a topic starting at the specified offset
     /// Returns bytes read up to max_bytes
-    pub fn read_from_offset(&self, topic_id: u32, start_offset: u64, max_bytes: u32) -> Result<bytes::Bytes> {
+    pub fn read_from_offset(
+        &self,
+        topic_id: u32,
+        start_offset: u64,
+        max_bytes: u32,
+    ) -> Result<bytes::Bytes> {
         let topic_dir = self.get_topic_dir(topic_id);
         let segment_path = topic_dir.join("current.seg");
-        
+
         if !segment_path.exists() {
             return Ok(bytes::Bytes::new());
         }
-        
+
         use std::io::{Read, Seek, SeekFrom};
         let mut file = std::fs::File::open(&segment_path)?;
         file.seek(SeekFrom::Start(start_offset))?;
-        
+
         let mut buffer = vec![0u8; max_bytes as usize];
         let bytes_read = file.read(&mut buffer)?;
         buffer.truncate(bytes_read);
-        
+
         Ok(bytes::Bytes::from(buffer))
     }
 
@@ -444,14 +449,15 @@ impl TopicRegistry {
     /// Per Architecture §9.2: Seal active segment.
     #[allow(dead_code)]
     pub fn seal_all_segments(&self) -> Result<u32> {
-        let topics = self.topics_by_id.read().map_err(|_| {
-            LanceError::Internal("Failed to acquire topic lock for sealing".into())
-        })?;
+        let topics = self
+            .topics_by_id
+            .read()
+            .map_err(|_| LanceError::Internal("Failed to acquire topic lock for sealing".into()))?;
 
         let mut sealed_count = 0u32;
         for (topic_id, _metadata) in topics.iter() {
             let topic_dir = self.get_topic_dir(*topic_id);
-            
+
             // Check for active segment marker file
             let active_marker = topic_dir.join(".active");
             if active_marker.exists() {
@@ -495,7 +501,7 @@ impl TopicRegistry {
         for (topic_id, _metadata) in topics.iter() {
             let topic_dir = self.get_topic_dir(*topic_id);
             let index_path = topic_dir.join("sparse.idx");
-            
+
             // Touch the index file to update modification time
             if index_path.exists() {
                 if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&index_path) {

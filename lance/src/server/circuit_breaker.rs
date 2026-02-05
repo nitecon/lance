@@ -126,17 +126,21 @@ impl CircuitBreaker {
     /// This also handles automatic state transitions based on timeouts.
     pub fn check(&self) -> CircuitState {
         let state_val = self.state.load(Ordering::Acquire);
-        
+
         match state_val {
             0 => CircuitState::Closed,
             1 => {
                 // Check if reset timeout has elapsed
                 let opened_at = self.opened_at.load(Ordering::Relaxed);
                 let now = Self::current_time_millis();
-                
+
                 if now.saturating_sub(opened_at) >= self.config.reset_timeout.as_millis() as u64 {
                     // Transition to half-open
-                    if self.state.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    if self
+                        .state
+                        .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
                         self.success_count.store(0, Ordering::Relaxed);
                         tracing::info!(target: "lance::circuit_breaker", "Circuit transitioning to half-open");
                     }
@@ -144,7 +148,7 @@ impl CircuitBreaker {
                 } else {
                     CircuitState::Open
                 }
-            }
+            },
             2 => CircuitState::HalfOpen,
             _ => CircuitState::Closed, // Fallback
         }
@@ -153,26 +157,30 @@ impl CircuitBreaker {
     /// Record a successful operation
     pub fn record_success(&self) {
         let state = self.state.load(Ordering::Acquire);
-        
+
         match state {
             0 => {
                 // In closed state, reset failure count on success
                 self.failure_count.store(0, Ordering::Relaxed);
-            }
+            },
             2 => {
                 // In half-open state, count successes
                 let count = self.success_count.fetch_add(1, Ordering::Relaxed) + 1;
-                
+
                 if count >= self.config.success_threshold {
                     // Enough successes, close the circuit
-                    if self.state.compare_exchange(2, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    if self
+                        .state
+                        .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
                         self.failure_count.store(0, Ordering::Relaxed);
                         self.success_count.store(0, Ordering::Relaxed);
                         tracing::info!(target: "lance::circuit_breaker", "Circuit closed after recovery");
                     }
                 }
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
 
@@ -180,21 +188,26 @@ impl CircuitBreaker {
     pub fn record_failure(&self) {
         let state = self.state.load(Ordering::Acquire);
         let now = Self::current_time_millis();
-        
+
         match state {
             0 => {
                 // In closed state, check failure window
                 let last_failure = self.last_failure_at.load(Ordering::Relaxed);
-                
-                if now.saturating_sub(last_failure) > self.config.failure_window.as_millis() as u64 {
+
+                if now.saturating_sub(last_failure) > self.config.failure_window.as_millis() as u64
+                {
                     // Outside failure window, reset count
                     self.failure_count.store(1, Ordering::Relaxed);
                 } else {
                     let count = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    
+
                     if count >= self.config.failure_threshold {
                         // Trip the circuit
-                        if self.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                        if self
+                            .state
+                            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+                            .is_ok()
+                        {
                             self.opened_at.store(now, Ordering::Relaxed);
                             tracing::warn!(
                                 target: "lance::circuit_breaker",
@@ -204,18 +217,22 @@ impl CircuitBreaker {
                         }
                     }
                 }
-                
+
                 self.last_failure_at.store(now, Ordering::Relaxed);
-            }
+            },
             2 => {
                 // In half-open state, any failure reopens the circuit
-                if self.state.compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                if self
+                    .state
+                    .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
                     self.opened_at.store(now, Ordering::Relaxed);
                     self.success_count.store(0, Ordering::Relaxed);
                     tracing::warn!(target: "lance::circuit_breaker", "Circuit reopened after half-open failure");
                 }
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
 
@@ -285,10 +302,10 @@ mod tests {
         // Record failures
         breaker.record_failure();
         assert_eq!(breaker.state(), CircuitState::Closed);
-        
+
         breaker.record_failure();
         assert_eq!(breaker.state(), CircuitState::Closed);
-        
+
         breaker.record_failure();
         assert_eq!(breaker.state(), CircuitState::Open);
     }
@@ -312,12 +329,12 @@ mod tests {
     #[test]
     fn test_manual_trip_and_reset() {
         let breaker = CircuitBreaker::default();
-        
+
         assert_eq!(breaker.state(), CircuitState::Closed);
-        
+
         breaker.trip();
         assert_eq!(breaker.state(), CircuitState::Open);
-        
+
         breaker.reset();
         assert_eq!(breaker.state(), CircuitState::Closed);
     }
@@ -326,7 +343,7 @@ mod tests {
     fn test_config_presets() {
         let aggressive = CircuitBreakerConfig::aggressive();
         assert_eq!(aggressive.failure_threshold, 3);
-        
+
         let tolerant = CircuitBreakerConfig::tolerant();
         assert_eq!(tolerant.failure_threshold, 10);
     }

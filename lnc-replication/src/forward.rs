@@ -164,7 +164,7 @@ impl LeaderConnectionPool {
     /// This drains all existing connections since they're to the old leader.
     pub async fn on_leader_change(&self, new_leader: Option<SocketAddr>) {
         let mut addr = self.leader_addr.write().await;
-        
+
         // Only update if actually changed
         if *addr != new_leader {
             debug!(
@@ -172,11 +172,11 @@ impl LeaderConnectionPool {
                 new_leader = ?new_leader,
                 "Leader changed, draining connection pool"
             );
-            
+
             // Drain old connections (they're to the old leader)
             let mut pool = self.connections.lock().await;
             pool.clear();
-            
+
             *addr = new_leader;
         }
     }
@@ -206,7 +206,10 @@ impl LeaderConnectionPool {
 
     /// Acquire a connection from the pool, creating a new one if needed
     pub async fn acquire(&self) -> Result<PooledConnection<'_>, ForwardError> {
-        let addr = self.leader_addr.read().await
+        let addr = self
+            .leader_addr
+            .read()
+            .await
             .ok_or(ForwardError::LeaderUnknown)?;
 
         // Try to get an existing connection from the pool
@@ -223,15 +226,14 @@ impl LeaderConnectionPool {
 
         // Create a new connection
         debug!(leader = %addr, "Creating new connection to leader");
-        let stream = tokio::time::timeout(
-            self.config.connect_timeout,
-            TcpStream::connect(addr),
-        )
-        .await
-        .map_err(|_| ForwardError::Timeout)?
-        .map_err(ForwardError::ConnectionFailed)?;
+        let stream = tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|_| ForwardError::Timeout)?
+            .map_err(ForwardError::ConnectionFailed)?;
 
-        stream.set_nodelay(true).map_err(ForwardError::ConnectionFailed)?;
+        stream
+            .set_nodelay(true)
+            .map_err(ForwardError::ConnectionFailed)?;
 
         Ok(PooledConnection {
             stream: Some(stream),
@@ -252,26 +254,24 @@ impl LeaderConnectionPool {
     /// Forward a write request to the leader and return the response
     ///
     /// This is the main forwarding function used by connection handlers.
-    pub async fn forward_write(
-        &self,
-        request_bytes: &[u8],
-    ) -> Result<Vec<u8>, ForwardError> {
+    pub async fn forward_write(&self, request_bytes: &[u8]) -> Result<Vec<u8>, ForwardError> {
         let start = std::time::Instant::now();
-        
+
         let mut conn = self.acquire().await?;
-        
+
         // Send request to leader
-        let stream = conn.stream.as_mut()
-            .ok_or(ForwardError::LeaderUnknown)?;
-        
-        stream.write_all(request_bytes)
+        let stream = conn.stream.as_mut().ok_or(ForwardError::LeaderUnknown)?;
+
+        stream
+            .write_all(request_bytes)
             .await
             .map_err(ForwardError::SendFailed)?;
 
         // Read response from leader
         // First read the LWP header (44 bytes) to get payload length
         let mut header = [0u8; 44];
-        stream.read_exact(&mut header)
+        stream
+            .read_exact(&mut header)
             .await
             .map_err(ForwardError::ReceiveFailed)?;
 
@@ -279,20 +279,22 @@ impl LeaderConnectionPool {
         // LwpHeader layout: magic(4) + version(1) + flags(1) + reserved(2) + crc(4) + IngestHeader(32)
         // IngestHeader: batch_id(8) + timestamp_ns(8) + record_count(4) + payload_length(4) + ...
         // So payload_length is at offset 12 + 8 + 8 + 4 = 32
-        let payload_len = u32::from_le_bytes([header[32], header[33], header[34], header[35]]) as usize;
-        
+        let payload_len =
+            u32::from_le_bytes([header[32], header[33], header[34], header[35]]) as usize;
+
         // Read the full response
         let mut response = vec![0u8; 44 + payload_len];
         response[..44].copy_from_slice(&header);
-        
+
         if payload_len > 0 {
-            stream.read_exact(&mut response[44..])
+            stream
+                .read_exact(&mut response[44..])
                 .await
                 .map_err(ForwardError::ReceiveFailed)?;
         }
 
         let elapsed = start.elapsed();
-        
+
         // Return connection to pool for reuse
         if let Some(stream) = conn.stream.take() {
             self.release(stream).await;
@@ -435,7 +437,10 @@ mod tests {
     fn test_tee_forwarding_status_enum() {
         assert_eq!(TeeForwardingStatus::Enabled, TeeForwardingStatus::Enabled);
         assert_eq!(TeeForwardingStatus::Disabled, TeeForwardingStatus::Disabled);
-        assert_eq!(TeeForwardingStatus::Unsupported, TeeForwardingStatus::Unsupported);
+        assert_eq!(
+            TeeForwardingStatus::Unsupported,
+            TeeForwardingStatus::Unsupported
+        );
         assert_ne!(TeeForwardingStatus::Enabled, TeeForwardingStatus::Disabled);
     }
 
@@ -443,10 +448,10 @@ mod tests {
     fn test_local_write_error_display() {
         let err = LocalWriteError::TopicNotFound(42);
         assert!(err.to_string().contains("42"));
-        
+
         let err = LocalWriteError::StorageFull;
         assert!(err.to_string().contains("full"));
-        
+
         let err = LocalWriteError::ProcessingError("test error".to_string());
         assert!(err.to_string().contains("test error"));
     }
@@ -462,7 +467,7 @@ mod tests {
     fn test_pool_tee_status_methods() {
         let config = ForwardConfig::default();
         let pool = LeaderConnectionPool::new(config);
-        
+
         // TEE disabled by default
         assert!(!pool.is_tee_enabled());
         assert_eq!(pool.tee_status(), TeeForwardingStatus::Disabled);
@@ -479,20 +484,20 @@ mod tests {
     #[tokio::test]
     async fn test_pool_leader_change() {
         let pool = LeaderConnectionPool::new(ForwardConfig::default());
-        
+
         // Initially no leader
         assert!(pool.leader_addr().await.is_none());
-        
+
         // Set leader
         let addr: SocketAddr = "127.0.0.1:1992".parse().unwrap();
         pool.on_leader_change(Some(addr)).await;
         assert_eq!(pool.leader_addr().await, Some(addr));
-        
+
         // Change leader
         let new_addr: SocketAddr = "127.0.0.1:2002".parse().unwrap();
         pool.on_leader_change(Some(new_addr)).await;
         assert_eq!(pool.leader_addr().await, Some(new_addr));
-        
+
         // Clear leader
         pool.on_leader_change(None).await;
         assert!(pool.leader_addr().await.is_none());
@@ -510,7 +515,7 @@ mod tests {
         // Verify the pool() accessor works correctly
         let config = ForwardConfig::default();
         let pool = LeaderConnectionPool::new(config);
-        
+
         // We can't create a PooledConnection directly in tests without
         // connecting, but we verify the pool field is usable via config check
         assert_eq!(pool.tee_status(), TeeForwardingStatus::Disabled);
@@ -583,7 +588,7 @@ mod tests {
     #[tokio::test]
     async fn test_acquire_fails_without_leader() {
         let pool = LeaderConnectionPool::new(ForwardConfig::default());
-        
+
         // No leader set - acquire should fail with LeaderUnknown
         let result = pool.acquire().await;
         assert!(matches!(result, Err(ForwardError::LeaderUnknown)));
@@ -600,10 +605,7 @@ mod tests {
                 std::io::ErrorKind::ConnectionRefused,
                 "test",
             )),
-            ForwardError::SendFailed(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "test",
-            )),
+            ForwardError::SendFailed(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "test")),
             ForwardError::ReceiveFailed(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "test",
@@ -619,11 +621,11 @@ mod tests {
     #[test]
     fn test_forward_config_pool_size_bounds() {
         let mut config = ForwardConfig::default();
-        
+
         // Verify reasonable defaults
         assert!(config.pool_size > 0, "Pool size must be positive");
         assert!(config.pool_size <= 64, "Pool size should be reasonable");
-        
+
         // Custom pool size
         config.pool_size = 16;
         let pool = LeaderConnectionPool::new(config);

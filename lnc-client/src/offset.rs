@@ -84,18 +84,14 @@ impl MemoryOffsetStore {
 impl OffsetStore for MemoryOffsetStore {
     fn load(&self, topic_id: u32, consumer_id: u64) -> Result<Option<u64>> {
         let offsets = self.offsets.read().map_err(|e| {
-            ClientError::IoError(std::io::Error::other(
-                format!("Lock poisoned: {}", e),
-            ))
+            ClientError::IoError(std::io::Error::other(format!("Lock poisoned: {}", e)))
         })?;
         Ok(offsets.get(&(topic_id, consumer_id)).copied())
     }
 
     fn save(&self, topic_id: u32, consumer_id: u64, offset: u64) -> Result<()> {
         let mut offsets = self.offsets.write().map_err(|e| {
-            ClientError::IoError(std::io::Error::other(
-                format!("Lock poisoned: {}", e),
-            ))
+            ClientError::IoError(std::io::Error::other(format!("Lock poisoned: {}", e)))
         })?;
         offsets.insert((topic_id, consumer_id), offset);
         Ok(())
@@ -103,9 +99,7 @@ impl OffsetStore for MemoryOffsetStore {
 
     fn delete(&self, topic_id: u32, consumer_id: u64) -> Result<()> {
         let mut offsets = self.offsets.write().map_err(|e| {
-            ClientError::IoError(std::io::Error::other(
-                format!("Lock poisoned: {}", e),
-            ))
+            ClientError::IoError(std::io::Error::other(format!("Lock poisoned: {}", e)))
         })?;
         offsets.remove(&(topic_id, consumer_id));
         Ok(())
@@ -113,9 +107,7 @@ impl OffsetStore for MemoryOffsetStore {
 
     fn list_all(&self) -> Result<HashMap<(u32, u64), u64>> {
         let offsets = self.offsets.read().map_err(|e| {
-            ClientError::IoError(std::io::Error::other(
-                format!("Lock poisoned: {}", e),
-            ))
+            ClientError::IoError(std::io::Error::other(format!("Lock poisoned: {}", e)))
         })?;
         Ok(offsets.clone())
     }
@@ -171,8 +163,10 @@ impl LockFileOffsetStore {
 
     /// Get the file path for a specific topic/consumer offset
     fn offset_file_path(&self, topic_id: u32, consumer_id: u64) -> PathBuf {
-        self.base_dir
-            .join(format!("topic-{}-consumer-{}.offset", topic_id, consumer_id))
+        self.base_dir.join(format!(
+            "topic-{}-consumer-{}.offset",
+            topic_id, consumer_id
+        ))
     }
 
     /// Get the lock file path for a specific topic/consumer
@@ -184,9 +178,7 @@ impl LockFileOffsetStore {
     /// Load all existing offsets into the cache
     fn load_all_into_cache(&self) -> Result<()> {
         let mut cache = self.cache.write().map_err(|e| {
-            ClientError::IoError(std::io::Error::other(
-                format!("Lock poisoned: {}", e),
-            ))
+            ClientError::IoError(std::io::Error::other(format!("Lock poisoned: {}", e)))
         })?;
 
         let entries = match fs::read_dir(&self.base_dir) {
@@ -269,14 +261,21 @@ impl LockFileOffsetStore {
         {
             use std::os::windows::io::AsRawHandle;
             use windows_sys::Win32::Foundation::HANDLE;
-            use windows_sys::Win32::Storage::FileSystem::{
-                LockFileEx, LOCKFILE_EXCLUSIVE_LOCK,
-            };
+            use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
             let handle = lock_file.as_raw_handle() as HANDLE;
             // SAFETY: handle is valid from as_raw_handle, OVERLAPPED is zeroed correctly
             unsafe {
-                let mut overlapped = std::mem::zeroed::<windows_sys::Win32::System::IO::OVERLAPPED>();
-                if LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK, 0, u32::MAX, u32::MAX, &mut overlapped) == 0 {
+                let mut overlapped =
+                    std::mem::zeroed::<windows_sys::Win32::System::IO::OVERLAPPED>();
+                if LockFileEx(
+                    handle,
+                    LOCKFILE_EXCLUSIVE_LOCK,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    &mut overlapped,
+                ) == 0
+                {
                     return Err(ClientError::IoError(std::io::Error::last_os_error()));
                 }
             }
@@ -313,9 +312,7 @@ impl OffsetStore for LockFileOffsetStore {
         // Check cache first
         {
             let cache = self.cache.read().map_err(|e| {
-                ClientError::IoError(std::io::Error::other(
-                    format!("Lock poisoned: {}", e),
-                ))
+                ClientError::IoError(std::io::Error::other(format!("Lock poisoned: {}", e)))
             })?;
             if let Some(&offset) = cache.get(&(topic_id, consumer_id)) {
                 return Ok(Some(offset));
@@ -333,9 +330,7 @@ impl OffsetStore for LockFileOffsetStore {
         // Update cache
         {
             let mut cache = self.cache.write().map_err(|e| {
-                ClientError::IoError(std::io::Error::other(
-                    format!("Lock poisoned: {}", e),
-                ))
+                ClientError::IoError(std::io::Error::other(format!("Lock poisoned: {}", e)))
             })?;
             cache.insert((topic_id, consumer_id), offset);
         }
@@ -350,9 +345,7 @@ impl OffsetStore for LockFileOffsetStore {
         // Update cache
         {
             let mut cache = self.cache.write().map_err(|e| {
-                ClientError::IoError(std::io::Error::other(
-                    format!("Lock poisoned: {}", e),
-                ))
+                ClientError::IoError(std::io::Error::other(format!("Lock poisoned: {}", e)))
             })?;
             cache.insert((topic_id, consumer_id), offset);
         }
@@ -367,9 +360,7 @@ impl OffsetStore for LockFileOffsetStore {
         // Remove from cache
         {
             let mut cache = self.cache.write().map_err(|e| {
-                ClientError::IoError(std::io::Error::other(
-                    format!("Lock poisoned: {}", e),
-                ))
+                ClientError::IoError(std::io::Error::other(format!("Lock poisoned: {}", e)))
             })?;
             cache.remove(&(topic_id, consumer_id));
         }
@@ -383,9 +374,7 @@ impl OffsetStore for LockFileOffsetStore {
 
     fn list_all(&self) -> Result<HashMap<(u32, u64), u64>> {
         let cache = self.cache.read().map_err(|e| {
-            ClientError::IoError(std::io::Error::other(
-                format!("Lock poisoned: {}", e),
-            ))
+            ClientError::IoError(std::io::Error::other(format!("Lock poisoned: {}", e)))
         })?;
         Ok(cache.clone())
     }
@@ -466,20 +455,22 @@ impl<S: OffsetStore> HookedOffsetStore<S> {
 impl<S: OffsetStore> OffsetStore for HookedOffsetStore<S> {
     fn load(&self, topic_id: u32, consumer_id: u64) -> Result<Option<u64>> {
         let offset = self.inner.load(topic_id, consumer_id)?;
-        
+
         // Track for previous_offset in commits
         if let Some(off) = offset {
             if let Ok(mut prev) = self.previous_offsets.write() {
                 prev.insert((topic_id, consumer_id), off);
             }
         }
-        
+
         Ok(offset)
     }
 
     fn save(&self, topic_id: u32, consumer_id: u64, offset: u64) -> Result<()> {
         // Get previous offset
-        let previous_offset = self.previous_offsets.read()
+        let previous_offset = self
+            .previous_offsets
+            .read()
             .ok()
             .and_then(|prev| prev.get(&(topic_id, consumer_id)).copied());
 
@@ -509,7 +500,7 @@ impl<S: OffsetStore> OffsetStore for HookedOffsetStore<S> {
         if let Ok(mut prev) = self.previous_offsets.write() {
             prev.remove(&(topic_id, consumer_id));
         }
-        
+
         self.inner.delete(topic_id, consumer_id)
     }
 
@@ -549,9 +540,7 @@ impl CollectingCommitHook {
 
     /// Get all collected commits
     pub fn commits(&self) -> Vec<CommitInfo> {
-        self.commits.read()
-            .map(|c| c.clone())
-            .unwrap_or_default()
+        self.commits.read().map(|c| c.clone()).unwrap_or_default()
     }
 
     /// Clear collected commits
@@ -683,7 +672,7 @@ mod tests {
 
         // Save triggers hook
         store.save(1, 100, 42).unwrap();
-        
+
         let commits = hook.commits();
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].topic_id, 1);
@@ -693,7 +682,7 @@ mod tests {
 
         // Second save has previous offset
         store.save(1, 100, 100).unwrap();
-        
+
         let commits = hook.commits();
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[1].offset, 100);
@@ -715,7 +704,7 @@ mod tests {
     #[test]
     fn test_collecting_commit_hook() {
         let hook = CollectingCommitHook::new();
-        
+
         let info = CommitInfo {
             topic_id: 1,
             consumer_id: 100,
@@ -723,13 +712,13 @@ mod tests {
             previous_offset: None,
             timestamp: std::time::SystemTime::now(),
         };
-        
+
         hook.on_commit(&info).unwrap();
-        
+
         let commits = hook.commits();
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].topic_id, 1);
-        
+
         hook.clear();
         assert!(hook.commits().is_empty());
     }

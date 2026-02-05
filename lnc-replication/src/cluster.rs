@@ -13,11 +13,11 @@ use crate::raft::{FencingToken, RaftConfig, RaftNode, RaftState};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 
 /// Events emitted by the cluster coordinator
@@ -115,16 +115,20 @@ impl ClusterCoordinator {
     }
 
     /// Create a new cluster coordinator with persistent log storage
-    pub fn with_persistence(config: ClusterConfig, data_dir: &Path) -> Result<Self, std::io::Error> {
+    pub fn with_persistence(
+        config: ClusterConfig,
+        data_dir: &Path,
+    ) -> Result<Self, std::io::Error> {
         let (event_tx, _) = broadcast::channel(64);
 
         // Open persistent log store
         let raft_dir = data_dir.join("raft");
-        let log_store = LogStore::open(&raft_dir)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let log_store =
+            LogStore::open(&raft_dir).map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Load persistent state (term, voted_for)
-        let persistent_state = log_store.load_state()
+        let persistent_state = log_store
+            .load_state()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Create Raft cluster config from our config
@@ -380,7 +384,8 @@ impl ClusterCoordinator {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    self.last_sync_time.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                    self.last_sync_time
+                        .store(now_ms, std::sync::atomic::Ordering::Relaxed);
                     info!(
                         target: "lance::cluster",
                         write_id,
@@ -432,7 +437,8 @@ impl ClusterCoordinator {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
-                self.last_sync_time.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                self.last_sync_time
+                    .store(now_ms, std::sync::atomic::Ordering::Relaxed);
                 info!(
                     target: "lance::cluster",
                     success_count,
@@ -615,14 +621,20 @@ impl ClusterCoordinator {
         lnc_metrics::set_cluster_quorum_available(quorum_available);
 
         // Update replication lag metrics
-        let last_sync = self.last_sync_time.load(std::sync::atomic::Ordering::Relaxed);
+        let last_sync = self
+            .last_sync_time
+            .load(std::sync::atomic::Ordering::Relaxed);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let lag_ms = if last_sync > 0 { now_ms.saturating_sub(last_sync) } else { 0 };
+        let lag_ms = if last_sync > 0 {
+            now_ms.saturating_sub(last_sync)
+        } else {
+            0
+        };
         lnc_metrics::set_replication_last_sync_ms(lag_ms);
-        
+
         // Pending ops tracked via quorum manager
         let pending_ops = self.quorum_manager.pending_count().await;
         lnc_metrics::set_replication_pending_ops(pending_ops as u64);

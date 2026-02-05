@@ -168,7 +168,7 @@ impl StandaloneConsumer {
         })?;
         let mut client_config = ClientConfig::new(socket_addr);
         client_config.connect_timeout = config.connect_timeout;
-        
+
         let client = LanceClient::connect(client_config).await?;
         Self::from_client(client, config).await
     }
@@ -177,7 +177,7 @@ impl StandaloneConsumer {
     pub async fn from_client(client: LanceClient, config: StandaloneConfig) -> Result<Self> {
         // Generate numeric consumer ID from string name
         let numeric_consumer_id = Self::hash_consumer_id(&config.consumer_id);
-        
+
         // Initialize offset store
         let offset_store: Arc<dyn OffsetStore> = if let Some(ref dir) = config.offset_dir {
             Arc::new(LockFileOffsetStore::open(dir, &config.consumer_id)?)
@@ -205,7 +205,7 @@ impl StandaloneConsumer {
             .with_auto_commit_interval(0); // We handle auto-commit ourselves
 
         let mut inner = StreamingConsumer::new(client, streaming_config);
-        
+
         // Start the subscription
         inner.start().await?;
 
@@ -247,7 +247,7 @@ impl StandaloneConsumer {
     /// are available or the configured poll_timeout is reached.
     pub async fn poll_timeout(&mut self, timeout: Duration) -> Result<Option<PollResult>> {
         let deadline = Instant::now() + timeout;
-        
+
         while Instant::now() < deadline {
             if let Some(result) = self.poll().await? {
                 return Ok(Some(result));
@@ -273,7 +273,7 @@ impl StandaloneConsumer {
     pub async fn commit_offset(&mut self, offset: u64) -> Result<()> {
         // Generate numeric consumer ID
         let numeric_consumer_id = Self::hash_consumer_id(&self.config.consumer_id);
-        
+
         // Persist to offset store
         self.offset_store
             .save(self.config.topic_id, numeric_consumer_id, offset)?;
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn test_standalone_config_defaults() {
         let config = StandaloneConfig::new("test-consumer", 1);
-        
+
         assert_eq!(config.consumer_id, "test-consumer");
         assert_eq!(config.topic_id, 1);
         assert_eq!(config.max_fetch_bytes, 1_048_576);
@@ -446,7 +446,7 @@ mod tests {
             .with_offset_dir(Path::new("/tmp/offsets"))
             .with_manual_commit()
             .with_start_position(SeekPosition::End);
-        
+
         assert_eq!(config.max_fetch_bytes, 512 * 1024);
         assert!(config.offset_dir.is_some());
         assert!(config.auto_commit_interval.is_none());
@@ -456,10 +456,7 @@ mod tests {
     fn test_standalone_config_with_auto_commit() {
         let config = StandaloneConfig::new("test", 1)
             .with_auto_commit_interval(Some(Duration::from_secs(10)));
-        
-        assert_eq!(
-            config.auto_commit_interval,
-            Some(Duration::from_secs(10))
-        );
+
+        assert_eq!(config.auto_commit_interval, Some(Duration::from_secs(10)));
     }
 }

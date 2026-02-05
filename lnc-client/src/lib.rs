@@ -13,21 +13,31 @@ pub mod standalone;
 pub mod tls;
 
 pub use client::{
-    AuthConfig, ClientConfig, ClientStream, CommitResult, FetchResult, LanceClient, SubscribeResult, TopicInfo,
+    AuthConfig, ClientConfig, ClientStream, CommitResult, FetchResult, LanceClient,
+    SubscribeResult, TopicInfo,
+};
+pub use connection::{
+    ClusterClient, ConnectionPool, ConnectionPoolConfig, PoolStats, PooledClient,
+    ReconnectingClient,
 };
 pub use consumer::{
     Consumer, ConsumerConfig, PollResult, SeekPosition, StreamingConsumer, StreamingConsumerConfig,
 };
-pub use error::{parse_not_leader_error, ClientError};
+pub use error::{ClientError, parse_not_leader_error};
 pub use grouped::{
     AssignmentStrategy, GroupConfig, GroupCoordinator, GroupedConsumer, WorkerConfig,
 };
-pub use offset::{LockFileOffsetStore, MemoryOffsetStore, OffsetStore, CommitInfo, PostCommitHook, HookedOffsetStore, LoggingCommitHook, CollectingCommitHook};
-pub use producer::{Producer, ProducerConfig, ProducerMetrics, MetricsSnapshot, SendAck};
+pub use offset::{
+    CollectingCommitHook, CommitInfo, HookedOffsetStore, LockFileOffsetStore, LoggingCommitHook,
+    MemoryOffsetStore, OffsetStore, PostCommitHook,
+};
+pub use producer::{MetricsSnapshot, Producer, ProducerConfig, ProducerMetrics, SendAck};
+pub use record::{
+    Record, RecordIterator, RecordParseError, RecordParserConfig, RecordType, TLV_HEADER_SIZE,
+    encode_record, parse_record, parse_records,
+};
 pub use standalone::{StandaloneConfig, StandaloneConsumer, StandaloneConsumerBuilder};
 pub use tls::TlsClientConfig;
-pub use connection::{ConnectionPool, ConnectionPoolConfig, PoolStats, PooledClient, ReconnectingClient, ClusterClient};
-pub use record::{Record, RecordType, RecordIterator, RecordParserConfig, RecordParseError, parse_records, parse_record, encode_record, TLV_HEADER_SIZE};
 
 #[cfg(test)]
 mod tests;

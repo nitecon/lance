@@ -68,8 +68,7 @@ impl OtlpConfig {
 }
 
 /// Global OTLP state for easy access
-static OTLP_INITIALIZED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static OTLP_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Initialize OTLP metrics exporter
 /// Per Architecture §12.3: Non-blocking, drops on overflow

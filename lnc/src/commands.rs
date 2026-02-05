@@ -1,7 +1,7 @@
 use lnc_client::ClientError;
 use lnc_core::{LanceError, Result};
 use lnc_index::{SecondaryIndex, SparseIndex};
-use lnc_recovery::{find_segments_needing_recovery, IndexRebuilder, SegmentRecovery};
+use lnc_recovery::{IndexRebuilder, SegmentRecovery, find_segments_needing_recovery};
 use std::path::Path;
 
 fn client_err(e: ClientError) -> LanceError {
@@ -198,7 +198,7 @@ fn scan_orphaned_dirs(segments_dir: &Path) -> Result<Vec<OrphanedDir>> {
 /// Check if a directory is orphaned (no valid metadata or marked deleted)
 fn is_orphaned_directory(path: &Path) -> bool {
     let metadata_path = path.join("metadata.json");
-    
+
     if metadata_path.exists() {
         // Check if metadata marks topic as deleted
         match std::fs::read_to_string(&metadata_path) {
@@ -214,10 +214,11 @@ fn is_orphaned_directory(path: &Path) -> bool {
 /// Display orphaned directories and compute total size
 fn display_orphaned_summary(orphaned: &[OrphanedDir]) -> u64 {
     let total_bytes: u64 = orphaned.iter().map(|d| d.size).sum();
-    
+
     println!("Found {} orphaned topic directories:", orphaned.len());
     for dir in orphaned {
-        let dir_name = dir.path
+        let dir_name = dir
+            .path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
@@ -228,7 +229,7 @@ fn display_orphaned_summary(orphaned: &[OrphanedDir]) -> u64 {
         total_bytes,
         total_bytes as f64 / (1024.0 * 1024.0)
     );
-    
+
     total_bytes
 }
 
@@ -237,15 +238,16 @@ fn execute_cleanup(orphaned: &[OrphanedDir], total_bytes: u64) {
     for dir in orphaned {
         match std::fs::remove_dir_all(&dir.path) {
             Ok(()) => {
-                let dir_name = dir.path
+                let dir_name = dir
+                    .path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown");
                 println!("Deleted: {}", dir_name);
-            }
+            },
             Err(e) => {
                 eprintln!("Failed to delete {}: {}", dir.path.display(), e);
-            }
+            },
         }
     }
     println!(
@@ -254,7 +256,6 @@ fn execute_cleanup(orphaned: &[OrphanedDir], total_bytes: u64) {
         total_bytes
     );
 }
-
 
 /// Clean storage by removing orphaned topic directories.
 ///
@@ -441,13 +442,14 @@ pub async fn fetch_topic(
             println!("No data available at offset {}", offset);
         },
         Err(e) => {
-            return Err(lnc_core::LanceError::Io(std::io::Error::other(e.to_string())));
+            return Err(lnc_core::LanceError::Io(std::io::Error::other(
+                e.to_string(),
+            )));
         },
     }
 
     Ok(())
 }
-
 
 /// Statistics tracked during consumption
 struct ConsumeStats {
@@ -475,7 +477,7 @@ fn resolve_start_position(
     from_end: bool,
 ) -> lnc_client::SeekPosition {
     use lnc_client::SeekPosition;
-    
+
     if from_beginning {
         SeekPosition::Beginning
     } else if from_end {
@@ -490,7 +492,7 @@ fn resolve_start_position(
 /// Format the start position for display
 fn format_position(position: &lnc_client::SeekPosition) -> String {
     use lnc_client::SeekPosition;
-    
+
     match position {
         SeekPosition::Beginning => "beginning".to_string(),
         SeekPosition::End => "end (tail)".to_string(),
@@ -509,11 +511,7 @@ fn print_consume_summary(stats: &ConsumeStats) {
 }
 
 /// Process a single fetch result
-fn process_fetch_result(
-    result: &lnc_client::PollResult,
-    fetch_num: usize,
-    output_hex: bool,
-) {
+fn process_fetch_result(result: &lnc_client::PollResult, fetch_num: usize, output_hex: bool) {
     println!(
         "--- Fetch {} (offset: {}, bytes: {}, records: {}) ---",
         fetch_num,
@@ -531,7 +529,6 @@ fn process_fetch_result(
     }
     println!();
 }
-
 
 /// Consume data continuously from a topic, starting at a specific offset.
 ///
@@ -595,15 +592,15 @@ pub async fn consume_topic(
                     println!("End of stream reached.");
                     break;
                 }
-            }
+            },
             Ok(None) => {
                 println!("No more data available.");
                 break;
-            }
+            },
             Err(e) => {
                 eprintln!("Error: {}", e);
                 break;
-            }
+            },
         }
     }
 
@@ -666,11 +663,28 @@ pub async fn set_retention(
     let config = ClientConfig::new(addr);
     let mut client = LanceClient::connect(config).await.map_err(client_err)?;
 
-    client.set_retention(topic_id, max_age_secs, max_bytes).await.map_err(client_err)?;
+    client
+        .set_retention(topic_id, max_age_secs, max_bytes)
+        .await
+        .map_err(client_err)?;
 
     println!("Retention policy set for topic {}", topic_id);
-    println!("  Max age: {} seconds", if max_age_secs == 0 { "unlimited".to_string() } else { max_age_secs.to_string() });
-    println!("  Max bytes: {}", if max_bytes == 0 { "unlimited".to_string() } else { format_bytes(max_bytes) });
+    println!(
+        "  Max age: {} seconds",
+        if max_age_secs == 0 {
+            "unlimited".to_string()
+        } else {
+            max_age_secs.to_string()
+        }
+    );
+    println!(
+        "  Max bytes: {}",
+        if max_bytes == 0 {
+            "unlimited".to_string()
+        } else {
+            format_bytes(max_bytes)
+        }
+    );
 
     Ok(())
 }
@@ -697,7 +711,8 @@ pub async fn create_topic(
     let topic = if max_age_secs.is_some() || max_bytes.is_some() {
         client
             .create_topic_with_retention(name, max_age_secs.unwrap_or(0), max_bytes.unwrap_or(0))
-            .await.map_err(client_err)?
+            .await
+            .map_err(client_err)?
     } else {
         client.create_topic(name).await.map_err(client_err)?
     };
@@ -706,10 +721,24 @@ pub async fn create_topic(
     println!("  ID: {}", topic.id);
     println!("  Name: {}", topic.name);
     if let Some(age) = max_age_secs {
-        println!("  Max age: {} seconds", if age == 0 { "unlimited".to_string() } else { age.to_string() });
+        println!(
+            "  Max age: {} seconds",
+            if age == 0 {
+                "unlimited".to_string()
+            } else {
+                age.to_string()
+            }
+        );
     }
     if let Some(bytes) = max_bytes {
-        println!("  Max bytes: {}", if bytes == 0 { "unlimited".to_string() } else { format_bytes(bytes) });
+        println!(
+            "  Max bytes: {}",
+            if bytes == 0 {
+                "unlimited".to_string()
+            } else {
+                format_bytes(bytes)
+            }
+        );
     }
 
     Ok(())
@@ -734,7 +763,6 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-
 /// List all topics from a remote server
 pub async fn list_topics_remote(server_addr: &str) -> Result<()> {
     use lnc_client::{ClientConfig, LanceClient};
@@ -757,7 +785,10 @@ pub async fn list_topics_remote(server_addr: &str) -> Result<()> {
     }
 
     println!("Topics on {}:", server_addr);
-    println!("{:<8} {:<32} {:<20} {:>12} {:>12}", "ID", "NAME", "CREATED", "MAX AGE", "MAX BYTES");
+    println!(
+        "{:<8} {:<32} {:<20} {:>12} {:>12}",
+        "ID", "NAME", "CREATED", "MAX AGE", "MAX BYTES"
+    );
     println!("{}", "-".repeat(88));
 
     for topic in topics {
@@ -903,12 +934,28 @@ pub async fn cluster_status(server_addr: &str) -> Result<()> {
 
     println!("Cluster Status:");
     println!("  Node ID:        {}", status.node_id);
-    println!("  Is Leader:      {}", if status.is_leader { "yes" } else { "no" });
-    println!("  Leader ID:      {}", status.leader_id.map(|id| id.to_string()).unwrap_or_else(|| "unknown".to_string()));
+    println!(
+        "  Is Leader:      {}",
+        if status.is_leader { "yes" } else { "no" }
+    );
+    println!(
+        "  Leader ID:      {}",
+        status
+            .leader_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
     println!("  Current Term:   {}", status.current_term);
     println!("  Node Count:     {}", status.node_count);
     println!("  Healthy Nodes:  {}", status.healthy_nodes);
-    println!("  Quorum:         {}", if status.quorum_available { "available" } else { "NOT AVAILABLE" });
+    println!(
+        "  Quorum:         {}",
+        if status.quorum_available {
+            "available"
+        } else {
+            "NOT AVAILABLE"
+        }
+    );
 
     if !status.peer_states.is_empty() {
         println!("\nPeer States:");
@@ -919,7 +966,6 @@ pub async fn cluster_status(server_addr: &str) -> Result<()> {
 
     Ok(())
 }
-
 
 /// Ingest data to a topic from file or stdin
 pub async fn ingest_data(
@@ -946,10 +992,7 @@ pub async fn ingest_data(
     // Open input source
     let input: Box<dyn Read> = match file_path {
         Some("-") | None => Box::new(io::stdin()),
-        Some(path) => Box::new(
-            std::fs::File::open(path)
-                .map_err(lnc_core::LanceError::Io)?,
-        ),
+        Some(path) => Box::new(std::fs::File::open(path).map_err(lnc_core::LanceError::Io)?),
     };
 
     let mut total_records = 0u64;
@@ -977,7 +1020,8 @@ pub async fn ingest_data(
 
                 client
                     .send_ingest_to_topic_sync(topic_id, payload, record_count, None)
-                    .await.map_err(client_err)?;
+                    .await
+                    .map_err(client_err)?;
 
                 batch.clear();
             }
@@ -992,13 +1036,16 @@ pub async fn ingest_data(
 
             client
                 .send_ingest_to_topic_sync(topic_id, payload, record_count, None)
-                .await.map_err(client_err)?;
+                .await
+                .map_err(client_err)?;
         }
     } else {
         // Binary mode: read entire file as single record
         let mut reader = io::BufReader::new(input);
         let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).map_err(lnc_core::LanceError::Io)?;
+        reader
+            .read_to_end(&mut buffer)
+            .map_err(lnc_core::LanceError::Io)?;
 
         if !buffer.is_empty() {
             let payload = Bytes::from(buffer);
@@ -1007,7 +1054,8 @@ pub async fn ingest_data(
 
             client
                 .send_ingest_to_topic_sync(topic_id, payload, 1, None)
-                .await.map_err(client_err)?;
+                .await
+                .map_err(client_err)?;
         }
     }
 
@@ -1027,7 +1075,6 @@ pub async fn ingest_data(
 
     Ok(())
 }
-
 
 /// Verify data integrity for a topic by checking CRC values
 pub fn verify_topic_data(data_path: &Path, topic_id: u32, fail_fast: bool) -> Result<()> {
@@ -1049,39 +1096,45 @@ pub fn verify_topic_data(data_path: &Path, topic_id: u32, fail_fast: bool) -> Re
     let mut errors = Vec::new();
 
     // Scan all segment files
-    let entries = fs::read_dir(&topic_path)
-        .map_err(lnc_core::LanceError::Io)?;
+    let entries = fs::read_dir(&topic_path).map_err(lnc_core::LanceError::Io)?;
 
     for entry in entries {
         let entry = entry.map_err(lnc_core::LanceError::Io)?;
         let path = entry.path();
-        
+
         if path.extension().map(|e| e == "seg").unwrap_or(false) {
             total_segments += 1;
-            
+
             match verify_segment_crc(&path) {
                 Ok(record_count) => {
                     verified_segments += 1;
                     total_records += record_count;
-                    println!("  ✓ {:?}: {} records", path.file_name().unwrap_or_default(), record_count);
-                }
+                    println!(
+                        "  ✓ {:?}: {} records",
+                        path.file_name().unwrap_or_default(),
+                        record_count
+                    );
+                },
                 Err(e) => {
                     let error_msg = format!("{:?}: {}", path.file_name().unwrap_or_default(), e);
                     println!("  ✗ {}", error_msg);
                     errors.push(error_msg);
-                    
+
                     if fail_fast {
                         return Err(lnc_core::LanceError::DataCorruption(
-                            "Verification failed - stopping on first error".to_string()
+                            "Verification failed - stopping on first error".to_string(),
                         ));
                     }
-                }
+                },
             }
         }
     }
 
     println!("\nVerification Summary:");
-    println!("  Segments:  {}/{} verified", verified_segments, total_segments);
+    println!(
+        "  Segments:  {}/{} verified",
+        verified_segments, total_segments
+    );
     println!("  Records:   {}", total_records);
     println!("  Errors:    {}", errors.len());
 
@@ -1107,20 +1160,25 @@ fn verify_segment_crc(segment_path: &Path) -> Result<u64> {
 
     // Read and verify each record's CRC
     let mut header_buf = [0u8; 5]; // TLV header: type(1) + length(4)
-    
+
     loop {
         match reader.read_exact(&mut header_buf) {
             Ok(()) => {
                 let length = u32::from_le_bytes([
-                    header_buf[1], header_buf[2], header_buf[3], header_buf[4]
+                    header_buf[1],
+                    header_buf[2],
+                    header_buf[3],
+                    header_buf[4],
                 ]) as usize;
-                
+
                 // Skip the value bytes
                 let mut value_buf = vec![0u8; length];
-                reader.read_exact(&mut value_buf).map_err(lnc_core::LanceError::Io)?;
-                
+                reader
+                    .read_exact(&mut value_buf)
+                    .map_err(lnc_core::LanceError::Io)?;
+
                 record_count += 1;
-            }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(lnc_core::LanceError::Io(e)),
         }
@@ -1130,7 +1188,12 @@ fn verify_segment_crc(segment_path: &Path) -> Result<u64> {
 }
 
 /// Export topic data to a file for backup
-pub fn export_topic(data_path: &Path, topic_id: u32, output: &Path, with_metadata: bool) -> Result<()> {
+pub fn export_topic(
+    data_path: &Path,
+    topic_id: u32,
+    output: &Path,
+    with_metadata: bool,
+) -> Result<()> {
     use std::fs::{self, File};
     use std::io::{BufReader, BufWriter, Read, Write};
 
@@ -1154,12 +1217,15 @@ pub fn export_topic(data_path: &Path, topic_id: u32, output: &Path, with_metadat
         "exported_at": chrono::Utc::now().to_rfc3339(),
         "with_metadata": with_metadata
     });
-    let header_bytes = serde_json::to_vec(&header)
-        .map_err(|e| lnc_core::LanceError::Config(e.to_string()))?;
-    
-    writer.write_all(&(header_bytes.len() as u32).to_le_bytes())
+    let header_bytes =
+        serde_json::to_vec(&header).map_err(|e| lnc_core::LanceError::Config(e.to_string()))?;
+
+    writer
+        .write_all(&(header_bytes.len() as u32).to_le_bytes())
         .map_err(lnc_core::LanceError::Io)?;
-    writer.write_all(&header_bytes).map_err(lnc_core::LanceError::Io)?;
+    writer
+        .write_all(&header_bytes)
+        .map_err(lnc_core::LanceError::Io)?;
 
     let mut total_bytes = 0u64;
     let mut segment_count = 0u64;
@@ -1168,9 +1234,14 @@ pub fn export_topic(data_path: &Path, topic_id: u32, output: &Path, with_metadat
     let mut entries: Vec<_> = fs::read_dir(&topic_path)
         .map_err(lnc_core::LanceError::Io)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|ext| ext == "seg").unwrap_or(false))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "seg")
+                .unwrap_or(false)
+        })
         .collect();
-    
+
     entries.sort_by_key(|e| e.path());
 
     for entry in entries {
@@ -1178,21 +1249,30 @@ pub fn export_topic(data_path: &Path, topic_id: u32, output: &Path, with_metadat
         let file = File::open(&path).map_err(lnc_core::LanceError::Io)?;
         let mut reader = BufReader::new(file);
         let mut data = Vec::new();
-        reader.read_to_end(&mut data).map_err(lnc_core::LanceError::Io)?;
+        reader
+            .read_to_end(&mut data)
+            .map_err(lnc_core::LanceError::Io)?;
 
         // Write segment marker and data
-        writer.write_all(&(data.len() as u64).to_le_bytes())
+        writer
+            .write_all(&(data.len() as u64).to_le_bytes())
             .map_err(lnc_core::LanceError::Io)?;
         writer.write_all(&data).map_err(lnc_core::LanceError::Io)?;
 
         total_bytes += data.len() as u64;
         segment_count += 1;
-        
-        println!("  Exported {:?} ({} bytes)", path.file_name().unwrap_or_default(), data.len());
+
+        println!(
+            "  Exported {:?} ({} bytes)",
+            path.file_name().unwrap_or_default(),
+            data.len()
+        );
     }
 
     // Write end marker
-    writer.write_all(&0u64.to_le_bytes()).map_err(lnc_core::LanceError::Io)?;
+    writer
+        .write_all(&0u64.to_le_bytes())
+        .map_err(lnc_core::LanceError::Io)?;
     writer.flush().map_err(lnc_core::LanceError::Io)?;
 
     println!("\nExport Summary:");
@@ -1222,11 +1302,15 @@ pub fn import_topic(data_path: &Path, topic_name: &str, input: &Path) -> Result<
 
     // Read and parse header
     let mut header_len_buf = [0u8; 4];
-    reader.read_exact(&mut header_len_buf).map_err(lnc_core::LanceError::Io)?;
+    reader
+        .read_exact(&mut header_len_buf)
+        .map_err(lnc_core::LanceError::Io)?;
     let header_len = u32::from_le_bytes(header_len_buf) as usize;
 
     let mut header_buf = vec![0u8; header_len];
-    reader.read_exact(&mut header_buf).map_err(lnc_core::LanceError::Io)?;
+    reader
+        .read_exact(&mut header_buf)
+        .map_err(lnc_core::LanceError::Io)?;
 
     let header: serde_json::Value = serde_json::from_slice(&header_buf)
         .map_err(|e| lnc_core::LanceError::Config(format!("Invalid export header: {}", e)))?;
@@ -1250,7 +1334,9 @@ pub fn import_topic(data_path: &Path, topic_name: &str, input: &Path) -> Result<
     // Read and write segment data
     loop {
         let mut len_buf = [0u8; 8];
-        reader.read_exact(&mut len_buf).map_err(lnc_core::LanceError::Io)?;
+        reader
+            .read_exact(&mut len_buf)
+            .map_err(lnc_core::LanceError::Io)?;
         let segment_len = u64::from_le_bytes(len_buf) as usize;
 
         if segment_len == 0 {
@@ -1258,18 +1344,25 @@ pub fn import_topic(data_path: &Path, topic_name: &str, input: &Path) -> Result<
         }
 
         let mut segment_data = vec![0u8; segment_len];
-        reader.read_exact(&mut segment_data).map_err(lnc_core::LanceError::Io)?;
+        reader
+            .read_exact(&mut segment_data)
+            .map_err(lnc_core::LanceError::Io)?;
 
         let segment_path = topic_path.join(format!("{:016}.seg", segment_count));
         let out_file = File::create(&segment_path).map_err(lnc_core::LanceError::Io)?;
         let mut writer = BufWriter::new(out_file);
-        writer.write_all(&segment_data).map_err(lnc_core::LanceError::Io)?;
+        writer
+            .write_all(&segment_data)
+            .map_err(lnc_core::LanceError::Io)?;
         writer.flush().map_err(lnc_core::LanceError::Io)?;
 
         total_bytes += segment_len as u64;
         segment_count += 1;
-        
-        println!("  Imported segment {} ({} bytes)", segment_count, segment_len);
+
+        println!(
+            "  Imported segment {} ({} bytes)",
+            segment_count, segment_len
+        );
     }
 
     // Write topic metadata
@@ -1293,5 +1386,3 @@ pub fn import_topic(data_path: &Path, topic_name: &str, input: &Path) -> Result<
 
     Ok(())
 }
-
-

@@ -488,7 +488,6 @@ impl RaftNode {
         }
     }
 
-
     /// Handle a TimeoutNow request from the current leader.
     /// This triggers an immediate election to facilitate leadership transfer.
     pub fn handle_timeout_now(&mut self, req: &TimeoutNowRequest) -> TimeoutNowResponse {
@@ -553,7 +552,6 @@ impl RaftNode {
             leader_id: self.node_id,
         })
     }
-
 
     // =========================================================================
     // State Transitions
@@ -653,9 +651,12 @@ impl RaftNode {
         }
 
         // Check if target is in cluster configuration
-        let target_in_cluster = self.config.old_nodes.iter()
+        let target_in_cluster = self
+            .config
+            .old_nodes
+            .iter()
             .any(|n| n.node_id == target_node);
-        
+
         if !target_in_cluster {
             tracing::warn!(
                 target: "lance::raft",
@@ -929,7 +930,10 @@ mod tests {
 
         // Become leader
         node.start_election();
-        let resp = VoteResponse { term: 1, vote_granted: true };
+        let resp = VoteResponse {
+            term: 1,
+            vote_granted: true,
+        };
         node.handle_vote_response(2, &resp);
         assert_eq!(node.state, RaftState::Leader);
 
@@ -946,7 +950,7 @@ mod tests {
             node.current_term = ae_resp.term;
             node.state = RaftState::Follower;
         }
-        
+
         // Node should step down to follower
         assert_eq!(node.state, RaftState::Follower);
         assert_eq!(node.current_term, 2);
@@ -962,13 +966,19 @@ mod tests {
         assert_eq!(node.state, RaftState::Candidate);
 
         // Receive rejection from node 2
-        let resp = VoteResponse { term: 1, vote_granted: false };
+        let resp = VoteResponse {
+            term: 1,
+            vote_granted: false,
+        };
         let won = node.handle_vote_response(2, &resp);
         assert!(!won);
         assert_eq!(node.state, RaftState::Candidate); // Still candidate
 
         // Receive rejection from node 3 - election fails, still candidate
-        let resp = VoteResponse { term: 1, vote_granted: false };
+        let resp = VoteResponse {
+            term: 1,
+            vote_granted: false,
+        };
         let won = node.handle_vote_response(3, &resp);
         assert!(!won);
         // In split vote, node remains candidate until timeout triggers new election
@@ -1045,7 +1055,7 @@ mod tests {
         };
 
         let resp = node.handle_pre_vote_request(&req);
-        
+
         // Should reject - leader is still active
         assert!(!resp.vote_granted);
         // Term should NOT be updated (pre-vote protection)

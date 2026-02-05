@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // ============================================================================
 
 /// Audit log entry header - fixed size for efficient parsing
-/// 
+///
 /// Layout (48 bytes total):
 /// - magic: 4 bytes (0x41 0x55 0x44 0x54 = "AUDT")
 /// - version: 1 byte
@@ -57,7 +57,13 @@ impl AuditEntryHeader {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 
     /// Create a new audit entry header
-    pub fn new(topic_id: u64, batch_id: u64, payload_len: u32, node_id: u16, operation: AuditOperation) -> Self {
+    pub fn new(
+        topic_id: u64,
+        batch_id: u64,
+        payload_len: u32,
+        node_id: u16,
+        operation: AuditOperation,
+    ) -> Self {
         let timestamp_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -184,7 +190,9 @@ impl std::fmt::Display for AuditError {
         match self {
             Self::IoError(e) => write!(f, "Audit I/O error: {}", e),
             Self::Disabled => write!(f, "Audit logging is disabled"),
-            Self::DirectoryNotFound(p) => write!(f, "Audit log directory not found: {}", p.display()),
+            Self::DirectoryNotFound(p) => {
+                write!(f, "Audit log directory not found: {}", p.display())
+            },
             Self::RotationFailed(msg) => write!(f, "Log rotation failed: {}", msg),
         }
     }
@@ -278,7 +286,14 @@ impl AuditLogWriter {
             AuditOperation::Write,
         );
 
-        self.write_raw_entry(&header, if self.config.include_payload { payload } else { None })
+        self.write_raw_entry(
+            &header,
+            if self.config.include_payload {
+                payload
+            } else {
+                None
+            },
+        )
     }
 
     /// Write a raw audit entry with header and optional payload
@@ -307,7 +322,8 @@ impl AuditLogWriter {
         }
 
         // Update metrics
-        let entry_size = AuditEntryHeader::SIZE as u64 + payload.map(|p| p.len()).unwrap_or(0) as u64;
+        let entry_size =
+            AuditEntryHeader::SIZE as u64 + payload.map(|p| p.len()).unwrap_or(0) as u64;
         self.current_size += entry_size;
         self.entries_written.fetch_add(1, Ordering::Relaxed);
         self.bytes_written.fetch_add(entry_size, Ordering::Relaxed);
@@ -428,7 +444,7 @@ mod tests {
             .with_enabled(true)
             .with_sync_writes(true)
             .with_include_payload(true);
-        
+
         assert!(config.enabled);
         assert!(config.sync_writes);
         assert!(config.include_payload);
@@ -438,7 +454,7 @@ mod tests {
     fn test_audit_writer_disabled() {
         let config = AuditConfig::default();
         let mut writer = AuditLogWriter::new(config, 1).unwrap();
-        
+
         // Should succeed but do nothing
         let result = writer.write_entry(1, 100, Some(b"test data"));
         assert!(result.is_ok());
@@ -454,9 +470,9 @@ mod tests {
         let config = AuditConfig::default()
             .with_enabled(true)
             .with_log_dir(temp_dir.clone());
-        
+
         let mut writer = AuditLogWriter::new(config, 1).unwrap();
-        
+
         // Write an entry
         writer.write_entry(1, 100, None).unwrap();
         assert_eq!(writer.entries_written(), 1);

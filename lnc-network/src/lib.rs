@@ -10,7 +10,7 @@ pub mod tls;
 
 pub use compression::{CompressionAlgorithm, CompressionError, Compressor};
 pub use connection::ConnectionBuffer;
-pub use frame::{encode_frame, parse_frame, Frame, FrameType};
+pub use frame::{Frame, FrameType, encode_frame, parse_frame};
 pub use protocol::{ControlCommand, IngestHeader, LwpFlags, LwpHeader, PROTOCOL_VERSION};
 pub use tls::{TlsAcceptor, TlsConfig, TlsConnector, TlsError, TlsResult};
 

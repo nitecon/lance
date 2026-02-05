@@ -55,64 +55,42 @@ impl<'a> ControlCommandDispatcher<'a> {
     pub async fn dispatch(&self, command: ControlCommand, payload: Option<&Bytes>) -> Frame {
         match command {
             // Topic management commands
-            ControlCommand::CreateTopic => {
-                handle_create_topic(self.ctx, payload).await
-            }
+            ControlCommand::CreateTopic => handle_create_topic(self.ctx, payload).await,
             ControlCommand::CreateTopicWithRetention => {
                 handle_create_topic_with_retention(self.ctx, payload).await
-            }
-            ControlCommand::ListTopics => {
-                handle_list_topics(self.ctx)
-            }
-            ControlCommand::GetTopic => {
-                handle_get_topic(self.ctx, payload)
-            }
-            ControlCommand::DeleteTopic => {
-                handle_delete_topic(self.ctx, payload).await
-            }
-            
+            },
+            ControlCommand::ListTopics => handle_list_topics(self.ctx),
+            ControlCommand::GetTopic => handle_get_topic(self.ctx, payload),
+            ControlCommand::DeleteTopic => handle_delete_topic(self.ctx, payload).await,
+
             // Subscription commands
-            ControlCommand::Subscribe => {
-                handle_subscribe(self.ctx, payload)
-            }
-            ControlCommand::Unsubscribe => {
-                handle_unsubscribe(self.ctx, payload)
-            }
-            ControlCommand::CommitOffset => {
-                handle_commit_offset(self.ctx, payload)
-            }
-            
+            ControlCommand::Subscribe => handle_subscribe(self.ctx, payload),
+            ControlCommand::Unsubscribe => handle_unsubscribe(self.ctx, payload),
+            ControlCommand::CommitOffset => handle_commit_offset(self.ctx, payload),
+
             // Retention commands
-            ControlCommand::SetRetention => {
-                handle_set_retention(self.ctx, payload)
-            }
-            
+            ControlCommand::SetRetention => handle_set_retention(self.ctx, payload),
+
             // Cluster management commands
-            ControlCommand::GetClusterStatus => {
-                handle_get_cluster_status(self.ctx).await
-            }
-            
+            ControlCommand::GetClusterStatus => handle_get_cluster_status(self.ctx).await,
+
             // Authentication commands - handled separately in connection.rs
             // as they need access to connection-level state
             ControlCommand::Authenticate | ControlCommand::AuthenticateResponse => {
                 // These are handled at connection level, not via dispatcher
                 Frame::new_error_response("Authentication handled at connection level")
-            }
-            
+            },
+
             // Fetch is handled separately with rate limiting
-            ControlCommand::Fetch => {
-                self.handle_fetch(payload)
-            }
-            
+            ControlCommand::Fetch => self.handle_fetch(payload),
+
             // Server-only frames - invalid from clients
             ControlCommand::SubscribeAck
             | ControlCommand::CommitAck
             | ControlCommand::FetchResponse
             | ControlCommand::TopicResponse
             | ControlCommand::ClusterStatusResponse
-            | ControlCommand::ErrorResponse => {
-                handle_invalid_client_command()
-            }
+            | ControlCommand::ErrorResponse => handle_invalid_client_command(),
         }
     }
 
@@ -120,13 +98,16 @@ impl<'a> ControlCommandDispatcher<'a> {
     fn handle_fetch(&self, payload: Option<&Bytes>) -> Frame {
         match payload.map(|p| FetchRequest::parse(p)) {
             Some(Ok(fetch_req)) => {
-                let allowed = self.ctx.rate_limiter.try_consume(fetch_req.max_bytes as u64);
+                let allowed = self
+                    .ctx
+                    .rate_limiter
+                    .try_consume(fetch_req.max_bytes as u64);
                 if allowed == 0 && !self.ctx.rate_limiter.has_capacity() {
                     Frame::new_error_response("Rate limit exceeded")
                 } else {
                     self.handle_fetch_request(&fetch_req)
                 }
-            }
+            },
             Some(Err(e)) => Frame::new_error_response(&e.to_string()),
             None => Frame::new_error_response("Fetch request payload required"),
         }
@@ -137,8 +118,12 @@ impl<'a> ControlCommandDispatcher<'a> {
         if self.ctx.topic_registry.get_topic(req.topic_id).is_none() {
             return Frame::new_error_response(&format!("Topic {} not found", req.topic_id));
         }
-        
-        match self.ctx.topic_registry.read_from_offset(req.topic_id, req.start_offset, req.max_bytes) {
+
+        match self.ctx.topic_registry.read_from_offset(
+            req.topic_id,
+            req.start_offset,
+            req.max_bytes,
+        ) {
             Ok(data) => Frame::new_fetch_response(data),
             Err(e) => Frame::new_error_response(&e.to_string()),
         }
@@ -157,10 +142,7 @@ pub fn is_write_operation(command: ControlCommand) -> bool {
 }
 
 /// Handle CreateTopic command
-pub async fn handle_create_topic(
-    ctx: &CommandContext<'_>,
-    payload: Option<&Bytes>,
-) -> Frame {
+pub async fn handle_create_topic(ctx: &CommandContext<'_>, payload: Option<&Bytes>) -> Frame {
     let topic_name = payload
         .map(|p| String::from_utf8_lossy(p).to_string())
         .unwrap_or_default();
@@ -194,7 +176,7 @@ pub async fn handle_create_topic(
                 "created_at": metadata.created_at
             });
             Frame::new_topic_response(Bytes::from(response_data.to_string()))
-        }
+        },
         Err(e) => Frame::new_error_response(&e.to_string()),
     }
 }
@@ -207,10 +189,7 @@ pub fn handle_list_topics(ctx: &CommandContext<'_>) -> Frame {
 }
 
 /// Handle GetTopic command
-pub fn handle_get_topic(
-    ctx: &CommandContext<'_>,
-    payload: Option<&Bytes>,
-) -> Frame {
+pub fn handle_get_topic(ctx: &CommandContext<'_>, payload: Option<&Bytes>) -> Frame {
     let topic_id = payload
         .filter(|p| p.len() >= 4)
         .map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]]))
@@ -224,16 +203,13 @@ pub fn handle_get_topic(
                 "created_at": metadata.created_at
             });
             Frame::new_topic_response(Bytes::from(response_data.to_string()))
-        }
+        },
         None => Frame::new_error_response("Topic not found"),
     }
 }
 
 /// Handle DeleteTopic command
-pub async fn handle_delete_topic(
-    ctx: &CommandContext<'_>,
-    payload: Option<&Bytes>,
-) -> Frame {
+pub async fn handle_delete_topic(ctx: &CommandContext<'_>, payload: Option<&Bytes>) -> Frame {
     let topic_id = payload
         .filter(|p| p.len() >= 4)
         .map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]]))
@@ -256,16 +232,13 @@ pub async fn handle_delete_topic(
 
             let response_data = serde_json::json!({"deleted": topic_id});
             Frame::new_topic_response(Bytes::from(response_data.to_string()))
-        }
+        },
         Err(e) => Frame::new_error_response(&e.to_string()),
     }
 }
 
 /// Handle Subscribe command
-pub fn handle_subscribe(
-    ctx: &CommandContext<'_>,
-    payload: Option<&Bytes>,
-) -> Frame {
+pub fn handle_subscribe(ctx: &CommandContext<'_>, payload: Option<&Bytes>) -> Frame {
     // Payload: topic_id(4) + start_offset(8) + max_batch_bytes(4) + consumer_id(8) = 24 bytes
     match payload.filter(|p| p.len() >= 24) {
         Some(p) => {
@@ -273,9 +246,8 @@ pub fn handle_subscribe(
             let start_offset =
                 u64::from_le_bytes([p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11]]);
             let max_batch_bytes = u32::from_le_bytes([p[12], p[13], p[14], p[15]]);
-            let consumer_id = u64::from_le_bytes([
-                p[16], p[17], p[18], p[19], p[20], p[21], p[22], p[23],
-            ]);
+            let consumer_id =
+                u64::from_le_bytes([p[16], p[17], p[18], p[19], p[20], p[21], p[22], p[23]]);
 
             // Validate topic exists (topic_id 0 is the default/legacy topic)
             if topic_id != 0 && !ctx.topic_registry.topic_exists(topic_id) {
@@ -298,16 +270,13 @@ pub fn handle_subscribe(
             );
 
             Frame::new_subscribe_ack(consumer_id, actual_offset)
-        }
+        },
         None => Frame::new_error_response("Invalid subscribe payload"),
     }
 }
 
 /// Handle Unsubscribe command
-pub fn handle_unsubscribe(
-    ctx: &CommandContext<'_>,
-    payload: Option<&Bytes>,
-) -> Frame {
+pub fn handle_unsubscribe(ctx: &CommandContext<'_>, payload: Option<&Bytes>) -> Frame {
     // Payload: topic_id(4) + consumer_id(8) = 12 bytes
     match payload.filter(|p| p.len() >= 12) {
         Some(p) => {
@@ -327,28 +296,25 @@ pub fn handle_unsubscribe(
 
             // Return Ack frame for unsubscribe
             Frame::new_ack(consumer_id)
-        }
+        },
         None => Frame::new_error_response("Invalid unsubscribe payload"),
     }
 }
 
 /// Handle CommitOffset command
-pub fn handle_commit_offset(
-    ctx: &CommandContext<'_>,
-    payload: Option<&Bytes>,
-) -> Frame {
+pub fn handle_commit_offset(ctx: &CommandContext<'_>, payload: Option<&Bytes>) -> Frame {
     // Payload: topic_id(4) + consumer_id(8) + offset(8) = 20 bytes
     match payload.filter(|p| p.len() >= 20) {
         Some(p) => {
             let topic_id = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
             let consumer_id =
                 u64::from_le_bytes([p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11]]);
-            let offset = u64::from_le_bytes([
-                p[12], p[13], p[14], p[15], p[16], p[17], p[18], p[19],
-            ]);
+            let offset =
+                u64::from_le_bytes([p[12], p[13], p[14], p[15], p[16], p[17], p[18], p[19]]);
 
             let committed_offset =
-                ctx.subscription_manager.commit_offset(consumer_id, topic_id, offset);
+                ctx.subscription_manager
+                    .commit_offset(consumer_id, topic_id, offset);
 
             debug!(
                 target: "lance::server",
@@ -359,27 +325,26 @@ pub fn handle_commit_offset(
             );
 
             Frame::new_commit_ack(consumer_id, committed_offset)
-        }
+        },
         None => Frame::new_error_response("Invalid commit offset payload"),
     }
 }
 
 /// Handle SetRetention command
-pub fn handle_set_retention(
-    ctx: &CommandContext<'_>,
-    payload: Option<&Bytes>,
-) -> Frame {
+pub fn handle_set_retention(ctx: &CommandContext<'_>, payload: Option<&Bytes>) -> Frame {
     // Payload: topic_id(4) + max_age_secs(8) + max_bytes(8) = 20 bytes
     match payload.filter(|p| p.len() >= 20) {
         Some(p) => {
             let topic_id = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
             let max_age_secs =
                 u64::from_le_bytes([p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11]]);
-            let max_bytes = u64::from_le_bytes([
-                p[12], p[13], p[14], p[15], p[16], p[17], p[18], p[19],
-            ]);
+            let max_bytes =
+                u64::from_le_bytes([p[12], p[13], p[14], p[15], p[16], p[17], p[18], p[19]]);
 
-            match ctx.topic_registry.set_retention(topic_id, max_age_secs, max_bytes) {
+            match ctx
+                .topic_registry
+                .set_retention(topic_id, max_age_secs, max_bytes)
+            {
                 Ok(()) => {
                     info!(
                         target: "lance::server",
@@ -394,14 +359,13 @@ pub fn handle_set_retention(
                         "max_bytes": max_bytes
                     });
                     Frame::new_topic_response(Bytes::from(response_data.to_string()))
-                }
+                },
                 Err(e) => Frame::new_error_response(&e.to_string()),
             }
-        }
+        },
         None => Frame::new_error_response("Invalid set retention payload"),
     }
 }
-
 
 /// Handle GetClusterStatus command - returns cluster health and state information
 pub async fn handle_get_cluster_status(ctx: &CommandContext<'_>) -> Frame {
@@ -438,7 +402,7 @@ pub async fn handle_get_cluster_status(ctx: &CommandContext<'_>) -> Frame {
             });
 
             Frame::new_cluster_status_response(Bytes::from(response_data.to_string()))
-        }
+        },
         None => {
             // Standalone mode - return minimal cluster info
             let response_data = serde_json::json!({
@@ -454,10 +418,9 @@ pub async fn handle_get_cluster_status(ctx: &CommandContext<'_>) -> Frame {
             });
 
             Frame::new_cluster_status_response(Bytes::from(response_data.to_string()))
-        }
+        },
     }
 }
-
 
 /// Handle CreateTopicWithRetention command
 pub async fn handle_create_topic_with_retention(
@@ -500,7 +463,10 @@ pub async fn handle_create_topic_with_retention(
                 max_bytes: Some(max_bytes),
             });
 
-            match ctx.topic_registry.create_topic_with_retention(&topic_name, retention) {
+            match ctx
+                .topic_registry
+                .create_topic_with_retention(&topic_name, retention)
+            {
                 Ok(metadata) => {
                     // Replicate to followers if in cluster mode
                     if let Some(coord) = ctx.cluster {
@@ -527,10 +493,10 @@ pub async fn handle_create_topic_with_retention(
                         "max_bytes": max_bytes
                     });
                     Frame::new_topic_response(Bytes::from(response_data.to_string()))
-                }
+                },
                 Err(e) => Frame::new_error_response(&e.to_string()),
             }
-        }
+        },
         None => Frame::new_error_response("Invalid create topic payload"),
     }
 }
@@ -636,4 +602,3 @@ mod tests {
         ));
     }
 }
-

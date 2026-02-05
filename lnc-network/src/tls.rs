@@ -193,12 +193,14 @@ impl TlsAcceptor {
     fn build_acceptor(config: &TlsConfig) -> TlsResult<tokio_rustls::TlsAcceptor> {
         use rustls::pki_types::CertificateDer;
 
-        let cert_path = config.cert_path.as_ref().ok_or_else(|| {
-            TlsError::ConfigError("Certificate path required".into())
-        })?;
-        let key_path = config.key_path.as_ref().ok_or_else(|| {
-            TlsError::ConfigError("Key path required".into())
-        })?;
+        let cert_path = config
+            .cert_path
+            .as_ref()
+            .ok_or_else(|| TlsError::ConfigError("Certificate path required".into()))?;
+        let key_path = config
+            .key_path
+            .as_ref()
+            .ok_or_else(|| TlsError::ConfigError("Key path required".into()))?;
 
         // Load certificates
         let cert_file = File::open(cert_path)
@@ -213,8 +215,8 @@ impl TlsAcceptor {
         }
 
         // Load private key
-        let key_file = File::open(key_path)
-            .map_err(|e| TlsError::KeyError(format!("{}: {}", key_path, e)))?;
+        let key_file =
+            File::open(key_path).map_err(|e| TlsError::KeyError(format!("{}: {}", key_path, e)))?;
         let mut key_reader = BufReader::new(key_file);
         let key = rustls_pemfile::private_key(&mut key_reader)
             .map_err(|e| TlsError::KeyError(format!("Failed to parse key: {}", e)))?
@@ -275,8 +277,8 @@ impl TlsConnector {
 
     #[cfg(feature = "tls")]
     fn build_connector(config: &TlsConfig) -> TlsResult<tokio_rustls::TlsConnector> {
-        use rustls::pki_types::CertificateDer;
         use rustls::RootCertStore;
+        use rustls::pki_types::CertificateDer;
 
         let mut root_store = RootCertStore::empty();
 

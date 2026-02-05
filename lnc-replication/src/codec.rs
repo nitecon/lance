@@ -474,12 +474,8 @@ impl ReplicationCodec {
             ReplicationMessage::InstallSnapshotResponse(resp) => {
                 self.encode_install_snapshot_response(resp)
             },
-            ReplicationMessage::TimeoutNowRequest(req) => {
-                self.encode_timeout_now_request(req)
-            },
-            ReplicationMessage::TimeoutNowResponse(resp) => {
-                self.encode_timeout_now_response(resp)
-            },
+            ReplicationMessage::TimeoutNowRequest(req) => self.encode_timeout_now_request(req),
+            ReplicationMessage::TimeoutNowResponse(resp) => self.encode_timeout_now_response(resp),
         }
     }
 
@@ -1072,7 +1068,9 @@ impl ReplicationCodec {
 
     fn decode_timeout_now_request(data: &[u8]) -> Result<ReplicationMessage> {
         if data.len() < 10 {
-            return Err(LanceError::InvalidData("TimeoutNowRequest too short".into()));
+            return Err(LanceError::InvalidData(
+                "TimeoutNowRequest too short".into(),
+            ));
         }
 
         let term = u64::from_le_bytes(
@@ -1094,7 +1092,9 @@ impl ReplicationCodec {
 
     fn decode_timeout_now_response(data: &[u8]) -> Result<ReplicationMessage> {
         if data.len() < 9 {
-            return Err(LanceError::InvalidData("TimeoutNowResponse too short".into()));
+            return Err(LanceError::InvalidData(
+                "TimeoutNowResponse too short".into(),
+            ));
         }
 
         let term = u64::from_le_bytes(

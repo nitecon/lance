@@ -1,5 +1,5 @@
-use lnc_core::{parse_header, Result, SortKey, DEFAULT_SPARSE_INDEX_INTERVAL};
-use lnc_index::{IndexBuilder, INDEX_FILE_EXTENSION, SECONDARY_INDEX_EXTENSION};
+use lnc_core::{DEFAULT_SPARSE_INDEX_INTERVAL, Result, SortKey, parse_header};
+use lnc_index::{INDEX_FILE_EXTENSION, IndexBuilder, SECONDARY_INDEX_EXTENSION};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;

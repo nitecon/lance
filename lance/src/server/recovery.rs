@@ -3,7 +3,7 @@
 use crate::config::Config;
 use lnc_core::Result;
 use lnc_io::close_unclosed_segments;
-use lnc_recovery::{find_segments_needing_recovery, IndexRebuilder, SegmentRecovery, WalReplay};
+use lnc_recovery::{IndexRebuilder, SegmentRecovery, WalReplay, find_segments_needing_recovery};
 use tracing::{debug, info};
 
 /// Clean up empty segment files from previous aborted sessions

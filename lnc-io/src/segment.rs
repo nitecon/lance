@@ -113,11 +113,11 @@ impl SegmentWriter {
 
     pub fn close(&mut self, end_timestamp: u64) -> Result<PathBuf> {
         self.seal()?;
-        
+
         // Rename to closed segment format: {start_index}_{start_timestamp}-{end_timestamp}.lnc
         let new_path = rename_to_closed_segment(&self.path, end_timestamp)?;
         self.path = new_path.clone();
-        
+
         Ok(new_path)
     }
 
@@ -240,12 +240,7 @@ impl SharedMmapSlice {
 impl AsRef<[u8]> for SharedMmapSlice {
     fn as_ref(&self) -> &[u8] {
         // SAFETY: offset and len are validated at construction time
-        unsafe {
-            std::slice::from_raw_parts(
-                self.mmap.ptr.add(self.offset),
-                self.len,
-            )
-        }
+        unsafe { std::slice::from_raw_parts(self.mmap.ptr.add(self.offset), self.len) }
     }
 }
 
@@ -503,7 +498,6 @@ mod tests {
     }
 }
 
-
 // =============================================================================
 // Segment Compaction
 // =============================================================================
@@ -600,9 +594,7 @@ impl SegmentCompactor {
             // Parse segment name for index info
             // Format: {start_index}_{start_timestamp_ns}.lnc or
             //         {start_index}_{start_timestamp_ns}-{end_timestamp_ns}.lnc
-            let file_name = path.file_stem()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let file_name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
 
             let (start_index, created_at) = parse_segment_name(file_name);
 
@@ -779,21 +771,22 @@ impl SegmentCompactor {
 /// Active: {start_index}_{start_timestamp}.lnc
 /// Closed: {start_index}_{start_timestamp}-{end_timestamp}.lnc
 fn rename_to_closed_segment(path: &Path, end_timestamp: u64) -> Result<PathBuf> {
-    let filename = path.file_stem()
+    let filename = path
+        .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| LanceError::Io(std::io::Error::other("Invalid segment filename")))?;
-    
+
     // Check if already in closed format (contains '-')
     if filename.contains('-') {
         return Ok(path.to_path_buf());
     }
-    
+
     // Build new filename: {original}-{end_timestamp}.lnc
     let new_filename = format!("{}-{}.lnc", filename, end_timestamp);
     let new_path = path.with_file_name(new_filename);
-    
+
     std::fs::rename(path, &new_path)?;
-    
+
     Ok(new_path)
 }
 
@@ -801,15 +794,15 @@ fn rename_to_closed_segment(path: &Path, end_timestamp: u64) -> Result<PathBuf> 
 /// This handles crash recovery where segments weren't properly closed
 pub fn close_unclosed_segments(segments_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut closed = Vec::new();
-    
+
     if !segments_dir.exists() {
         return Ok(closed);
     }
-    
+
     for entry in std::fs::read_dir(segments_dir)? {
         let entry = entry?;
         let path = entry.path();
-        
+
         if path.extension().is_some_and(|ext| ext == "lnc") {
             if let Some(filename) = path.file_stem().and_then(|s| s.to_str()) {
                 // Active segments don't have '-' in the name
@@ -819,14 +812,14 @@ pub fn close_unclosed_segments(segments_dir: &Path) -> Result<Vec<PathBuf>> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_nanos() as u64)
                         .unwrap_or(0);
-                    
+
                     let new_path = rename_to_closed_segment(&path, end_timestamp)?;
                     closed.push(new_path);
                 }
             }
         }
     }
-    
+
     Ok(closed)
 }
 

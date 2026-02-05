@@ -112,7 +112,9 @@ impl ConnectionBuffer {
     pub unsafe fn advance_write(&mut self, len: usize) {
         let new_len = self.buffer.len() + len;
         // SAFETY: Caller guarantees that len bytes have been written to the spare capacity
-        unsafe { self.buffer.set_len(new_len); }
+        unsafe {
+            self.buffer.set_len(new_len);
+        }
     }
 }
 

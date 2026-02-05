@@ -13,23 +13,23 @@ pub mod retention;
 mod writer;
 
 pub use connection::handle_connection;
-pub use ingestion::{run_ingestion_actor, IngestionRequest};
+pub use ingestion::{IngestionRequest, run_ingestion_actor};
 pub use multi_actor::{IngestionSender, MultiActorIngestion};
 pub use recovery::perform_startup_recovery;
-pub use retention::{run_retention_service, RetentionServiceConfig};
+pub use retention::{RetentionServiceConfig, run_retention_service};
 
+use crate::auth::TokenValidator;
 use crate::config::Config;
 use crate::consumer::ConsumerRateLimiter;
 use crate::health::HealthState;
 use crate::subscription::SubscriptionManager;
 use crate::topic::TopicRegistry;
-use crate::auth::TokenValidator;
 use lnc_core::{BatchPool, NumaTopology, Result};
 #[cfg(feature = "tls")]
 use lnc_network::tls::{TlsAcceptor, TlsConfig};
 use lnc_replication::{
-    create_leader_pool, create_replication_channel, ClusterCoordinator, ClusterEvent,
-    ForwardConfig, LeaderConnectionPool, ReplicationActor, TopicOperation,
+    ClusterCoordinator, ClusterEvent, ForwardConfig, LeaderConnectionPool, ReplicationActor,
+    TopicOperation, create_leader_pool, create_replication_channel,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -145,7 +145,7 @@ pub async fn run(
         tokio::spawn(async move {
             // Track last known leader for change detection
             let mut last_leader = event_coord.leader_addr();
-            
+
             loop {
                 // Check for leader changes periodically
                 let current_leader = event_coord.leader_addr();
@@ -159,7 +159,7 @@ pub async fn run(
                     last_leader = current_leader;
                     // Note: Leader pool is updated via forward module's on_leader_change
                 }
-                
+
                 match event_rx.recv().await {
                     Ok(ClusterEvent::TopicOperation(op)) => match op {
                         TopicOperation::Create {
@@ -238,12 +238,12 @@ pub async fn run(
     // Create leader connection pool for write forwarding (only if in cluster mode)
     let leader_pool: Option<Arc<LeaderConnectionPool>> = if let Some(ref coord) = cluster {
         let pool = create_leader_pool(ForwardConfig::default());
-        
+
         // Initialize pool with current leader address if known
         if let Some(leader_addr) = coord.leader_addr() {
             pool.on_leader_change(Some(leader_addr)).await;
         }
-        
+
         // Start leader change watcher task
         let pool_for_watcher = Arc::clone(&pool);
         let coord_for_watcher = Arc::clone(coord);
@@ -264,7 +264,7 @@ pub async fn run(
                 }
             }
         });
-        
+
         Some(pool)
     } else {
         None
@@ -276,13 +276,7 @@ pub async fn run(
         let ingestion_pool = Arc::clone(&batch_pool);
         let ingestion_registry = Arc::clone(&topic_registry);
         Some(tokio::spawn(async move {
-            run_ingestion_actor(
-                ingestion_config,
-                rx,
-                ingestion_pool,
-                ingestion_registry,
-            )
-            .await
+            run_ingestion_actor(ingestion_config, rx, ingestion_pool, ingestion_registry).await
         }))
     } else {
         info!(
@@ -301,7 +295,9 @@ pub async fn run(
         dry_run: false,
     };
     let retention_handle = tokio::spawn(async move {
-        if let Err(e) = run_retention_service(retention_config, retention_registry, retention_shutdown_rx).await {
+        if let Err(e) =
+            run_retention_service(retention_config, retention_registry, retention_shutdown_rx).await
+        {
             warn!(target: "lance::server", error = %e, "Retention service error");
         }
     });
@@ -326,7 +322,7 @@ pub async fn run(
                 );
             }
             Arc::new(validator)
-        }
+        },
         Err(e) => {
             warn!(
                 target: "lance::server",
@@ -334,7 +330,7 @@ pub async fn run(
                 "Failed to initialize token validator, auth disabled"
             );
             Arc::new(TokenValidator::default())
-        }
+        },
     };
 
     // Initialize TLS acceptor if configured
@@ -351,7 +347,7 @@ pub async fn run(
                             "TLS enabled for client connections"
                         );
                         Some(Arc::new(acceptor))
-                    }
+                    },
                     Err(e) => {
                         error!(
                             target: "lance::server",
@@ -359,21 +355,21 @@ pub async fn run(
                             "Failed to initialize TLS acceptor, continuing without TLS"
                         );
                         None
-                    }
+                    },
                 }
-            }
+            },
             _ => {
                 warn!(
                     target: "lance::server",
                     "TLS enabled but cert_path or key_path not configured"
                 );
                 None
-            }
+            },
         }
     } else {
         None
     };
-    
+
     #[cfg(not(feature = "tls"))]
     let tls_acceptor: Option<()> = None;
     let _ = &tls_acceptor; // Suppress unused warning when TLS not enabled

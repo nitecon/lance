@@ -3,7 +3,7 @@
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[derive(Parser)]
 #[command(name = "lnc")]

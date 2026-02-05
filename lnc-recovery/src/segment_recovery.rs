@@ -1,4 +1,4 @@
-use lnc_core::{parse_header, Result, TLV_HEADER_SIZE};
+use lnc_core::{Result, TLV_HEADER_SIZE, parse_header};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -251,7 +251,7 @@ mod tests {
         let mut buf = Vec::new();
         encode_test_tlv(0x10, payload, &mut buf);
         file.write_all(&buf).unwrap();
-        
+
         // Write incomplete/truncated record
         file.write_all(&[0x10, 0xFF, 0x00, 0x00, 0x00]).unwrap();
 
@@ -263,7 +263,7 @@ mod tests {
 
         assert_eq!(result.valid_records, 1);
         assert!(result.truncated_bytes > 0);
-        
+
         // Verify file was actually truncated
         let metadata = std::fs::metadata(&path).unwrap();
         assert_eq!(metadata.len(), result.valid_bytes);
@@ -278,14 +278,14 @@ mod tests {
         File::create(&path).unwrap();
 
         let recovery = SegmentRecovery::new(&path);
-        
+
         // Initially not dirty
         assert!(!recovery.is_dirty());
-        
+
         // Mark as dirty
         recovery.mark_as_dirty().unwrap();
         assert!(recovery.is_dirty());
-        
+
         // Clear dirty marker
         recovery.clear_dirty_marker().unwrap();
         assert!(!recovery.is_dirty());
@@ -337,17 +337,17 @@ mod tests {
     #[test]
     fn test_find_segments_needing_recovery() {
         let dir = tempdir().unwrap();
-        
+
         // Create a segment file directly in data_dir (function doesn't recurse)
         let segment_path = dir.path().join("segment_0.lnc");
         File::create(&segment_path).unwrap();
-        
+
         // Mark as dirty - dirty marker uses .dirty extension replacing .lnc
         let dirty_marker = dir.path().join("segment_0.dirty");
         File::create(&dirty_marker).unwrap();
-        
+
         let segments = find_segments_needing_recovery(dir.path()).unwrap();
-        
+
         assert_eq!(segments.len(), 1);
         assert!(segments[0].ends_with("segment_0.lnc"));
     }

@@ -10,11 +10,16 @@ pub enum ClientError {
     ProtocolError(String),
     InvalidResponse(String),
     Timeout,
-    CrcMismatch { expected: u32, actual: u32 },
+    CrcMismatch {
+        expected: u32,
+        actual: u32,
+    },
     ServerBackpressure,
     ServerError(String),
     /// Server is not the leader, redirect to the specified address
-    NotLeader { leader_addr: Option<SocketAddr> },
+    NotLeader {
+        leader_addr: Option<SocketAddr>,
+    },
     /// TLS handshake or configuration error
     TlsError(String),
 }
@@ -51,18 +56,18 @@ pub fn parse_not_leader_error(msg: &str) -> Option<Option<SocketAddr>> {
     if !msg.starts_with("NOT_LEADER:") {
         return None;
     }
-    
+
     if msg.contains("leader unknown") {
         return Some(None);
     }
-    
+
     // Parse "NOT_LEADER: redirect to X.X.X.X:PORT"
     if let Some(addr_str) = msg.strip_prefix("NOT_LEADER: redirect to ") {
         if let Ok(addr) = addr_str.trim().parse::<SocketAddr>() {
             return Some(Some(addr));
         }
     }
-    
+
     Some(None)
 }
 

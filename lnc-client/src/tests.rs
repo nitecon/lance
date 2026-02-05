@@ -700,8 +700,6 @@ async fn test_multiple_consumers_same_topic() {
     client2.close().await.unwrap();
 }
 
-
-
 // =============================================================================
 // Retention Management Tests
 // =============================================================================
@@ -728,12 +726,10 @@ async fn test_set_retention_on_topic() {
     let max_age_secs = 86400; // 1 day
     let max_bytes = 1024 * 1024 * 100; // 100 MB
 
-    let result = client.set_retention(topic.id, max_age_secs, max_bytes).await;
-    assert!(
-        result.is_ok(),
-        "Set retention failed: {:?}",
-        result.err()
-    );
+    let result = client
+        .set_retention(topic.id, max_age_secs, max_bytes)
+        .await;
+    assert!(result.is_ok(), "Set retention failed: {:?}", result.err());
     println!(
         "Set retention: max_age={}s, max_bytes={}",
         max_age_secs, max_bytes
@@ -858,10 +854,7 @@ async fn test_create_topic_with_retention_duplicate_name() {
     let result = client
         .create_topic_with_retention(&topic_name, 7200, 2048 * 1024)
         .await;
-    assert!(
-        result.is_err(),
-        "Creating duplicate topic should fail"
-    );
+    assert!(result.is_err(), "Creating duplicate topic should fail");
     println!(
         "Duplicate topic creation correctly failed: {:?}",
         result.err()
@@ -903,7 +896,9 @@ async fn test_retention_update_values() {
     println!("Updated retention to: 2h, 2MB");
 
     // Update again with larger values
-    let result = client.set_retention(topic.id, 86400, 1024 * 1024 * 100).await;
+    let result = client
+        .set_retention(topic.id, 86400, 1024 * 1024 * 100)
+        .await;
     assert!(
         result.is_ok(),
         "Second update retention failed: {:?}",

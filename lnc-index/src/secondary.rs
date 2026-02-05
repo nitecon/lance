@@ -226,7 +226,7 @@ impl SecondaryIndex {
             Ok(idx) => {
                 result.exact_match = Some(&entries[idx]);
                 idx
-            }
+            },
             Err(idx) => idx,
         };
 
@@ -296,7 +296,7 @@ impl SecondaryIndex {
                         Some(after)
                     }
                 }
-            }
+            },
         }
     }
 

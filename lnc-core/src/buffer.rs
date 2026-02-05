@@ -352,6 +352,7 @@ impl Drop for NumaAlignedBuffer {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

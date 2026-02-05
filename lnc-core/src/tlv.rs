@@ -160,6 +160,7 @@ pub fn parse_header(data: &[u8]) -> Result<Header> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

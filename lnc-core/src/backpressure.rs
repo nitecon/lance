@@ -320,6 +320,7 @@ impl Drop for BackpressureGuard<'_> {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 

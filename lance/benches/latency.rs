@@ -67,6 +67,7 @@ fn bench_buffer_slice(c: &mut Criterion) {
 mod latency_gates {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     #[cfg(feature = "alloc-counter")]
     use std::alloc::{GlobalAlloc, Layout, System};

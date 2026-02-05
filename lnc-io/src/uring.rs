@@ -49,9 +49,11 @@ impl IoUringBackend {
     fn submit_and_wait(&mut self) -> Result<i32> {
         self.ring.submit_and_wait(1)?;
 
-        let cqe = self.ring.completion().next().ok_or_else(|| {
-            LanceError::Io(std::io::Error::other("No completion entry"))
-        })?;
+        let cqe = self
+            .ring
+            .completion()
+            .next()
+            .ok_or_else(|| LanceError::Io(std::io::Error::other("No completion entry")))?;
 
         let result = cqe.result();
         if result < 0 {
@@ -72,9 +74,10 @@ impl IoBackend for IoUringBackend {
         // SAFETY: The submission queue entry is valid and data buffer remains valid
         // until the operation completes (we wait synchronously)
         unsafe {
-            self.ring.submission().push(&write_op).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&write_op)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         lnc_metrics::increment_io_submitted();
@@ -93,9 +96,10 @@ impl IoBackend for IoUringBackend {
         // SAFETY: The submission queue entry is valid and buffer remains valid
         // until the operation completes (we wait synchronously)
         unsafe {
-            self.ring.submission().push(&read_op).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&read_op)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         lnc_metrics::increment_io_submitted();
@@ -112,9 +116,10 @@ impl IoBackend for IoUringBackend {
 
         // SAFETY: The submission queue entry is valid
         unsafe {
-            self.ring.submission().push(&fsync_op).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&fsync_op)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         lnc_metrics::increment_io_submitted();
@@ -244,9 +249,10 @@ impl IoUringPoller {
 
         // SAFETY: Caller must ensure data remains valid until completion is harvested
         unsafe {
-            self.ring.submission().push(&write_op).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&write_op)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         self.pending_ops += 1;
@@ -269,9 +275,10 @@ impl IoUringPoller {
 
         // SAFETY: Caller must ensure buffer remains valid until completion
         unsafe {
-            self.ring.submission().push(&read_op).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&read_op)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         self.pending_ops += 1;
@@ -312,9 +319,10 @@ impl IoUringPoller {
 
         // SAFETY: Caller must ensure buffer is registered and remains valid
         unsafe {
-            self.ring.submission().push(&read_op).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&read_op)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         self.pending_ops += 1;
@@ -342,9 +350,10 @@ impl IoUringPoller {
 
         // SAFETY: Caller must ensure buffer is registered and remains valid
         unsafe {
-            self.ring.submission().push(&write_op).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&write_op)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         self.pending_ops += 1;
@@ -546,7 +555,10 @@ impl RegisteredBufferPool {
         // for the lifetime of the io_uring instance
         unsafe {
             ring.submitter().register_buffers(&iovecs).map_err(|e| {
-                LanceError::Io(std::io::Error::other(format!("Failed to register buffers: {}", e)))
+                LanceError::Io(std::io::Error::other(format!(
+                    "Failed to register buffers: {}",
+                    e
+                )))
             })?;
         }
 
@@ -1057,9 +1069,10 @@ impl ZeroCopySender {
 
         // SAFETY: Caller ensures data remains valid until completion
         unsafe {
-            self.ring.submission().push(&send_op).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&send_op)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         self.pending_ops += 1;
@@ -1075,9 +1088,10 @@ impl ZeroCopySender {
 
         // SAFETY: Caller ensures data remains valid until completion
         unsafe {
-            self.ring.submission().push(&send_op).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&send_op)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         self.pending_ops += 1;
@@ -1099,9 +1113,10 @@ impl ZeroCopySender {
 
         // SAFETY: Caller ensures msghdr and referenced buffers remain valid
         unsafe {
-            self.ring.submission().push(&sendmsg_op).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&sendmsg_op)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         self.pending_ops += 1;
@@ -1303,9 +1318,10 @@ impl SpliceForwarder {
 
         // SAFETY: File descriptors must be valid
         unsafe {
-            self.ring.submission().push(&splice_op).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&splice_op)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         self.pending_ops += 1;
@@ -1329,9 +1345,10 @@ impl SpliceForwarder {
 
         // SAFETY: File descriptors must be valid
         unsafe {
-            self.ring.submission().push(&splice_op).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&splice_op)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         self.pending_ops += 1;
@@ -1377,12 +1394,14 @@ impl SpliceForwarder {
 
         // SAFETY: File descriptors must be valid
         unsafe {
-            self.ring.submission().push(&splice_in).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
-            self.ring.submission().push(&splice_out).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&splice_in)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
+            self.ring
+                .submission()
+                .push(&splice_out)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         self.pending_ops += 2;
@@ -1546,9 +1565,10 @@ impl TeeForwarder {
 
         // SAFETY: File descriptors must be valid pipes
         unsafe {
-            self.ring.submission().push(&tee_op).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&tee_op)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         self.pending_ops += 1;
@@ -1627,18 +1647,22 @@ impl TeeForwarder {
 
         // SAFETY: File descriptors must be valid
         unsafe {
-            self.ring.submission().push(&splice_in).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
-            self.ring.submission().push(&tee_op).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
-            self.ring.submission().push(&splice_leader).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
-            self.ring.submission().push(&splice_local).map_err(|_| {
-                LanceError::Io(std::io::Error::other("SQ full"))
-            })?;
+            self.ring
+                .submission()
+                .push(&splice_in)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
+            self.ring
+                .submission()
+                .push(&tee_op)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
+            self.ring
+                .submission()
+                .push(&splice_leader)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
+            self.ring
+                .submission()
+                .push(&splice_local)
+                .map_err(|_| LanceError::Io(std::io::Error::other("SQ full")))?;
         }
 
         self.pending_ops += 4;

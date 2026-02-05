@@ -2,6 +2,18 @@
 <module type="EMPTY_MODULE" version="4">
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/lance/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/lance/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lnc-client/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lnc-client/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/lnc-core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lnc-index/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lnc-io/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lnc-metrics/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lnc-network/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lnc-recovery/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lnc-replication/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lnc/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>

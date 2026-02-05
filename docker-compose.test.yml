@@ -1,0 +1,106 @@
+# LANCE 3-Node Cluster for Integration Testing
+# 
+# Usage:
+#   docker-compose -f docker-compose.test.yml up -d    # Start cluster
+#   docker-compose -f docker-compose.test.yml down     # Stop cluster
+#   docker-compose -f docker-compose.test.yml logs -f  # View logs
+
+services:
+  lance-node0:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lance-node0
+    hostname: lance-node0
+    command:
+      - "--node-id=0"
+      - "--listen=0.0.0.0:1992"
+      - "--replication=0.0.0.0:1993"
+      - "--metrics=0.0.0.0:9090"
+      - "--health=0.0.0.0:8080"
+      - "--data-dir=/var/lib/lance"
+      - "--replication-mode=l3"
+      - "--peers=0@lance-node0:1993,1@lance-node1:1993,2@lance-node2:1993"
+    ports:
+      - "1992:1992"   # Client port
+      - "9090:9090"   # Metrics
+      - "8080:8080"   # Health
+    volumes:
+      - lance-node0-data:/var/lib/lance
+    networks:
+      - lance-cluster
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "1992"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  lance-node1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lance-node1
+    hostname: lance-node1
+    command:
+      - "--node-id=1"
+      - "--listen=0.0.0.0:1992"
+      - "--replication=0.0.0.0:1993"
+      - "--metrics=0.0.0.0:9090"
+      - "--health=0.0.0.0:8080"
+      - "--data-dir=/var/lib/lance"
+      - "--replication-mode=l3"
+      - "--peers=0@lance-node0:1993,1@lance-node1:1993,2@lance-node2:1993"
+    ports:
+      - "1993:1992"   # Client port (mapped to 1993 on host)
+      - "9091:9090"   # Metrics
+      - "8081:8080"   # Health
+    volumes:
+      - lance-node1-data:/var/lib/lance
+    networks:
+      - lance-cluster
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "1992"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  lance-node2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lance-node2
+    hostname: lance-node2
+    command:
+      - "--node-id=2"
+      - "--listen=0.0.0.0:1992"
+      - "--replication=0.0.0.0:1993"
+      - "--metrics=0.0.0.0:9090"
+      - "--health=0.0.0.0:8080"
+      - "--data-dir=/var/lib/lance"
+      - "--replication-mode=l3"
+      - "--peers=0@lance-node0:1993,1@lance-node1:1993,2@lance-node2:1993"
+    ports:
+      - "1994:1992"   # Client port (mapped to 1994 on host)
+      - "9092:9090"   # Metrics
+      - "8082:8080"   # Health
+    volumes:
+      - lance-node2-data:/var/lib/lance
+    networks:
+      - lance-cluster
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "1992"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+networks:
+  lance-cluster:
+    driver: bridge
+
+volumes:
+  lance-node0-data:
+  lance-node1-data:
+  lance-node2-data:

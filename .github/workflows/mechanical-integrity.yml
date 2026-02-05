@@ -1,0 +1,142 @@
+# LANCE Mechanical Integrity Checks
+# Per Engineering Standards §10 - CI/CD & Review Gates
+#
+# These checks are non-negotiable. Violations block merge.
+
+name: Mechanical Integrity
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  hot-path-audit:
+    name: Hot Path Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No Mutex on hot path
+        run: |
+          echo "Checking for Mutex/RwLock in hot path crates..."
+          if grep -rE "Mutex|RwLock" lnc-core/src lnc-io/src --include="*.rs" 2>/dev/null; then
+            echo "❌ BLOCKED: Lock found on hot path (lnc-core or lnc-io)"
+            echo "See Engineering Standards §1: No Mutex on Hot Path"
+            exit 1
+          fi
+          echo "✅ No locks found on hot path"
+
+      - name: No dynamic dispatch on data plane
+        run: |
+          echo "Checking for dynamic dispatch (dyn) in hot path crates..."
+          if grep -rE "dyn\s+" lnc-core/src lnc-io/src lnc-network/src --include="*.rs" 2>/dev/null; then
+            echo "❌ BLOCKED: Dynamic dispatch on data plane"
+            echo "See Engineering Standards §1: No Dynamic Dispatch"
+            exit 1
+          fi
+          echo "✅ No dynamic dispatch on data plane"
+
+      - name: No to_vec on network path
+        run: |
+          echo "Checking for .to_vec() in lnc-network..."
+          # Allow to_vec in tests only
+          if grep -rE "\.to_vec\(\)" lnc-network/src --include="*.rs" | grep -v "#\[cfg(test)\]" | grep -v "mod tests" 2>/dev/null; then
+            echo "⚠️ WARNING: to_vec() found in network code (review required)"
+            echo "See Engineering Standards §1: No to_vec() on Network Path"
+            # Note: Warning only, as some buffer operations may be acceptable
+          fi
+          echo "✅ Network path to_vec check complete"
+
+  clippy-strict:
+    name: Clippy Strict
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+        with:
+          components: clippy
+
+      - name: Run Clippy with strict settings
+        run: |
+          cargo clippy --workspace --all-targets -- \
+            -D clippy::unwrap_used \
+            -D clippy::expect_used \
+            -D warnings
+
+  alignment-check:
+    name: Struct Alignment Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for packed structs on hot path
+        run: |
+          echo "Checking for #[repr(C, packed)] in hot path crates..."
+          if grep -rE "#\[repr\(.*packed.*\)\]" lnc-core/src lnc-io/src lnc-network/src --include="*.rs" 2>/dev/null; then
+            echo "❌ BLOCKED: Packed struct found on hot path"
+            echo "See Engineering Standards §2.3: Packed causes unaligned access"
+            exit 1
+          fi
+          echo "✅ No packed structs on hot path"
+
+      - name: Verify I/O buffer alignment
+        run: |
+          echo "Checking for aligned I/O buffer definitions..."
+          # This is informational - manual review required for proper alignment
+          grep -rE "#\[repr\(C,\s*align\(" lnc-io/src --include="*.rs" || echo "Note: No explicit alignment found in lnc-io"
+
+  unsafe-audit:
+    name: Unsafe Block Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check unsafe blocks have SAFETY comments
+        run: |
+          echo "Auditing unsafe blocks for SAFETY comments..."
+          # Find all unsafe blocks and check for SAFETY comment
+          UNSAFE_COUNT=$(grep -rn "unsafe\s*{" --include="*.rs" | wc -l)
+          SAFETY_COUNT=$(grep -rn "// SAFETY:" --include="*.rs" | wc -l)
+          
+          echo "Found $UNSAFE_COUNT unsafe blocks"
+          echo "Found $SAFETY_COUNT SAFETY comments"
+          
+          if [ "$UNSAFE_COUNT" -gt "$SAFETY_COUNT" ]; then
+            echo "⚠️ WARNING: Some unsafe blocks may be missing SAFETY comments"
+            echo "See Engineering Standards §6.1: Documented Unsafe"
+          fi
+
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+
+      - name: Build workspace
+        run: cargo build --workspace --all-features
+
+      - name: Run tests
+        run: cargo test --workspace --all-features
+
+  deny-check:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Check dependencies
+        run: cargo deny check || echo "Note: cargo deny not configured yet"

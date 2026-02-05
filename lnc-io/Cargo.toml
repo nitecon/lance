@@ -1,0 +1,22 @@
+[package]
+name = "lnc-io"
+description = "I/O layer for LANCE - io_uring, pwritev2 fallback, segment management"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lnc-core = { workspace = true }
+lnc-metrics = { workspace = true }
+bytes = { workspace = true }
+crossbeam = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

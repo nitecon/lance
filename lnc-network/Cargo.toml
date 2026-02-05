@@ -1,0 +1,36 @@
+[package]
+name = "lnc-network"
+description = "Network layer for LANCE - LWP protocol, connection handling, zero-copy parsing"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lnc-core = { workspace = true }
+lnc-metrics = { workspace = true }
+bytes = { workspace = true }
+zerocopy = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+crc32fast = { workspace = true }
+
+# TLS support (optional feature)
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", optional = true }
+rustls-pemfile = { version = "2.1", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+# Compression support (optional features)
+lz4_flex = { version = "0.11", optional = true }
+zstd = { version = "0.13", optional = true }
+
+[features]
+default = []
+tls = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots"]
+lz4 = ["lz4_flex"]
+compression = ["lz4", "zstd"]
+
+[dev-dependencies]
+tokio-test = "0.4"

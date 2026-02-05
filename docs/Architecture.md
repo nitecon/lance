@@ -16,233 +16,17 @@
 - [10. Container Deployment & Ephemeral Integrity](#10-container-deployment-ephemeral-integrity)
 - [11. Chaos Testing & Failure Mode Design](#11-chaos-testing-failure-mode-design)
 - [12. Observability & Telemetry](#12-observability-telemetry)
-- [5.4 Revised Write Path: End-to-End Flow](#54-revised-write-path-end-to-end-flow)
 - [13. Memory Layout & Zero-Copy Primitives](#13-memory-layout-zero-copy-primitives)
-- [13.10 Bit-Packing: node_actor_seq Implementation](#1310-bit-packing-node_actor_seq-implementation)
-- [13.11 io_uring Probe & Fallback Strategy](#1311-io_uring-probe-fallback-strategy)
-- [13.12 SIMD-Accelerated Checksumming](#1312-simd-accelerated-checksumming)
 - [14. Thread Pinning & NUMA Awareness](#14-thread-pinning-numa-awareness)
 - [15. Buffer Ownership & Lifecycle (The Loaner Pattern)](#15-buffer-ownership-lifecycle-the-loaner-pattern)
 - [16. The LANCE Wire Protocol (LWP)](#16-the-lance-wire-protocol-lwp)
 - [17. Consumer Read Path (Zero-Copy Out)](#17-consumer-read-path-zero-copy-out)
 - [18. Mechanical Integrity Checklist (Engineering Audit)](#18-mechanical-integrity-checklist-engineering-audit)
+- [19. Client-Side Offset Management](#19-client-side-offset-management)
+- [20. Consumer Client Modes](#20-consumer-client-modes)
+- [21. Write Forwarding (Cluster Mode)](#21-write-forwarding-cluster-mode)
 
-- [1. System Overview](#1-system-overview)
-- [2. Storage Layer Architecture](#2-storage-layer-architecture)
-- [3. Memory & I/O Management](#3-memory-io-management)
-- [4. Replication & State Machine](#4-replication-state-machine)
-- [5. Concurrency Model](#5-concurrency-model)
-- [6. Backpressure & Flow Control](#6-backpressure-flow-control)
-- [7. Crash Recovery & Durability](#7-crash-recovery-durability)
-- [8. io_uring Feature Baseline](#8-io_uring-feature-baseline)
-- [9. Graceful Shutdown & Signal Handling](#9-graceful-shutdown-signal-handling)
-- [10. Container Deployment & Ephemeral Integrity](#10-container-deployment-ephemeral-integrity)
-- [11. Chaos Testing & Failure Mode Design](#11-chaos-testing-failure-mode-design)
-- [12. Observability & Telemetry](#12-observability-telemetry)
-- [5.4 Revised Write Path: End-to-End Flow](#54-revised-write-path-end-to-end-flow)
-- [13. Memory Layout & Zero-Copy Primitives](#13-memory-layout-zero-copy-primitives)
-- [13.10 Bit-Packing: node_actor_seq Implementation](#1310-bit-packing-node_actor_seq-implementation)
-- [13.11 io_uring Probe & Fallback Strategy](#1311-io_uring-probe-fallback-strategy)
-- [13.12 SIMD-Accelerated Checksumming](#1312-simd-accelerated-checksumming)
-- [14. Thread Pinning & NUMA Awareness](#14-thread-pinning-numa-awareness)
-- [15. Buffer Ownership & Lifecycle (The Loaner Pattern)](#15-buffer-ownership-lifecycle-the-loaner-pattern)
-- [16. The LANCE Wire Protocol (LWP)](#16-the-lance-wire-protocol-lwp)
-- [17. Consumer Read Path (Zero-Copy Out)](#17-consumer-read-path-zero-copy-out)
-
-- [1. System Overview](#1-system-overview)
-- [2. Storage Layer Architecture](#2-storage-layer-architecture)
-- [3. Memory & I/O Management](#3-memory-io-management)
-- [4. Replication & State Machine](#4-replication-state-machine)
-- [5. Concurrency Model](#5-concurrency-model)
-- [6. Backpressure & Flow Control](#6-backpressure-flow-control)
-- [7. Crash Recovery & Durability](#7-crash-recovery-durability)
-- [8. io_uring Feature Baseline](#8-io_uring-feature-baseline)
-- [9. Graceful Shutdown & Signal Handling](#9-graceful-shutdown-signal-handling)
-- [10. Container Deployment & Ephemeral Integrity](#10-container-deployment-ephemeral-integrity)
-- [11. Chaos Testing & Failure Mode Design](#11-chaos-testing-failure-mode-design)
-- [12. Observability & Telemetry](#12-observability-telemetry)
-- [5.4 Revised Write Path: End-to-End Flow](#54-revised-write-path-end-to-end-flow)
-- [13. Memory Layout & Zero-Copy Primitives](#13-memory-layout-zero-copy-primitives)
-- [13.10 Bit-Packing: node_actor_seq Implementation](#1310-bit-packing-node_actor_seq-implementation)
-- [13.11 io_uring Probe & Fallback Strategy](#1311-io_uring-probe-fallback-strategy)
-- [13.12 SIMD-Accelerated Checksumming](#1312-simd-accelerated-checksumming)
-- [14. Thread Pinning & NUMA Awareness](#14-thread-pinning-numa-awareness)
-- [15. Buffer Ownership & Lifecycle (The Loaner Pattern)](#15-buffer-ownership-lifecycle-the-loaner-pattern)
-- [16. The LANCE Wire Protocol (LWP)](#16-the-lance-wire-protocol-lwp)
-
-- [1. System Overview](#1-system-overview)
-- [2. Storage Layer Architecture](#2-storage-layer-architecture)
-- [3. Memory & I/O Management](#3-memory-io-management)
-- [4. Replication & State Machine](#4-replication-state-machine)
-- [5. Concurrency Model](#5-concurrency-model)
-- [6. Backpressure & Flow Control](#6-backpressure-flow-control)
-- [7. Crash Recovery & Durability](#7-crash-recovery-durability)
-- [8. io_uring Feature Baseline](#8-io_uring-feature-baseline)
-- [9. Graceful Shutdown & Signal Handling](#9-graceful-shutdown-signal-handling)
-- [10. Container Deployment & Ephemeral Integrity](#10-container-deployment-ephemeral-integrity)
-- [11. Chaos Testing & Failure Mode Design](#11-chaos-testing-failure-mode-design)
-- [12. Observability & Telemetry](#12-observability-telemetry)
-- [5.4 Revised Write Path: End-to-End Flow](#54-revised-write-path-end-to-end-flow)
-- [13. Memory Layout & Zero-Copy Primitives](#13-memory-layout-zero-copy-primitives)
-- [13.10 Bit-Packing: node_actor_seq Implementation](#1310-bit-packing-node_actor_seq-implementation)
-- [13.11 io_uring Probe & Fallback Strategy](#1311-io_uring-probe-fallback-strategy)
-- [13.12 SIMD-Accelerated Checksumming](#1312-simd-accelerated-checksumming)
-- [14. Thread Pinning & NUMA Awareness](#14-thread-pinning-numa-awareness)
-- [15. Buffer Ownership & Lifecycle (The Loaner Pattern)](#15-buffer-ownership-lifecycle-the-loaner-pattern)
-
-- [1. System Overview](#1-system-overview)
-- [2. Storage Layer Architecture](#2-storage-layer-architecture)
-- [3. Memory & I/O Management](#3-memory-io-management)
-- [4. Replication & State Machine](#4-replication-state-machine)
-- [5. Concurrency Model](#5-concurrency-model)
-- [6. Backpressure & Flow Control](#6-backpressure-flow-control)
-- [7. Crash Recovery & Durability](#7-crash-recovery-durability)
-- [8. io_uring Feature Baseline](#8-io_uring-feature-baseline)
-- [9. Graceful Shutdown & Signal Handling](#9-graceful-shutdown-signal-handling)
-- [10. Container Deployment & Ephemeral Integrity](#10-container-deployment-ephemeral-integrity)
-- [11. Chaos Testing & Failure Mode Design](#11-chaos-testing-failure-mode-design)
-- [12. Observability & Telemetry](#12-observability-telemetry)
-- [5.4 Revised Write Path: End-to-End Flow](#54-revised-write-path-end-to-end-flow)
-- [13. Memory Layout & Zero-Copy Primitives](#13-memory-layout-zero-copy-primitives)
-- [13.10 Bit-Packing: node_actor_seq Implementation](#1310-bit-packing-node_actor_seq-implementation)
-- [13.11 io_uring Probe & Fallback Strategy](#1311-io_uring-probe-fallback-strategy)
-- [13.12 SIMD-Accelerated Checksumming](#1312-simd-accelerated-checksumming)
-- [14. Thread Pinning & NUMA Awareness](#14-thread-pinning-numa-awareness)
-
-- [1. System Overview](#1-system-overview)
-- [2. Storage Layer Architecture](#2-storage-layer-architecture)
-- [3. Memory & I/O Management](#3-memory-io-management)
-- [4. Replication & State Machine](#4-replication-state-machine)
-- [5. Concurrency Model](#5-concurrency-model)
-- [6. Backpressure & Flow Control](#6-backpressure-flow-control)
-- [7. Crash Recovery & Durability](#7-crash-recovery-durability)
-- [8. io_uring Feature Baseline](#8-io_uring-feature-baseline)
-- [9. Graceful Shutdown & Signal Handling](#9-graceful-shutdown-signal-handling)
-- [10. Container Deployment & Ephemeral Integrity](#10-container-deployment-ephemeral-integrity)
-- [11. Chaos Testing & Failure Mode Design](#11-chaos-testing-failure-mode-design)
-- [12. Observability & Telemetry](#12-observability-telemetry)
-- [5.4 Revised Write Path: End-to-End Flow](#54-revised-write-path-end-to-end-flow)
-- [13. Memory Layout & Zero-Copy Primitives](#13-memory-layout-zero-copy-primitives)
-- [13.10 Bit-Packing: node_actor_seq Implementation](#1310-bit-packing-node_actor_seq-implementation)
-- [13.11 io_uring Probe & Fallback Strategy](#1311-io_uring-probe-fallback-strategy)
-- [13.12 SIMD-Accelerated Checksumming](#1312-simd-accelerated-checksumming)
-
-- [1. System Overview](#1-system-overview)
-- [2. Storage Layer Architecture](#2-storage-layer-architecture)
-- [3. Memory & I/O Management](#3-memory-io-management)
-- [4. Replication & State Machine](#4-replication-state-machine)
-- [5. Concurrency Model](#5-concurrency-model)
-- [6. Backpressure & Flow Control](#6-backpressure-flow-control)
-- [7. Crash Recovery & Durability](#7-crash-recovery-durability)
-- [8. io_uring Feature Baseline](#8-io_uring-feature-baseline)
-- [9. Graceful Shutdown & Signal Handling](#9-graceful-shutdown-signal-handling)
-- [10. Container Deployment & Ephemeral Integrity](#10-container-deployment-ephemeral-integrity)
-- [11. Chaos Testing & Failure Mode Design](#11-chaos-testing-failure-mode-design)
-- [12. Observability & Telemetry](#12-observability-telemetry)
-- [5.4 Revised Write Path: End-to-End Flow](#54-revised-write-path-end-to-end-flow)
-- [13. Memory Layout & Zero-Copy Primitives](#13-memory-layout-zero-copy-primitives)
-- [13.10 Bit-Packing: node_actor_seq Implementation](#1310-bit-packing-node_actor_seq-implementation)
-- [13.11 io_uring Probe & Fallback Strategy](#1311-io_uring-probe-fallback-strategy)
-
-- [1. System Overview](#1-system-overview)
-- [2. Storage Layer Architecture](#2-storage-layer-architecture)
-- [3. Memory & I/O Management](#3-memory-io-management)
-- [4. Replication & State Machine](#4-replication-state-machine)
-- [5. Concurrency Model](#5-concurrency-model)
-- [6. Backpressure & Flow Control](#6-backpressure-flow-control)
-- [7. Crash Recovery & Durability](#7-crash-recovery-durability)
-- [8. io_uring Feature Baseline](#8-io_uring-feature-baseline)
-- [9. Graceful Shutdown & Signal Handling](#9-graceful-shutdown-signal-handling)
-- [10. Container Deployment & Ephemeral Integrity](#10-container-deployment-ephemeral-integrity)
-- [11. Chaos Testing & Failure Mode Design](#11-chaos-testing-failure-mode-design)
-- [12. Observability & Telemetry](#12-observability-telemetry)
-- [5.4 Revised Write Path: End-to-End Flow](#54-revised-write-path-end-to-end-flow)
-- [13. Memory Layout & Zero-Copy Primitives](#13-memory-layout-zero-copy-primitives)
-- [13.10 Bit-Packing: node_actor_seq Implementation](#1310-bit-packing-node_actor_seq-implementation)
-
-- [1. System Overview](#1-system-overview)
-- [2. Storage Layer Architecture](#2-storage-layer-architecture)
-- [3. Memory & I/O Management](#3-memory-io-management)
-- [4. Replication & State Machine](#4-replication-state-machine)
-- [5. Concurrency Model](#5-concurrency-model)
-- [6. Backpressure & Flow Control](#6-backpressure-flow-control)
-- [7. Crash Recovery & Durability](#7-crash-recovery-durability)
-- [8. io_uring Feature Baseline](#8-io_uring-feature-baseline)
-- [9. Graceful Shutdown & Signal Handling](#9-graceful-shutdown-signal-handling)
-- [10. Container Deployment & Ephemeral Integrity](#10-container-deployment-ephemeral-integrity)
-- [11. Chaos Testing & Failure Mode Design](#11-chaos-testing-failure-mode-design)
-- [12. Observability & Telemetry](#12-observability-telemetry)
-- [5.4 Revised Write Path: End-to-End Flow](#54-revised-write-path-end-to-end-flow)
-- [13. Memory Layout & Zero-Copy Primitives](#13-memory-layout-zero-copy-primitives)
-
-- [1. System Overview](#1-system-overview)
-- [2. Storage Layer Architecture](#2-storage-layer-architecture)
-- [3. Memory & I/O Management](#3-memory-io-management)
-- [4. Replication & State Machine](#4-replication-state-machine)
-- [5. Concurrency Model](#5-concurrency-model)
-- [6. Backpressure & Flow Control](#6-backpressure-flow-control)
-- [7. Crash Recovery & Durability](#7-crash-recovery-durability)
-- [8. io_uring Feature Baseline](#8-io_uring-feature-baseline)
-- [9. Graceful Shutdown & Signal Handling](#9-graceful-shutdown-signal-handling)
-- [10. Container Deployment & Ephemeral Integrity](#10-container-deployment-ephemeral-integrity)
-- [11. Chaos Testing & Failure Mode Design](#11-chaos-testing-failure-mode-design)
-- [12. Observability & Telemetry](#12-observability-telemetry)
-- [5.4 Revised Write Path: End-to-End Flow](#54-revised-write-path-end-to-end-flow)
-
-- [1. System Overview](#1-system-overview)
-- [2. Storage Layer Architecture](#2-storage-layer-architecture)
-- [3. Memory & I/O Management](#3-memory-io-management)
-- [4. Replication & State Machine](#4-replication-state-machine)
-- [5. Concurrency Model](#5-concurrency-model)
-- [6. Backpressure & Flow Control](#6-backpressure-flow-control)
-- [7. Crash Recovery & Durability](#7-crash-recovery-durability)
-- [8. io_uring Feature Baseline](#8-io_uring-feature-baseline)
-- [9. Graceful Shutdown & Signal Handling](#9-graceful-shutdown-signal-handling)
-- [10. Kubernetes Deployment & Ephemeral Integrity](#10-kubernetes-deployment-ephemeral-integrity)
-- [11. Chaos Testing & Failure Mode Design](#11-chaos-testing-failure-mode-design)
-- [12. Observability & Telemetry](#12-observability-telemetry)
-
-- [1. System Overview](#1-system-overview)
-- [2. Storage Layer Architecture](#2-storage-layer-architecture)
-- [3. Memory & I/O Management](#3-memory-io-management)
-- [4. Replication & State Machine](#4-replication-state-machine)
-- [5. Concurrency Model](#5-concurrency-model)
-- [6. Backpressure & Flow Control](#6-backpressure-flow-control)
-- [7. Crash Recovery & Durability](#7-crash-recovery-durability)
-- [8. io_uring Feature Baseline](#8-io_uring-feature-baseline)
-- [9. Graceful Shutdown & Signal Handling](#9-graceful-shutdown-signal-handling)
-- [10. Kubernetes Deployment & Ephemeral Integrity](#10-kubernetes-deployment-ephemeral-integrity)
-- [11. Chaos Testing & Failure Mode Design](#11-chaos-testing-failure-mode-design)
-
-- [1. System Overview](#1-system-overview)
-- [2. Storage Layer Architecture](#2-storage-layer-architecture)
-- [3. Memory & I/O Management](#3-memory-io-management)
-- [4. Replication & State Machine](#4-replication-state-machine)
-- [5. Concurrency Model](#5-concurrency-model)
-- [6. Backpressure & Flow Control](#6-backpressure-flow-control)
-- [7. Crash Recovery & Durability](#7-crash-recovery-durability)
-- [8. io_uring Feature Baseline](#8-io_uring-feature-baseline)
-- [9. Graceful Shutdown & Signal Handling](#9-graceful-shutdown-signal-handling)
-- [10. Kubernetes Deployment & Ephemeral Integrity](#10-kubernetes-deployment-ephemeral-integrity)
-
-- [1. System Overview](#1-system-overview)
-- [2. Storage Layer Architecture](#2-storage-layer-architecture)
-- [3. Memory & I/O Management](#3-memory-io-management)
-- [4. Replication & State Machine](#4-replication-state-machine)
-- [5. Concurrency Model](#5-concurrency-model)
-- [6. Backpressure & Flow Control](#6-backpressure-flow-control)
-- [7. Crash Recovery & Durability](#7-crash-recovery-durability)
-- [8. io_uring Feature Baseline](#8-io_uring-feature-baseline)
-- [9. Graceful Shutdown & Signal Handling](#9-graceful-shutdown-signal-handling)
-
-- [1. System Overview](#1-system-overview)
-- [2. Storage Layer Architecture](#2-storage-layer-architecture)
-- [3. Memory & I/O Management](#3-memory-io-management)
-- [4. Replication & State Machine](#4-replication-state-machine)
-- [5. Concurrency Model](#5-concurrency-model)
-- [6. Backpressure & Flow Control](#6-backpressure-flow-control)
-- [7. Crash Recovery & Durability](#7-crash-recovery-durability)
-- [8. io_uring Feature Baseline](#8-io_uring-feature-baseline)
+---
 
 This design paper outlines the architecture for LANCE (Log-based Asynchronous Networked Compute Engine), a high-performance, non-blocking stream engine designed to replace Kafka-heavy workloads with zero-copy efficiency and deterministic memory management.
 
@@ -266,8 +50,10 @@ Segments are named to provide O(1) metadata discovery from the filesystem layer:
 To optimize space and ensure structural integrity, LANCE replaces raw JSON with a binary TLV format.
 
 - **[Type: 1-byte]**: Identifies the record schema.
-- **[Length: 4-bytes]**: Total payload size.
+- **[Length: 4-bytes little-endian]**: Total payload size.
 - **[Value: N-bytes]**: The encoded record data.
+
+**Implementation**: See `lnc-core/src/tlv.rs` for core TLV encoding/decoding and `lnc-client/src/record.rs` for client-side record parsing.
 
 ### 2.3 Dual Indexing Strategy
 
@@ -279,6 +65,8 @@ Since TLV records are variable-width, LANCE implements a Sparse Index sidecar fi
 ### 2.4 Sparse Index Configuration
 
 The sparse index balances read amplification against index file size.
+
+**Implementation**: See `lnc-index/src/sparse.rs` for `SparseIndex` and `SparseIndexWriter` with `memmap2` zero-copy access.
 
 #### Index Granularity
 
@@ -307,6 +95,8 @@ Both indexes are memory-mapped at segment open time for O(1) lookup.
 #### ⚠️ Cache Coherency: Active vs Closed Segments
 
 **Critical constraint**: `mmap` and `io_uring` with `O_DIRECT` do **not** share cache coherency. The kernel page cache (used by mmap) and direct I/O paths are independent.
+
+**Implementation**: See `lnc-io/src/segment.rs` for `SegmentWriter`, `SegmentReader`, `ZeroCopyReader` (mmap-based), and segment naming conventions (`rename_to_closed_segment`, `parse_segment_name`).
 
 | Segment State | Read Method | Write Method | Why |
 |---------------|-------------|--------------|-----|
@@ -442,10 +232,13 @@ To bypass the overhead of standard syscalls and Go-style context switching:
 
 ### 4.1 Hybrid Consistency Model
 
-LANCE supports two distinct replication modes to balance throughput vs. durability:
+LANCE supports three distinct replication modes to balance throughput vs. durability:
 
-- **Log-Based (L1)**: Single-writer, multi-reader. Optimized for high-speed consumers.
-- **High-Durability (L2)**: Send + ACK. Requires M/2+1 nodes to confirm the write before the index is incremented.
+- **Log-Based (L1)**: Single-writer, multi-reader. Optimized for high-speed consumers. No quorum required.
+- **Async Replication (L2)**: Asynchronous replication to followers. Fire-and-forget durability without blocking writes.
+- **Sync Quorum (L3)**: Send + ACK. Requires M/2+1 nodes to confirm the write before the index is incremented. Highest durability guarantee.
+
+**Implementation**: See `lnc-replication/src/mode.rs` for the `ReplicationMode` enum and `lnc-replication/src/quorum.rs` for quorum management.
 
 #### ⚠️ The "Slow Follower" Poison (L2 Tail Latency Trap)
 
@@ -858,7 +651,8 @@ LANCE's replication modes have specific cluster size requirements.
 | Replication Mode | Minimum Nodes | Quorum Formula | Notes |
 |------------------|---------------|----------------|-------|
 | **L1 (Log-Based)** | 1 | N/A (no quorum) | Single-writer; replicas are read-only followers |
-| **L2 (High-Durability)** | 3 | `floor(M/2) + 1` | Tolerates 1 node failure |
+| **L2 (Async Replication)** | 2 | N/A (no quorum) | Asynchronous follower replication |
+| **L3 (Sync Quorum)** | 3 | `floor(M/2) + 1` | Tolerates 1 node failure; highest durability |
 
 #### Two-Node Deployments
 
@@ -883,8 +677,9 @@ This provides durability across 2 nodes without consensus overhead, but does not
 |----------|-------|------|-----------------|
 | Dev/Test | 1 | L1 | None |
 | Production (speed) | 3 | L1 | 2 nodes (reads), 0 nodes (writes) |
-| Production (durability) | 3 | L2 | 1 node |
-| Mission-critical | 5 | L2 | 2 nodes |
+| Production (async durability) | 3 | L2 | Best-effort replication |
+| Production (sync durability) | 3 | L3 | 1 node |
+| Mission-critical | 5 | L3 | 2 nodes |
 
 ## 5. Concurrency Model
 
@@ -981,6 +776,8 @@ Each arrow represents a **handoff**, not shared memory. In multi-core mode, the 
 
 LANCE implements a **multi-stage backpressure** system to prevent unbounded memory growth and provide graceful degradation under load.
 
+**Implementation**: See `lnc-core/src/backpressure.rs` for `BackpressureMonitor`, `BackpressureConfig`, `BackpressureLevel`, and `BackpressureGuard`.
+
 ### 6.1 Pressure Signals
 
 | Signal | Threshold | Action |
@@ -1041,12 +838,15 @@ match producer.try_push(batch) {
 
 LANCE provides **segment-level durability** with explicit trade-offs for the active segment.
 
+**Implementation**: See `lnc-recovery/src/segment_recovery.rs` for segment scanning and truncation, and `lnc-recovery/src/wal_replay.rs` for WAL replay.
+
 ### 7.1 Durability Guarantees
 
 | Segment State | Durability | Recovery Behavior |
 |---------------|------------|-------------------|
 | **Closed Segment** | Fully durable | Immutable; verified via trailing checksum |
-| **Active Segment (L2)** | Durable after ACK | Recoverable up to last ACKed write |
+| **Active Segment (L3)** | Durable after quorum ACK | Recoverable up to last ACKed write |
+| **Active Segment (L2)** | Best-effort async | Data replicated asynchronously |
 | **Active Segment (L1)** | Best-effort | Data between last `fsync` and crash is lost |
 
 ### 7.2 Active Segment Recovery
@@ -1124,6 +924,8 @@ This avoids the overhead of `unlink()` + `create()` + `set_len()` on every segme
 
 LANCE targets a specific io_uring feature set to balance performance with deployment compatibility.
 
+**Implementation**: See `lnc-io/src/uring.rs` for `IoUringBackend`, `IoUringPoller`, `RegisteredBufferPool`, and zero-copy operations (`ZeroCopySender`, `SpliceForwarder`, `TeeForwarder`).
+
 ### 8.1 Required Kernel Features
 
 | Feature | Minimum Kernel | Usage in LANCE |
@@ -1197,32 +999,13 @@ Upon receiving `SIGTERM`/`SIGINT`, LANCE executes a deterministic shutdown:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 9.3 Rust Implementation
+### 9.3 Implementation
 
-```rust
-use tokio::signal::unix::{signal, SignalKind};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
-static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-pub async fn install_signal_handlers(shutdown_tx: tokio::sync::broadcast::Sender<()>) {
-    let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-    let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-    
-    tokio::select! {
-        _ = sigterm.recv() => {
-            tracing::info!("SIGTERM received, initiating graceful shutdown");
-        }
-        _ = sigint.recv() => {
-            tracing::info!("SIGINT received, initiating graceful shutdown");
-        }
-    }
-    
-    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
-    let _ = shutdown_tx.send(()); // Notify all actors
-}
-```
+**Implementation**: See `lance/src/shutdown.rs` for the complete graceful shutdown implementation including:
+- `ShutdownSignal` for cross-platform signal handling (Unix SIGTERM/SIGINT, Windows Ctrl+C)
+- `DrainCoordinator` for orchestrating the drain sequence
+- `DRAIN_TIMEOUT` constant (25 seconds) for Kubernetes compatibility
+- In-flight operation tracking via `InFlightOps`
 
 ### 9.4 Drain Timeout & Force Exit
 
@@ -1233,27 +1016,7 @@ If the drain sequence exceeds the configured timeout (default: 25s, leaving 5s b
 3. Mark active segment as "dirty" (triggers recovery scan on restart)
 4. Exit with code 1 (signals unclean shutdown to orchestrator)
 
-```rust
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(25);
-
-async fn drain_with_timeout(actors: &ActorSystem) -> Result<()> {
-    match tokio::time::timeout(DRAIN_TIMEOUT, actors.drain()).await {
-        Ok(Ok(())) => {
-            tracing::info!("Clean shutdown complete");
-            Ok(())
-        }
-        Ok(Err(e)) => {
-            tracing::error!("Drain failed: {}", e);
-            Err(e)
-        }
-        Err(_) => {
-            tracing::warn!("Drain timeout exceeded, forcing exit");
-            actors.force_abort();
-            Err(LanceError::DrainTimeout)
-        }
-    }
-}
-```
+**Implementation**: The `DrainCoordinator::drain_with_timeout()` method in `lance/src/shutdown.rs` implements this behavior with the `DRAIN_TIMEOUT` constant.
 
 ### 9.5 Replication Impact
 
@@ -1262,7 +1025,8 @@ When a node leaves the cluster:
 | Replication Mode | Behavior |
 |------------------|----------|
 | **L1 (Log-Based)** | Followers detect leader absence via heartbeat timeout; promote next node |
-| **L2 (High-Durability)** | Quorum recalculates; if below M/2+1, writes block until node returns or is replaced |
+| **L2 (Async Replication)** | Followers continue; no immediate impact on writes |
+| **L3 (Sync Quorum)** | Quorum recalculates; if below M/2+1, writes block until node returns or is replaced |
 
 The "leaving" broadcast (Step 5) allows peers to immediately update their view rather than waiting for heartbeat timeout (faster failover).
 ## 10. Container Deployment & Ephemeral Integrity
@@ -1287,9 +1051,21 @@ COPY --from=builder /build/target/release/lance /usr/local/bin/lance
 RUN useradd -r -u 1000 lance
 USER lance
 
-EXPOSE 8080 9090
+EXPOSE 1992 1993 9090 8080
 ENTRYPOINT ["/usr/local/bin/lance"]
 ```
+
+#### Network Ports
+
+| Port | Protocol | Purpose | Default |
+|------|----------|---------|---------|
+| **1992** | TCP | LWP client connections (producers/consumers) | `listen_addr` |
+| **1993** | TCP | Replication (inter-node Raft/log sync) | `replication_addr` |
+| **9090** | HTTP | Prometheus metrics scrape endpoint | `metrics_addr` |
+| **8080** | HTTP | Health checks (`/health/live`, `/health/ready`) | `health_addr` |
+| **4317** | gRPC | OTLP telemetry export (outbound to collector) | `otel_endpoint` |
+
+**Note**: Port 4317 is an *outbound* connection to your OTEL collector, not a listening port on LANCE.
 
 #### Running with Docker
 
@@ -1300,8 +1076,9 @@ docker run -d \
   -e LANCE_NODE_ID=0 \
   -e LANCE_DATA_DIR=/data \
   -v lance-data:/data \
-  -p 8080:8080 \
+  -p 1992:1992 \
   -p 9090:9090 \
+  -p 8080:8080 \
   ghcr.io/lance/lance:latest
 
 # Multi-node cluster (Docker Compose)
@@ -1318,13 +1095,14 @@ services:
     hostname: lance-0
     environment:
       LANCE_NODE_ID: 0
-      LANCE_PEERS: "lance-1:8080,lance-2:8080"
+      LANCE_PEERS: "lance-1:1992,lance-2:1992"
       LANCE_DATA_DIR: /data
     volumes:
       - lance-0-data:/data
     ports:
-      - "8080:8080"
-      - "9090:9090"
+      - "1992:1992"   # LWP client port
+      - "9090:9090"   # Prometheus metrics
+      - "8080:8080"   # Health checks
     stop_grace_period: 30s  # Match DRAIN_TIMEOUT
     
   lance-1:
@@ -1332,7 +1110,7 @@ services:
     hostname: lance-1
     environment:
       LANCE_NODE_ID: 1
-      LANCE_PEERS: "lance-0:8080,lance-2:8080"
+      LANCE_PEERS: "lance-0:1992,lance-2:1992"
       LANCE_DATA_DIR: /data
     volumes:
       - lance-1-data:/data
@@ -1343,7 +1121,7 @@ services:
     hostname: lance-2
     environment:
       LANCE_NODE_ID: 2
-      LANCE_PEERS: "lance-0:8080,lance-1:8080"
+      LANCE_PEERS: "lance-0:1992,lance-1:1992"
       LANCE_DATA_DIR: /data
     volumes:
       - lance-2-data:/data
@@ -1781,6 +1559,8 @@ To prevent cascading failures:
 
 LANCE exports metrics, traces, and logs in OpenTelemetry (OTEL) format for seamless integration with modern observability stacks. **All telemetry collection is non-blocking** to ensure zero impact on the hot path.
 
+**Implementation**: See `lnc-metrics/src/lib.rs` for the Prometheus exporter and all metric definitions (ingestion, I/O, replication, backpressure, recovery).
+
 ### 12.1 Telemetry Architecture
 
 ```
@@ -1926,9 +1706,15 @@ pub fn init_tracing(endpoint: &str) -> Result<()> {
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
+| `lance_replication_lag_bytes` | Gauge | `node_id` | Bytes behind leader |
 | `lance_replication_lag_records` | Gauge | `node_id`, `peer` | Records behind leader |
-| `lance_replication_rtt_ms` | Histogram | `node_id`, `peer` | Round-trip time to peer |
+| `lance_replication_last_sync_ms` | Gauge | `node_id` | Time since last successful sync |
+| `lance_replication_pending_ops` | Gauge | `node_id` | Pending replication operations |
+| `lance_replication_latency_seconds` | Histogram | `node_id`, `peer` | Replication operation latency |
 | `lance_quorum_size` | Gauge | `node_id` | Current quorum membership |
+| `lance_cluster_healthy_nodes` | Gauge | `node_id` | Number of healthy cluster nodes |
+| `lance_cluster_is_leader` | Gauge | `node_id` | 1 if this node is leader, 0 otherwise |
+| `lance_cluster_quorum_available` | Gauge | `node_id` | 1 if quorum is available, 0 otherwise |
 
 #### Backpressure Metrics
 
@@ -2838,6 +2624,8 @@ At 100Gbps ingestion:
 
 At 100Gbps, if your NIC is on NUMA Node 0 and your io_uring poller is on NUMA Node 1, QPI/UPI cross-socket traffic introduces **30-50% latency penalties**. This section mandates NUMA-local execution.
 
+**Implementation**: See `lnc-core/src/numa.rs` for `NumaTopology`, `NumaAllocator`, and thread pinning utilities.
+
 ### 14.1 The NUMA Problem
 
 ```
@@ -3245,6 +3033,8 @@ systemctl disable irqbalance
 
 To prevent engineers from using `Mutex` or `Clone` on the hot path, we mandate a strict **Ownership Relay** pattern for buffer management.
 
+**Implementation**: See `lnc-core/src/buffer.rs` for `AlignedBuffer` and `NumaAlignedBuffer` with 4KB alignment for O_DIRECT, `mlock()` support, and NUMA-local allocation.
+
 ### 15.1 The Problem: Lock Contention
 
 **What engineers might do**:
@@ -3553,6 +3343,8 @@ batch.assert_exclusive_ownership();
 ## 16. The LANCE Wire Protocol (LWP)
 
 To prevent "stitching" fragments in memory (a common Go bottleneck), the LWP is designed for **Fixed-Length Framing** with zero-allocation parsing.
+
+**Implementation**: See `lnc-network/src/protocol.rs` for `LwpHeader`, `LwpFlags`, `ControlCommand`, and `IngestHeader`. Frame handling is in `lnc-network/src/frame.rs`.
 
 ### 16.1 Frame Layout
 
@@ -4456,6 +4248,512 @@ fn ingestion_latency_regression() {
 **This checklist is not optional.** Any engineer who bypasses these rules introduces latency that compounds at 100Gbps. A 1μs lock acquisition per batch at 10M batches/second is 10 seconds of cumulative blocking per second—the system collapses.
 
 The rules exist because they have been violated before. Learn from those mistakes.
+
+---
+
+## 19. Client-Side Offset Management
+
+LANCE fundamentally differs from Kafka in its approach to offset management. Rather than server-side offset tracking with consumer groups managed by the broker, LANCE employs **client-side offset management** where consumers are fully responsible for tracking their position in the stream.
+
+**Implementation**: See `lnc-client/src/offset.rs` for `OffsetStore` trait, `MemoryOffsetStore`, `LockFileOffsetStore`, and `HookedOffsetStore` with `PostCommitHook` support.
+
+### 19.1 Design Philosophy
+
+| Aspect | Kafka | LANCE |
+|--------|-------|-------|
+| Offset Storage | Server-side (broker) | Client-side (local/external) |
+| Consumer Groups | Broker-managed | Client-coordinated or external |
+| Rebalancing | Automatic (broker-driven) | Explicit (client-driven) |
+| Server Resources | O(consumers × partitions) | O(1) per connection |
+| Complexity Location | Server | Client library |
+
+**Rationale**: By moving offset management to the client, LANCE servers remain stateless with respect to consumer progress. This enables:
+- Horizontal scaling without consumer group coordination overhead
+- Deterministic replay from any offset without server round-trips
+- Zero server-side state per consumer (reduced memory, simplified failover)
+- Client-controlled checkpointing strategies
+
+### 19.2 Offset Storage Strategies
+
+The client library supports pluggable offset storage via the `OffsetStore` trait:
+
+```rust
+pub trait OffsetStore: Send + Sync {
+    fn load(&self, topic_id: u32, consumer_id: u64) -> Result<Option<u64>>;
+    fn save(&self, topic_id: u32, consumer_id: u64, offset: u64) -> Result<()>;
+}
+```
+
+#### 19.2.1 Lock File Store (Default)
+
+File-based offset persistence with advisory locking:
+
+```
+/var/lance/offsets/
+└── my-consumer/
+    ├── topic_1_consumer_12345.offset
+    └── topic_2_consumer_12345.offset
+```
+
+**Characteristics**:
+- Single-consumer guarantee via `flock()`
+- Atomic updates via write-rename
+- In-memory cache with periodic flush
+- Suitable for single-node deployments
+
+#### 19.2.2 External Store (Production)
+
+For distributed deployments, offsets should be stored in:
+- **Redis**: Low-latency, suitable for high-frequency commits
+- **PostgreSQL/MySQL**: Transactional guarantees, audit trail
+- **etcd/Consul**: Consistent with service discovery
+
+### 19.3 Seek and Fetch Model
+
+Unlike Kafka's `poll()` model where the broker tracks position, LANCE uses explicit seek/fetch:
+
+```rust
+// Explicit positioning
+consumer.seek(SeekPosition::Beginning).await?;
+consumer.seek(SeekPosition::Offset(saved_offset)).await?;
+consumer.seek(SeekPosition::End).await?;
+
+// Fetch returns data + new offset
+let result = consumer.poll().await?;
+// result.current_offset is the offset AFTER this fetch
+
+// Client decides when to commit
+offset_store.save(topic_id, consumer_id, result.current_offset)?;
+```
+
+### 19.4 Replay and Rewind
+
+Full replay capability without server coordination:
+
+```rust
+// Replay entire stream
+consumer.rewind().await?;
+while let Some(batch) = consumer.poll().await? {
+    reprocess(batch);
+}
+
+// Seek to specific point
+consumer.seek_to_offset(checkpoint_offset).await?;
+```
+
+### 19.5 At-Least-Once vs Exactly-Once
+
+| Guarantee | Implementation |
+|-----------|----------------|
+| At-least-once | Commit offset AFTER processing |
+| At-most-once | Commit offset BEFORE processing |
+| Exactly-once | External transaction (process + commit atomically) |
+
+```rust
+// At-least-once pattern
+loop {
+    let batch = consumer.poll().await?;
+    process(&batch)?;  // May fail
+    consumer.commit().await?;  // Only if process succeeded
+}
+```
+
+---
+
+## 20. Consumer Client Modes
+
+LANCE provides two consumer client modes designed to balance simplicity, scalability, and resource efficiency.
+
+**Implementation**: See `lnc-client/src/consumer.rs` for `Consumer`, `StreamingConsumer`, `ConsumerConfig`, `SeekPosition`, and `PollResult`.
+
+### 20.1 Mode Comparison
+
+| Feature | Standalone Mode | Grouped Mode |
+|---------|-----------------|--------------|
+| Server Connections | 1 per consumer | 1 per group (shared) |
+| Offset Management | Per-consumer | Per-group, partitioned |
+| Coordination | None | External coordinator |
+| Scalability | Linear (N connections) | Sublinear (1 connection) |
+| Use Case | Simple consumers, replay | High-fan-out, microservices |
+
+### 20.2 Standalone Consumer
+
+Each consumer operates independently with its own connection and offset tracking.
+
+```
+┌─────────────────┐     ┌─────────────────┐
+│   Consumer A    │     │   Consumer B    │
+│  (connection 1) │     │  (connection 2) │
+│  offset: 1000   │     │  offset: 500    │
+└────────┬────────┘     └────────┬────────┘
+         │                       │
+         ▼                       ▼
+┌─────────────────────────────────────────┐
+│              LANCE Server               │
+│         (no consumer state)             │
+└─────────────────────────────────────────┘
+```
+
+**Use Cases**:
+- Independent workers processing same stream
+- Replay/reprocessing jobs
+- Development and testing
+- Simple single-consumer applications
+
+```rust
+use lnc_client::{StandaloneConsumer, ConsumerConfig, SeekPosition};
+
+let config = ConsumerConfig::new(topic_id)
+    .with_start_position(SeekPosition::Beginning)
+    .with_poll_timeout(Duration::from_millis(100));
+
+let mut consumer = StandaloneConsumer::new(client, config).await?;
+
+while let Some(result) = consumer.poll().await? {
+    process(&result.data);
+    consumer.commit().await?;
+}
+```
+
+### 20.3 Grouped Consumer
+
+Multiple workers share a single connection through a coordinator, dramatically reducing server-side connection overhead.
+
+```
+┌─────────────────────────────────────────┐
+│           Group Coordinator             │
+│  (partition assignment, heartbeats)     │
+└────────────────┬────────────────────────┘
+                 │ single connection
+                 ▼
+┌─────────────────────────────────────────┐
+│              LANCE Server               │
+└─────────────────────────────────────────┘
+                 ▲
+                 │ assignments
+    ┌────────────┼────────────┐
+    │            │            │
+┌───┴───┐   ┌────┴───┐   ┌────┴───┐
+│Worker1│   │Worker2 │   │Worker3 │
+│ t:1,3 │   │ t:2,4  │   │ t:5,6  │
+└───────┘   └────────┘   └────────┘
+```
+
+**Benefits**:
+- **Connection Efficiency**: 100 workers = 1 connection (vs 100 in Kafka)
+- **Reduced Server Load**: No per-consumer state on server
+- **Coordinated Rebalancing**: Workers get assigned topic partitions
+- **Shared Offset Commits**: Single commit stream per group
+
+```rust
+use lnc_client::{GroupCoordinator, GroupConfig, GroupedConsumer, WorkerConfig};
+
+// Start coordinator (one per group)
+let coordinator = GroupCoordinator::new(GroupConfig {
+    group_id: "my-group".into(),
+    topics: vec![topic_id],
+    assignment_strategy: AssignmentStrategy::RoundRobin,
+    ..Default::default()
+}).await?;
+
+// Workers join the group
+let worker = GroupedConsumer::join(
+    coordinator.join_address(),
+    client,
+    WorkerConfig::default(),
+).await?;
+
+// Process assigned partitions
+for topic_id in worker.assignments() {
+    while let Some(result) = worker.poll(topic_id).await? {
+        process(&result.data);
+        worker.commit(topic_id, result.current_offset).await?;
+    }
+}
+```
+
+### 20.4 Assignment Strategies
+
+| Strategy | Description |
+|----------|-------------|
+| RoundRobin | Distribute topics evenly across workers |
+| Sticky | Minimize reassignment during rebalance |
+| Range | Assign contiguous topic ranges |
+| Custom | User-defined assignment function |
+
+### 20.5 Coordinator Protocol
+
+The coordinator handles:
+1. **Worker Registration**: Workers announce availability
+2. **Heartbeats**: Detect worker failures (configurable timeout)
+3. **Assignment**: Distribute topics based on strategy
+4. **Rebalancing**: Reassign on worker join/leave
+5. **Offset Aggregation**: Collect and batch commit offsets
+
+```
+Worker                     Coordinator
+   │                            │
+   │──── JoinGroup ───────────>│
+   │<─── Assignment ───────────│
+   │                            │
+   │──── Heartbeat ───────────>│
+   │<─── HeartbeatAck ─────────│
+   │                            │
+   │──── CommitOffset ────────>│
+   │<─── CommitAck ────────────│
+   │                            │
+   │──── LeaveGroup ──────────>│
+   │                            │
+```
+
+### 20.6 Scaling Considerations
+
+| Consumers | Standalone Connections | Grouped Connections |
+|-----------|------------------------|---------------------|
+| 10 | 10 | 1 |
+| 100 | 100 | 1 |
+| 1,000 | 1,000 | 1-10 (sharded groups) |
+| 10,000 | 10,000 | 10-100 (sharded groups) |
+
+**Recommendation**: Use Grouped mode when:
+- Consumer count > 10 per topic
+- Connection overhead is a concern
+- Coordinated processing is required
+
+### 20.7 Failure Handling
+
+| Failure | Standalone Behavior | Grouped Behavior |
+|---------|---------------------|------------------|
+| Worker crash | Other workers unaffected | Coordinator reassigns topics |
+| Coordinator crash | N/A | Workers reconnect, state in offset store |
+| Network partition | Reconnect with backoff | Heartbeat timeout, rejoin |
+
+## 21. Write Forwarding (Cluster Mode)
+
+In clustered deployments, LANCE implements transparent write forwarding to support load-balancer-friendly operations where clients cannot directly connect to the leader.
+
+**Implementation**: See `lnc-replication/src/forward.rs` for `LeaderConnectionPool`, `ForwardConfig`, `TeeForwardingStatus`, and `LocalWriteProcessor`. Zero-copy primitives are in `lnc-io/src/uring.rs` (`SpliceForwarder`, `TeeForwarder`).
+
+### 21.1 Problem Statement
+
+The traditional NOT_LEADER redirect approach is incompatible with production deployments because:
+
+1. **Load Balancer Incompatibility**: Clients connect through L4/L7 load balancers that distribute connections based on least-sessions or round-robin. Clients cannot "choose" to connect to the leader.
+2. **Sticky Sessions**: Once a client establishes a connection to a node, that session is sticky. The client cannot easily migrate to another node.
+3. **Network Topology**: In many deployments, clients may not have direct network access to all cluster nodes—only the load balancer VIP is exposed.
+
+### 21.2 Architecture
+
+**Core Principle**: Clients connect to ANY node. Reads are served locally. Writes are transparently forwarded to the leader.
+
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────────┐
+│   Client    │────▶│ Load Balancer│────▶│  Any Node       │
+│  (Producer/ │◀────│   (L4/L7)    │◀────│  (Follower/     │
+│   Consumer) │     └──────────────┘     │   Leader)       │
+└─────────────┘                          └────────┬────────┘
+                                                  │
+                                    ┌─────────────┴─────────────┐
+                                    ▼                           ▼
+                            [If Read]                    [If Write]
+                            Serve locally                Forward to Leader
+                            from replica                 via internal mesh
+                                                               │
+                                                               ▼
+                                                    ┌─────────────────┐
+                                                    │     Leader      │
+                                                    │  (Raft commit)  │
+                                                    └─────────────────┘
+```
+
+### 21.3 Request Classification
+
+| Operation | Type | Handling |
+|-----------|------|----------|
+| `Ingest` | **Write** | Forward to leader |
+| `CreateTopic` | **Write** | Forward to leader |
+| `DeleteTopic` | **Write** | Forward to leader |
+| `SetRetention` | **Write** | Forward to leader |
+| `Fetch` | Read | Serve locally |
+| `ListTopics` | Read | Serve locally |
+| `GetTopic` | Read | Serve locally |
+| `Subscribe` | Session | Handle locally |
+| `Unsubscribe` | Session | Handle locally |
+| `Keepalive` | Control | Handle locally |
+
+### 21.4 Leader Connection Pool
+
+Followers maintain a connection pool to the current leader for efficient write forwarding:
+
+```rust
+pub struct LeaderConnectionPool {
+    /// Current leader address (client port)
+    leader_addr: RwLock<Option<SocketAddr>>,
+    /// Pool of available connections
+    connections: Mutex<Vec<TcpStream>>,
+    /// Configuration
+    config: ForwardConfig,
+}
+
+pub struct ForwardConfig {
+    pub pool_size: usize,           // Default: 8
+    pub connect_timeout: Duration,   // Default: 5s
+    pub forward_timeout: Duration,   // Default: 30s
+}
+```
+
+**Key behaviors**:
+- **On leader change**: Pool is drained (old connections are to the old leader)
+- **Connection reuse**: Connections are returned to pool after successful forward
+- **On-demand creation**: New connections created if pool is empty
+
+### 21.5 Forwarding Flow
+
+```
+Client Request                    Follower                         Leader
+     │                               │                               │
+     │──── Ingest(batch_id=N) ──────▶│                               │
+     │                               │                               │
+     │                               │── forward_write(raw_bytes) ──▶│
+     │                               │                               │
+     │                               │◀──── ACK(batch_id=N) ─────────│
+     │                               │                               │
+     │◀──── ACK(batch_id=N) ─────────│                               │
+     │                               │                               │
+```
+
+The follower forwards the **raw request bytes** to the leader (no re-encoding), and the leader's response is forwarded back to the client. The `batch_id` is preserved end-to-end.
+
+### 21.6 Failure Handling
+
+| Scenario | Detection | Behavior |
+|----------|-----------|----------|
+| Leader unreachable | Connection timeout/error | Return error to client, client retries |
+| Leader changes mid-forward | Connection reset | Return error, client retries (hits new leader) |
+| Follower crashes | Client TCP lost | Client reconnects via LB to another node |
+| Network partition | Raft election timeout | New leader elected, forwarding resumes |
+
+### 21.7 Backpressure Propagation
+
+Write forwarding naturally propagates backpressure through TCP flow control:
+
+```
+┌──────────┐    ┌──────────┐    ┌──────────┐
+│  Client  │    │ Follower │    │  Leader  │
+│          │    │          │    │          │
+│ [buffer] │◀──▶│ [forward]│◀──▶│ [buffer] │
+└──────────┘    └──────────┘    └──────────┘
+     ▲               │               │
+     │               │               ▼
+     │          If leader buffer     Leader under
+     │          full, write blocks   pressure
+     │               │
+     └───────────────┘
+   TCP window shrinks,
+   client throttled
+```
+
+No explicit backpressure signaling is required—TCP handles it automatically.
+
+### 21.8 Zero-Copy Splice Forwarding (Linux)
+
+On Linux with kernel 5.6+, LANCE uses `IORING_OP_SPLICE` for zero-copy write forwarding, eliminating userspace memory copies for 100Gbps line rates.
+
+```rust
+// lnc-io exports splice primitives
+pub use uring::{
+    probe_splice, SpliceForwarder, SplicePipe, SpliceSupport,
+};
+
+/// Zero-copy splice forwarder using io_uring
+pub struct SpliceForwarder {
+    ring: IoUring,
+    pending_ops: u32,
+    splice_supported: bool,
+}
+
+/// Data flow: client_socket → pipe → leader_socket
+/// No userspace memory copies involved
+impl SpliceForwarder {
+    pub fn submit_forward_splice(
+        &mut self,
+        source_fd: RawFd,
+        dest_fd: RawFd,
+        pipe: &SplicePipe,
+        len: u32,
+        user_data: u64,
+    ) -> Result<()>;
+}
+```
+
+**Characteristics**:
+- **Zero userspace copies**: Data moves kernel-to-kernel via pipe buffer
+- **Linked operations**: Source→pipe and pipe→dest are atomically linked
+- **Feature detection**: `probe_splice()` checks kernel support at startup
+- **Graceful fallback**: Falls back to direct buffer copy on unsupported kernels
+
+### 21.9 Zero-Copy Tee for L2 Quorum (Phase 3 - Implemented)
+
+For L2 sync quorum scenarios where writes need both forwarding AND local processing, LANCE uses `IORING_OP_TEE` for in-kernel data duplication:
+
+```
+Data flow with TEE:
+  client_socket → pipe1 → leader_socket (forwarding)
+                       ↘ pipe2 → local_processor (teeing)
+```
+
+**Use cases**:
+- **L2 sync quorum**: Forward to leader while locally acknowledging for quorum
+- **Audit logging**: Copy writes to audit trail without performance impact
+- **Real-time analytics**: Stream writes to analytics pipeline
+
+```rust
+// lnc-io exports TEE primitives
+pub use uring::{probe_tee, TeeForwarder, TeeSupport};
+
+// lnc-replication exports L2 quorum configuration
+pub use forward::{
+    check_tee_support, ForwardConfig, TeeForwardingStatus,
+    LocalWriteProcessor, AuditConfig, AuditLogWriter,
+};
+
+/// Tee forwarder for L2 quorum zero-copy forwarding
+pub struct TeeForwarder {
+    ring: IoUring,
+    tee_supported: bool,
+    splice_supported: bool,
+}
+
+impl TeeForwarder {
+    /// Submit a tee operation to duplicate data in-kernel
+    pub fn submit_forward_with_tee(
+        &mut self,
+        source_fd: RawFd,
+        leader_fd: RawFd,
+        local_fd: RawFd,
+        pipe1: &SplicePipe,
+        pipe2: &SplicePipe,
+        len: u32,
+        user_data: u64,
+    ) -> Result<()>;
+}
+```
+
+**Implementation status**: ✅ Implemented
+- `TeeForwarder` and `probe_tee()` in `lnc-io/src/uring.rs`
+- `TeeForwardingStatus` and `check_tee_support()` in `lnc-replication/src/forward.rs`
+- `LocalWriteProcessor` trait for processing TEE'd data locally
+- `AuditLogWriter` for audit logging pipeline in `lnc-replication/src/audit.rs`
+- Configuration via `ForwardConfig::with_tee_forwarding()` and `with_local_ack()`
+
+### 21.10 Industry Alignment
+
+This architecture aligns with established patterns:
+
+- **Kafka KIP-392**: Allows consumers to fetch from closest replica
+- **Amazon Aurora**: Separate writer and reader endpoints with internal forwarding
+- **CockroachDB**: Follower reads with write forwarding to leaseholder
+
 ---
 
 [↑ Back to Top](#technical-design-project-lance) | [← Back to Docs Index](./README.md)

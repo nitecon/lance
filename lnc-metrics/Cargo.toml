@@ -1,0 +1,17 @@
+[package]
+name = "lnc-metrics"
+description = "Non-blocking telemetry and metrics for LANCE"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }

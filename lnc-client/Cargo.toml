@@ -1,0 +1,32 @@
+[package]
+name = "lnc-client"
+description = "LANCE client library - LWP protocol implementation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lnc-core = { workspace = true }
+lnc-network = { path = "../lnc-network", features = ["tls"] }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = "0.26"
+tracing = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+[features]
+default = []
+dangerous-testing = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tracing-subscriber = { workspace = true }
+tempfile = "3.14"

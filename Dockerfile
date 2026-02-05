@@ -1,15 +1,30 @@
 # LANCE Dockerfile
-# Multi-stage build for minimal production image
-
-# Build arguments
-ARG VERSION=dev
+# Production-ready multi-stage build
+#
+# Build args:
+#   VERSION     - Version tag (default: from Cargo.toml)
+#   BUILD_MODE  - "release" (default) or "debug" for dev builds
+#   FEATURES    - Additional cargo features to enable
+#
+# Examples:
+#   docker build -t lance .                                    # Production build
+#   docker build -t lance:dev --build-arg BUILD_MODE=debug .   # Dev build
+#   docker build -t lance --build-arg FEATURES=tls .           # With TLS
 
 # =============================================================================
-# Stage 1: Build
+# Build Arguments
 # =============================================================================
-FROM rust:1.75-bookworm AS builder
+ARG VERSION=latest
+ARG BUILD_MODE=release
+ARG FEATURES=""
 
-ARG VERSION
+# =============================================================================
+# Stage 1: Builder
+# =============================================================================
+FROM rust:1.85-bookworm AS builder
+
+ARG BUILD_MODE
+ARG FEATURES
 
 WORKDIR /build
 
@@ -19,51 +34,55 @@ RUN apt-get update && apt-get install -y \
     libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests first for dependency caching
-COPY Cargo.toml Cargo.lock* ./
+# Copy entire project
+COPY . .
 
-# Create dummy src for dependency compilation
-RUN mkdir src && echo "fn main() {}" > src/main.rs
+# Build based on mode
+RUN if [ "$BUILD_MODE" = "debug" ]; then \
+        if [ -n "$FEATURES" ]; then \
+            cargo build --package lance --features "$FEATURES"; \
+        else \
+            cargo build --package lance; \
+        fi \
+    else \
+        if [ -n "$FEATURES" ]; then \
+            cargo build --release --package lance --features "$FEATURES"; \
+        else \
+            cargo build --release --package lance; \
+        fi \
+    fi
 
-# Build dependencies only (cached layer)
-RUN cargo build --release && rm -rf src target/release/deps/lance*
-
-# Copy actual source code
-COPY src/ src/
-
-# Build the actual binary
-RUN cargo build --release --locked
-
-# Strip the binary for smaller size
-RUN strip target/release/lance
+# Strip binary in release mode for smaller size
+RUN if [ "$BUILD_MODE" = "release" ]; then \
+        strip target/release/lance; \
+    fi
 
 # =============================================================================
-# Stage 2: Runtime
+# Stage 2: Runtime (Production)
 # =============================================================================
 FROM debian:bookworm-slim AS runtime
 
 ARG VERSION
+ARG BUILD_MODE=release
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
+    netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
 RUN useradd --create-home --shell /bin/bash lance
 
-# Create data directory
-RUN mkdir -p /var/lib/lance && chown lance:lance /var/lib/lance
+# Create directories
+RUN mkdir -p /var/lib/lance /etc/lance && chown -R lance:lance /var/lib/lance /etc/lance
 
-# Copy binary from builder
-COPY --from=builder /build/target/release/lance /usr/local/bin/lance
-
-# Copy default config if exists
-# COPY --from=builder /build/lance.toml /etc/lance/lance.toml
+# Copy binary from builder (handles both release and debug builds)
+COPY --from=builder /build/target/${BUILD_MODE}/lance /usr/local/bin/lance
 
 # Set ownership
-RUN chown lance:lance /usr/local/bin/lance
+RUN chown lance:lance /usr/local/bin/lance && chmod +x /usr/local/bin/lance
 
 # Switch to non-root user
 USER lance
@@ -71,16 +90,19 @@ USER lance
 # Set working directory
 WORKDIR /var/lib/lance
 
-# Expose default port
-EXPOSE 9000
+# Expose ports:
+#   1992 - LWP client connections (producers/consumers)
+#   1993 - Replication port (inter-node Raft/log sync, internal cluster traffic)
+#   9090 - Prometheus metrics scrape endpoint
+#   8080 - Health checks (/health/live, /health/ready for k8s probes)
+EXPOSE 1992 1993 9090 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["/usr/local/bin/lance", "--health-check"] || exit 1
+# Health check using netcat (more reliable than binary flag)
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=5 \
+    CMD nc -z localhost 1992 || exit 1
 
-# Default command
+# Default entrypoint - args passed via docker-compose or command line
 ENTRYPOINT ["/usr/local/bin/lance"]
-CMD ["--config", "/etc/lance/lance.toml"]
 
 # =============================================================================
 # Labels
@@ -92,5 +114,5 @@ LABEL org.opencontainers.image.vendor="Nitecon"
 LABEL org.opencontainers.image.source="https://github.com/Nitecon/lance"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
-# Environment variable for version (accessible at runtime)
+# Environment
 ENV LANCE_VERSION=${VERSION}

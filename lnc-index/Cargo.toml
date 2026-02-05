@@ -1,0 +1,17 @@
+[package]
+name = "lnc-index"
+description = "Sparse index and time-range queries for LANCE"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lnc-core = { workspace = true }
+zerocopy = { workspace = true }
+memmap2 = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

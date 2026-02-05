@@ -1,6 +1,63 @@
-[package]
-name = "lance"
+[workspace]
+resolver = "2"
+members = [
+    "lance",
+    "lnc",
+    "lnc-client",
+    "lnc-core",
+    "lnc-index",
+    "lnc-io",
+    "lnc-metrics",
+    "lnc-network",
+    "lnc-recovery",
+    "lnc-replication",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+authors = ["LANCE Team"]
+license = "Apache-2.0"
+rust-version = "1.85"
 
-[dependencies]
+[workspace.dependencies]
+lnc-core = { path = "lnc-core" }
+lnc-io = { path = "lnc-io" }
+lnc-network = { path = "lnc-network" }
+lnc-index = { path = "lnc-index" }
+lnc-metrics = { path = "lnc-metrics" }
+lnc-replication = { path = "lnc-replication" }
+lnc-recovery = { path = "lnc-recovery" }
+lnc-client = { path = "lnc-client" }
+
+bytes = "1.5"
+zerocopy = { version = "0.8", features = ["derive"] }
+thiserror = "2.0"
+crossbeam = "0.8"
+crc32fast = "1.3"
+libc = "0.2"
+tokio = { version = "1.35", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+flume = "0.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+hyper = { version = "1.1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+memmap2 = "0.9"
+flatbuffers = "24.3"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = "0.27"
+tonic = "0.12"
+tempfile = "3.10"
+io-uring = "0.7"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"

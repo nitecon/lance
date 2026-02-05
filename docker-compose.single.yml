@@ -1,0 +1,36 @@
+# LANCE Single-Node for Integration Testing (No Replication)
+# 
+# Usage:
+#   docker-compose -f docker-compose.single.yml up -d    # Start single node
+#   docker-compose -f docker-compose.single.yml down     # Stop node
+#   docker-compose -f docker-compose.single.yml logs -f  # View logs
+
+services:
+  lance:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lance-single
+    hostname: lance-single
+    command:
+      - "--node-id=0"
+      - "--listen=0.0.0.0:1992"
+      - "--metrics=0.0.0.0:9090"
+      - "--health=0.0.0.0:8080"
+      - "--data-dir=/var/lib/lance"
+      - "--replication-mode=l1"
+    ports:
+      - "1992:1992"   # Client port
+      - "9090:9090"   # Metrics
+      - "8080:8080"   # Health
+    volumes:
+      - lance-single-data:/var/lib/lance
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "1992"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  lance-single-data:

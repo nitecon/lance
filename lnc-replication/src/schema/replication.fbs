@@ -1,0 +1,174 @@
+// LANCE Replication Protocol - FlatBuffers Schema
+// 
+// This schema defines the wire format for Raft replication messages.
+// FlatBuffers provides zero-copy deserialization and schema evolution
+// for rolling upgrades.
+
+namespace lance.replication;
+
+// Entry type for log entries
+enum EntryType: byte {
+    Data = 0,
+    ConfigChange = 1,
+    Snapshot = 2,
+    Noop = 3,
+}
+
+// Raft log entry
+table LogEntry {
+    // Raft term when entry was created
+    term: uint64;
+    // Log index
+    index: uint64;
+    // HLC timestamp for causal ordering
+    hlc: uint64;
+    // Entry type
+    entry_type: EntryType;
+    // Opaque payload data
+    data: [ubyte];
+}
+
+// AppendEntries RPC request (leader → follower)
+table AppendEntriesRequest {
+    // Leader's current term
+    term: uint64;
+    // Leader's node ID
+    leader_id: uint16;
+    // Index of log entry immediately preceding new ones
+    prev_log_index: uint64;
+    // Term of prev_log_index entry
+    prev_log_term: uint64;
+    // Leader's commit index
+    leader_commit: uint64;
+    // Leader's HLC timestamp for clock synchronization
+    leader_hlc: uint64;
+    // Log entries to replicate (empty for heartbeat)
+    entries: [LogEntry];
+}
+
+// AppendEntries RPC response (follower → leader)
+table AppendEntriesResponse {
+    // Current term for leader to update itself
+    term: uint64;
+    // True if follower contained entry matching prev_log_index/term
+    success: bool;
+    // Follower's match index (optimization for fast catch-up)
+    match_index: uint64;
+    // Follower's HLC timestamp
+    follower_hlc: uint64;
+    // Follower's node ID
+    follower_id: uint16;
+}
+
+// Pre-Vote request (candidate → all nodes)
+// Used to check if election would succeed without incrementing term
+table PreVoteRequest {
+    // Candidate's current term (NOT incremented)
+    term: uint64;
+    // Candidate's node ID
+    candidate_id: uint16;
+    // Index of candidate's last log entry
+    last_log_index: uint64;
+    // Term of candidate's last log entry
+    last_log_term: uint64;
+}
+
+// Pre-Vote response
+table PreVoteResponse {
+    // Responder's current term
+    term: uint64;
+    // True if responder would grant vote
+    vote_granted: bool;
+}
+
+// RequestVote RPC request (candidate → all nodes)
+table VoteRequest {
+    // Candidate's term
+    term: uint64;
+    // Candidate requesting vote
+    candidate_id: uint16;
+    // Index of candidate's last log entry
+    last_log_index: uint64;
+    // Term of candidate's last log entry
+    last_log_term: uint64;
+}
+
+// RequestVote RPC response
+table VoteResponse {
+    // Current term for candidate to update itself
+    term: uint64;
+    // True if candidate received vote
+    vote_granted: bool;
+}
+
+// Node role in cluster
+enum NodeRole: byte {
+    Full = 0,      // Full participant: stores data, votes, can be leader
+    Witness = 1,   // Witness: votes only, no data, cannot be leader
+}
+
+// Cluster configuration entry
+table ConfigNode {
+    node_id: uint16;
+    role: NodeRole;
+    address: string;
+}
+
+// Cluster configuration for Joint Consensus
+table ClusterConfig {
+    // True if in joint consensus (transitioning between configs)
+    is_joint: bool;
+    // Current/old configuration nodes
+    old_nodes: [ConfigNode];
+    // New configuration nodes (only present during joint consensus)
+    new_nodes: [ConfigNode];
+}
+
+// InstallSnapshot RPC request (leader → follower)
+table InstallSnapshotRequest {
+    // Leader's term
+    term: uint64;
+    // Leader's node ID
+    leader_id: uint16;
+    // Snapshot replaces all entries up through this index
+    last_included_index: uint64;
+    // Term of last_included_index
+    last_included_term: uint64;
+    // HLC at snapshot time
+    snapshot_hlc: uint64;
+    // Byte offset in snapshot file
+    offset: uint64;
+    // Snapshot chunk data
+    data: [ubyte];
+    // True if this is the last chunk
+    done: bool;
+    // Cluster configuration at snapshot time
+    config: ClusterConfig;
+}
+
+// InstallSnapshot RPC response
+table InstallSnapshotResponse {
+    // Current term for leader to update itself
+    term: uint64;
+    // Bytes successfully stored
+    bytes_stored: uint64;
+}
+
+// Wrapper for all replication messages
+union ReplicationMessage {
+    AppendEntriesRequest,
+    AppendEntriesResponse,
+    PreVoteRequest,
+    PreVoteResponse,
+    VoteRequest,
+    VoteResponse,
+    InstallSnapshotRequest,
+    InstallSnapshotResponse,
+}
+
+// Root message envelope
+table ReplicationEnvelope {
+    message: ReplicationMessage;
+}
+
+root_type ReplicationEnvelope;

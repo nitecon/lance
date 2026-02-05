@@ -1,0 +1,23 @@
+[package]
+name = "lnc"
+description = "CLI tools for LANCE - triage, index repair, benchmarks"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lnc-core = { workspace = true }
+lnc-io = { workspace = true }
+lnc-index = { workspace = true }
+lnc-recovery = { workspace = true }
+lnc-client = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4.4", features = ["derive"] }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+bytes = { workspace = true }
+chrono = "0.4"

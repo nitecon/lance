@@ -23,20 +23,6 @@
 
 ---
 
-- [1. The Golden Rules](#1-the-golden-rules)
-- [2. Memory & Ownership](#2-memory--ownership)
-- [3. Concurrency & Threading](#3-concurrency--threading)
-- [4. I/O & Storage](#4-io--storage)
-- [5. Network & Protocol](#5-network--protocol)
-- [6. Safety & Error Handling](#6-safety--error-handling)
-- [7. Observability](#7-observability)
-- [8. Code Style & Idioms](#8-code-style--idioms)
-- [9. Crate Architecture](#9-crate-architecture)
-- [10. CI/CD & Review Gates](#10-cicd--review-gates)
-- [11. Performance Regression Testing](#11-performance-regression-testing)
-
----
-
 ## 1. The Golden Rules
 
 These rules are **non-negotiable**. Violations block merge.

@@ -1,0 +1,203 @@
+[2m2026-02-04T04:35:25.524810Z[0m [32m INFO[0m [2mlance[0m[2m:[0m Starting LANCE [3mnode_id[0m[2m=[0m0 [3mlisten[0m[2m=[0m127.0.0.1:1992 [3mmetrics[0m[2m=[0m127.0.0.1:9090 [3mhealth[0m[2m=[0m127.0.0.1:8080 [3mdata_dir[0m[2m=[0mC:\Users\nitec\Documents\Projects\lance\scripts\..\test-data\node0
+[2m2026-02-04T04:35:25.525260Z[0m [32m INFO[0m [2mlance[0m[2m:[0m LANCE v0.1.0
+[2m2026-02-04T04:35:25.525403Z[0m [33m WARN[0m [2mlance[0m[2m:[0m io_uring: not available (non-Linux platform)
+[2m2026-02-04T04:35:25.525521Z[0m [32m INFO[0m [2mlance[0m[2m:[0m CRC32C: SSE4.2 accelerated
+[2m2026-02-04T04:35:25.727849Z[0m [32m INFO[0m [2mlance[0m[2m:[0m Prometheus metrics exporter started [3maddr[0m[2m=[0m127.0.0.1:9090
+[2m2026-02-04T04:35:25.728279Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Server starting [3mnode_id[0m[2m=[0m0 [3mlisten[0m[2m=[0m127.0.0.1:1992 [3mmode[0m[2m=[0ml3
+[2m2026-02-04T04:35:25.728542Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Performing startup recovery checks
+[2m2026-02-04T04:35:25.728614Z[0m [32m INFO[0m [2mlance::health[0m[2m:[0m Health server listening [3maddr[0m[2m=[0m127.0.0.1:8080
+[2m2026-02-04T04:35:25.728855Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Startup recovery complete
+[2m2026-02-04T04:35:25.730728Z[0m [32m INFO[0m [2mlance::config[0m[2m:[0m Parsed cluster peers [3mnode_id[0m[2m=[0m0 [3mpeer_count[0m[2m=[0m2
+[2m2026-02-04T04:35:25.731107Z[0m [32m INFO[0m [2mlance::cluster[0m[2m:[0m Replication listener started [3maddr[0m[2m=[0m127.0.0.1:1993
+[2m2026-02-04T04:35:25.731231Z[0m [32m INFO[0m [2mlance::cluster[0m[2m:[0m Initializing cluster coordinator [3mnode_id[0m[2m=[0m0 [3mlisten_addr[0m[2m=[0m127.0.0.1:1993
+[2m2026-02-04T04:35:25.731262Z[0m [32m INFO[0m [2mlance::replication[0m[2m:[0m Replication actor started [3mmode[0m[2m=[0mL3 (Sync Quorum) [3mnode_id[0m[2m=[0m0 [3mfollowers[0m[2m=[0m3
+[2m2026-02-04T04:35:25.731306Z[0m [32m INFO[0m [2mlance::cluster[0m[2m:[0m Discovered peers [3mpeer_count[0m[2m=[0m2 [3mpeers[0m[2m=[0m[(1, 127.0.0.1:2003), (2, 127.0.0.1:2013)]
+[2m2026-02-04T04:35:25.731515Z[0m [32m INFO[0m [2mlance::replication[0m[2m:[0m Added peer with health tracking [3mpeer_id[0m[2m=[0m1 [3maddr[0m[2m=[0m127.0.0.1:2003
+[2m2026-02-04T04:35:25.731593Z[0m [32m INFO[0m [2mlance::replication[0m[2m:[0m Added peer with health tracking [3mpeer_id[0m[2m=[0m2 [3maddr[0m[2m=[0m127.0.0.1:2013
+[2m2026-02-04T04:35:25.741079Z[0m [32m INFO[0m [2mlance::cluster[0m[2m:[0m Accepted peer connection [3mpeer_addr[0m[2m=[0m127.0.0.1:62954
+[2m2026-02-04T04:35:25.743094Z[0m [32m INFO[0m [2mlance::cluster[0m[2m:[0m Accepted peer connection [3mpeer_addr[0m[2m=[0m127.0.0.1:62957
+[2m2026-02-04T04:35:26.242674Z[0m [32m INFO[0m [2mlance::replication[0m[2m:[0m Connected to peer [3mnode_id[0m[2m=[0m2 [3maddr[0m[2m=[0m127.0.0.1:2013
+[2m2026-02-04T04:35:26.243730Z[0m [32m INFO[0m [2mlance::replication[0m[2m:[0m Connected to peer [3mnode_id[0m[2m=[0m1 [3maddr[0m[2m=[0m127.0.0.1:2003
+[2m2026-02-04T04:35:26.243893Z[0m [32m INFO[0m [2mlance::cluster[0m[2m:[0m Initial peer connections established [3mconnected_peers[0m[2m=[0m2
+[2m2026-02-04T04:35:26.243987Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Cluster coordinator started [3mnode_id[0m[2m=[0m0 [3mreplication_addr[0m[2m=[0m127.0.0.1:1993 [3mpeers[0m[2m=[0m["0@127.0.0.1:1993", "1@127.0.0.1:2003", "2@127.0.0.1:2013"]
+[2m2026-02-04T04:35:26.244010Z[0m [32m INFO[0m [2mlance::cluster[0m[2m:[0m Starting cluster coordination loop [3mnode_id[0m[2m=[0m0
+[2m2026-02-04T04:35:26.244122Z[0m [32m INFO[0m [2mlance::ingestion[0m[2m:[0m Ingestion actor started
+[2m2026-02-04T04:35:26.244215Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Listening for connections [3maddr[0m[2m=[0m127.0.0.1:1992
+[2m2026-02-04T04:35:26.244344Z[0m [32m INFO[0m [2mlance::health[0m[2m:[0m Startup complete
+[2m2026-02-04T04:35:26.244436Z[0m [32m INFO[0m [2mlance::health[0m[2m:[0m Server ready
+[2m2026-02-04T04:35:26.244496Z[0m [32m INFO[0m [2mlance::retention[0m[2m:[0m Retention service started [3minterval_secs[0m[2m=[0m60 [3mdry_run[0m[2m=[0mfalse
+[2m2026-02-04T04:35:26.257921Z[0m [32m INFO[0m [2mlance::cluster[0m[2m:[0m Election timeout elapsed, starting election
+[2m2026-02-04T04:35:26.257919Z[0m [34mDEBUG[0m [2mlance::retention[0m[2m:[0m Retention cycle complete, no segments expired
+[2m2026-02-04T04:35:26.258306Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Sent pre-vote request [3mpeer_id[0m[2m=[0m2
+[2m2026-02-04T04:35:26.258639Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Sent pre-vote request [3mpeer_id[0m[2m=[0m1
+[2m2026-02-04T04:35:26.258708Z[0m [32m INFO[0m [2mlance::cluster[0m[2m:[0m Pre-vote succeeded, proceeding to election [3mgrants[0m[2m=[0m3 [3mmajority[0m[2m=[0m2
+[2m2026-02-04T04:35:26.258764Z[0m [32m INFO[0m [2mlance::raft[0m[2m:[0m Starting election [3mnode_id[0m[2m=[0m0 [3mterm[0m[2m=[0m1
+[2m2026-02-04T04:35:26.258936Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Sent vote request [3mpeer_id[0m[2m=[0m2
+[2m2026-02-04T04:35:26.259041Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Sent vote request [3mpeer_id[0m[2m=[0m1
+[2m2026-02-04T04:35:26.506747Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62960
+[2m2026-02-04T04:35:26.749585Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Leader changed, updating forward pool [3mold_leader[0m[2m=[0mNone [3mnew_leader[0m[2m=[0mSome(127.0.0.1:2002)
+[2m2026-02-04T04:35:32.322865Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62971
+[2m2026-02-04T04:35:32.323317Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62972
+[2m2026-02-04T04:35:32.323593Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62979
+[2m2026-02-04T04:35:32.323819Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62975
+[2m2026-02-04T04:35:32.324013Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62976
+[2m2026-02-04T04:35:32.324191Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62973
+[2m2026-02-04T04:35:32.324367Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62974
+[2m2026-02-04T04:35:32.324488Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62970
+[2m2026-02-04T04:35:32.324706Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62982
+[2m2026-02-04T04:35:32.324892Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62983
+[2m2026-02-04T04:35:32.325094Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62981
+[2m2026-02-04T04:35:32.325302Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62984
+[2m2026-02-04T04:35:32.325491Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62978
+[2m2026-02-04T04:35:32.325710Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62977
+[2m2026-02-04T04:35:32.325889Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 1, name: "pipelined_1770179732322986", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.325905Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62986
+[2m2026-02-04T04:35:32.326147Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 2, name: "resume_test_1770179732322968", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.326314Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62987
+[2m2026-02-04T04:35:32.326467Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m1 [3mtopic_name[0m[2m=[0mpipelined_1770179732322986
+[2m2026-02-04T04:35:32.326616Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62980
+[2m2026-02-04T04:35:32.326636Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 3, name: "cluster_visibility_1770179732323563", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.326972Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62991
+[2m2026-02-04T04:35:32.327151Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 4, name: "ingest_sync_1770179732322864", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.327330Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62989
+[2m2026-02-04T04:35:32.327486Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 5, name: "throughput_1770179732323083", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.327639Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62990
+[2m2026-02-04T04:35:32.327797Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 6, name: "lifecycle_test_1770179732322880", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.327925Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62985
+[2m2026-02-04T04:35:32.327981Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m1 [3mtopic_name[0m[2m=[0mpipelined_1770179732322986
+[2m2026-02-04T04:35:32.328354Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62988
+[2m2026-02-04T04:35:32.328514Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Leader change detected [3mold_leader[0m[2m=[0mNone [3mnew_leader[0m[2m=[0mSome(127.0.0.1:2002)
+[2m2026-02-04T04:35:32.328684Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 7, name: "get_by_id_test_1770179732323199", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.328712Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62993
+[2m2026-02-04T04:35:32.328818Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m2 [3mtopic_name[0m[2m=[0mresume_test_1770179732322968
+[2m2026-02-04T04:35:32.329044Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 8, name: "large_payload_1770179732322948", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.329156Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62997
+[2m2026-02-04T04:35:32.329632Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 9, name: "multi_subscriber_1770179732323432", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.329942Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 10, name: "delete_replication_1770179732323250", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.330106Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m2 [3mtopic_name[0m[2m=[0mresume_test_1770179732322968
+[2m2026-02-04T04:35:32.330204Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 11, name: "cluster_test_1770179732323454", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.330375Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m3 [3mtopic_name[0m[2m=[0mcluster_visibility_1770179732323563
+[2m2026-02-04T04:35:32.330647Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 12, name: "create_list_test_1770179732323120", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.330904Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 13, name: "concurrent_0_1770179732323227", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.331289Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m3 [3mtopic_name[0m[2m=[0mcluster_visibility_1770179732323563
+[2m2026-02-04T04:35:32.331361Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 14, name: "concurrent_node1_1770179732323542", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.331474Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m4 [3mtopic_name[0m[2m=[0mingest_sync_1770179732322864
+[2m2026-02-04T04:35:32.331666Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 15, name: "write_routing_1770179732323215", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.331875Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 16, name: "sequential_1770179732323042", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.332136Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 17, name: "delete_test_1770179732323244", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.332416Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m4 [3mtopic_name[0m[2m=[0mingest_sync_1770179732322864
+[2m2026-02-04T04:35:32.332567Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m5 [3mtopic_name[0m[2m=[0mthroughput_1770179732323083
+[2m2026-02-04T04:35:32.333040Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 18, name: "concurrent_1_1770179732331834", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.333460Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m5 [3mtopic_name[0m[2m=[0mthroughput_1770179732323083
+[2m2026-02-04T04:35:32.333639Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m6 [3mtopic_name[0m[2m=[0mlifecycle_test_1770179732322880
+[2m2026-02-04T04:35:32.333697Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 20, name: "follower_create_1770179732332050", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.333994Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 19, name: "concurrent_node2_1770179732323543", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.334512Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m6 [3mtopic_name[0m[2m=[0mlifecycle_test_1770179732322880
+[2m2026-02-04T04:35:32.334606Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:63013
+[2m2026-02-04T04:35:32.334699Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m7 [3mtopic_name[0m[2m=[0mget_by_id_test_1770179732323199
+[2m2026-02-04T04:35:32.334738Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mCreate { topic_id: 21, name: "concurrent_2_1770179732333442", created_at: 1770179732 }
+[2m2026-02-04T04:35:32.335567Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 20 }
+[2m2026-02-04T04:35:32.335803Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m7 [3mtopic_name[0m[2m=[0mget_by_id_test_1770179732323199
+[2m2026-02-04T04:35:32.335994Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m8 [3mtopic_name[0m[2m=[0mlarge_payload_1770179732322948
+[2m2026-02-04T04:35:32.336777Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 15 }
+[2m2026-02-04T04:35:32.336955Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m8 [3mtopic_name[0m[2m=[0mlarge_payload_1770179732322948
+[2m2026-02-04T04:35:32.337088Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m9 [3mtopic_name[0m[2m=[0mmulti_subscriber_1770179732323432
+[2m2026-02-04T04:35:32.337900Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m9 [3mtopic_name[0m[2m=[0mmulti_subscriber_1770179732323432
+[2m2026-02-04T04:35:32.338147Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m10 [3mtopic_name[0m[2m=[0mdelete_replication_1770179732323250
+[2m2026-02-04T04:35:32.338880Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m10 [3mtopic_name[0m[2m=[0mdelete_replication_1770179732323250
+[2m2026-02-04T04:35:32.339413Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m11 [3mtopic_name[0m[2m=[0mcluster_test_1770179732323454
+[2m2026-02-04T04:35:32.340492Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m11 [3mtopic_name[0m[2m=[0mcluster_test_1770179732323454
+[2m2026-02-04T04:35:32.341147Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m12 [3mtopic_name[0m[2m=[0mcreate_list_test_1770179732323120
+[2m2026-02-04T04:35:32.341876Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m12 [3mtopic_name[0m[2m=[0mcreate_list_test_1770179732323120
+[2m2026-02-04T04:35:32.342034Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m13 [3mtopic_name[0m[2m=[0mconcurrent_0_1770179732323227
+[2m2026-02-04T04:35:32.342737Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m13 [3mtopic_name[0m[2m=[0mconcurrent_0_1770179732323227
+[2m2026-02-04T04:35:32.342951Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m14 [3mtopic_name[0m[2m=[0mconcurrent_node1_1770179732323542
+[2m2026-02-04T04:35:32.343869Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m14 [3mtopic_name[0m[2m=[0mconcurrent_node1_1770179732323542
+[2m2026-02-04T04:35:32.344066Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m15 [3mtopic_name[0m[2m=[0mwrite_routing_1770179732323215
+[2m2026-02-04T04:35:32.344866Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m15 [3mtopic_name[0m[2m=[0mwrite_routing_1770179732323215
+[2m2026-02-04T04:35:32.345031Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m16 [3mtopic_name[0m[2m=[0msequential_1770179732323042
+[2m2026-02-04T04:35:32.345676Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m16 [3mtopic_name[0m[2m=[0msequential_1770179732323042
+[2m2026-02-04T04:35:32.345888Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m17 [3mtopic_name[0m[2m=[0mdelete_test_1770179732323244
+[2m2026-02-04T04:35:32.346489Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m17 [3mtopic_name[0m[2m=[0mdelete_test_1770179732323244
+[2m2026-02-04T04:35:32.346749Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m18 [3mtopic_name[0m[2m=[0mconcurrent_1_1770179732331834
+[2m2026-02-04T04:35:32.347667Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m18 [3mtopic_name[0m[2m=[0mconcurrent_1_1770179732331834
+[2m2026-02-04T04:35:32.347936Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m20 [3mtopic_name[0m[2m=[0mfollower_create_1770179732332050
+[2m2026-02-04T04:35:32.348738Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m20 [3mtopic_name[0m[2m=[0mfollower_create_1770179732332050
+[2m2026-02-04T04:35:32.348912Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m19 [3mtopic_name[0m[2m=[0mconcurrent_node2_1770179732323543
+[2m2026-02-04T04:35:32.349788Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m19 [3mtopic_name[0m[2m=[0mconcurrent_node2_1770179732323543
+[2m2026-02-04T04:35:32.349992Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic creation [3mtopic_id[0m[2m=[0m21 [3mtopic_name[0m[2m=[0mconcurrent_2_1770179732333442
+[2m2026-02-04T04:35:32.350699Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created replicated topic [3mtopic_id[0m[2m=[0m21 [3mtopic_name[0m[2m=[0mconcurrent_2_1770179732333442
+[2m2026-02-04T04:35:32.350889Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m20
+[2m2026-02-04T04:35:32.351760Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m20 [3mtopic_name[0m[2m=[0mfollower_create_1770179732332050
+[2m2026-02-04T04:35:32.351978Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m15
+[2m2026-02-04T04:35:32.352654Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m15 [3mtopic_name[0m[2m=[0mwrite_routing_1770179732323215
+[2m2026-02-04T04:35:32.353573Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 14 }
+[2m2026-02-04T04:35:32.353788Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m14
+[2m2026-02-04T04:35:32.354436Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m14 [3mtopic_name[0m[2m=[0mconcurrent_node1_1770179732323542
+[2m2026-02-04T04:35:32.355072Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 19 }
+[2m2026-02-04T04:35:32.355242Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m19
+[2m2026-02-04T04:35:32.355815Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m19 [3mtopic_name[0m[2m=[0mconcurrent_node2_1770179732323543
+[2m2026-02-04T04:35:32.404874Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 13 }
+[2m2026-02-04T04:35:32.405137Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m13
+[2m2026-02-04T04:35:32.406304Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 18 }
+[2m2026-02-04T04:35:32.406311Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m13 [3mtopic_name[0m[2m=[0mconcurrent_0_1770179732323227
+[2m2026-02-04T04:35:32.406580Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m18
+[2m2026-02-04T04:35:32.407289Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m18 [3mtopic_name[0m[2m=[0mconcurrent_1_1770179732331834
+[2m2026-02-04T04:35:32.407732Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 21 }
+[2m2026-02-04T04:35:32.407920Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m21
+[2m2026-02-04T04:35:32.408761Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m21 [3mtopic_name[0m[2m=[0mconcurrent_2_1770179732333442
+[2m2026-02-04T04:35:32.439292Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer subscribed [3mconsumer_id[0m[2m=[0m1001 [3mtopic_id[0m[2m=[0m9 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:32.439322Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer subscribed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m2 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:32.439573Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Subscribe request processed [3mconsumer_id[0m[2m=[0m1001 [3mtopic_id[0m[2m=[0m9 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:32.439755Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Subscribe request processed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m2 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:32.440016Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer subscribed [3mconsumer_id[0m[2m=[0m1002 [3mtopic_id[0m[2m=[0m9 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:32.440163Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Subscribe request processed [3mconsumer_id[0m[2m=[0m1002 [3mtopic_id[0m[2m=[0m9 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:32.440441Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer subscribed [3mconsumer_id[0m[2m=[0m1003 [3mtopic_id[0m[2m=[0m9 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:32.440609Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Subscribe request processed [3mconsumer_id[0m[2m=[0m1003 [3mtopic_id[0m[2m=[0m9 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:32.441334Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 17 }
+[2m2026-02-04T04:35:32.441405Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:63016
+[2m2026-02-04T04:35:32.441602Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 7 }
+[2m2026-02-04T04:35:32.442006Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 12 }
+[2m2026-02-04T04:35:32.442228Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m17
+[2m2026-02-04T04:35:32.443005Z[0m [34mDEBUG[0m [2mlance::subscription[0m[2m:[0m Offset committed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m2 [3moffset[0m[2m=[0m5
+[2m2026-02-04T04:35:32.443043Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m17 [3mtopic_name[0m[2m=[0mdelete_test_1770179732323244
+[2m2026-02-04T04:35:32.443180Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m CommitOffset request processed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m2 [3mcommitted_offset[0m[2m=[0m5
+[2m2026-02-04T04:35:32.443319Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m7
+[2m2026-02-04T04:35:32.443569Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer unsubscribed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m2
+[2m2026-02-04T04:35:32.443704Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Unsubscribe request processed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m2 [3mwas_subscribed[0m[2m=[0mtrue
+[2m2026-02-04T04:35:32.444028Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 6 }
+[2m2026-02-04T04:35:32.444277Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:63017
+[2m2026-02-04T04:35:32.444311Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m7 [3mtopic_name[0m[2m=[0mget_by_id_test_1770179732323199
+[2m2026-02-04T04:35:32.444558Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer subscribed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m2 [3mstart_offset[0m[2m=[0m5
+[2m2026-02-04T04:35:32.444594Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m12
+[2m2026-02-04T04:35:32.444725Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Subscribe request processed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m2 [3mstart_offset[0m[2m=[0m5
+[2m2026-02-04T04:35:32.445432Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m12 [3mtopic_name[0m[2m=[0mcreate_list_test_1770179732323120
+[2m2026-02-04T04:35:32.445566Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m6
+[2m2026-02-04T04:35:32.446093Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m6 [3mtopic_name[0m[2m=[0mlifecycle_test_1770179732322880
+[2m2026-02-04T04:35:32.446390Z[0m [34mDEBUG[0m [2mlance::subscription[0m[2m:[0m Offset committed [3mconsumer_id[0m[2m=[0m1001 [3mtopic_id[0m[2m=[0m9 [3moffset[0m[2m=[0m5
+[2m2026-02-04T04:35:32.446484Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m CommitOffset request processed [3mconsumer_id[0m[2m=[0m1001 [3mtopic_id[0m[2m=[0m9 [3mcommitted_offset[0m[2m=[0m5
+[2m2026-02-04T04:35:32.446686Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 2 }
+[2m2026-02-04T04:35:32.446863Z[0m [34mDEBUG[0m [2mlance::subscription[0m[2m:[0m Offset committed [3mconsumer_id[0m[2m=[0m1002 [3mtopic_id[0m[2m=[0m9 [3moffset[0m[2m=[0m10
+[2m2026-02-04T04:35:32.446899Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m2
+[2m2026-02-04T04:35:32.446963Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m CommitOffset request processed [3mconsumer_id[0m[2m=[0m1002 [3mtopic_id[0m[2m=[0m9 [3mcommitted_offset[0m[2m=[0m10
+[2m2026-02-04T04:35:32.447494Z[0m [34mDEBUG[0m [2mlance::subscription[0m[2m:[0m Offset committed [3mconsumer_id[0m[2m=[0m1003 [3mtopic_id[0m[2m=[0m9 [3moffset[0m[2m=[0m15
+[2m2026-02-04T04:35:32.447616Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m CommitOffset request processed [3mconsumer_id[0m[2m=[0m1003 [3mtopic_id[0m[2m=[0m9 [3mcommitted_offset[0m[2m=[0m15
+[2m2026-02-04T04:35:32.447641Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m2 [3mtopic_name[0m[2m=[0mresume_test_1770179732322968
+[2m2026-02-04T04:35:32.447862Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer unsubscribed [3mconsumer_id[0m[2m=[0m1001 [3mtopic_id[0m[2m=[0m9
+[2m2026-02-04T04:35:32.447965Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Unsubscribe request processed [3mconsumer_id[0m[2m=[0m1001 [3mtopic_id[0m[2m=[0m9 [3mwas_subscribed[0m[2m=[0mtrue
+[2m2026-02-04T04:35:32.448145Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer unsubscribed [3mconsumer_id[0m[2m=[0m1002 [3mtopic_id[0m[2m=[0m9
+[2m2026-02-04T04:35:32.448230Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Unsubscribe request processed [3mconsumer_id[0m[2m=[0m1002 [3mtopic_id[0m[2m=[0m9 [3mwas_subscribed[0m[2m=[0mtrue
+[2m2026-02-04T04:35:32.448403Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer unsubscribed [3mconsumer_id[0m[2m=[0m1003 [3mtopic_id[0m[2m=[0m9
+[2m2026-02-04T04:35:32.448471Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Unsubscribe request processed [3mconsumer_id[0m[2m=[0m1003 [3mtopic_id[0m[2m=[0m9 [3mwas_subscribed[0m[2m=[0mtrue
+[2m2026-02-04T04:35:32.449536Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 9 }
+[2m2026-02-04T04:35:32.449724Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m9
+[2m2026-02-04T04:35:32.450199Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m9 [3mtopic_name[0m[2m=[0mmulti_subscriber_1770179732323432
+[2m2026-02-04T04:35:32.839512Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 11 }
+[2m2026-02-04T04:35:32.839743Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m11
+[2m2026-02-04T04:35:32.840475Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m11 [3mtopic_name[0m[2m=[0mcluster_test_1770179732323454
+[2m2026-02-04T04:35:33.330680Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 3 }
+[2m2026-02-04T04:35:33.330932Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m3
+[2m2026-02-04T04:35:33.331691Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m3 [3mtopic_name[0m[2m=[0mcluster_visibility_1770179732323563
+[2m2026-02-04T04:35:33.345994Z[0m [34mDEBUG[0m [2mlance::cluster[0m[2m:[0m Received topic operation from leader [3mnode_id[0m[2m=[0m0 [3mop[0m[2m=[0mDelete { topic_id: 10 }
+[2m2026-02-04T04:35:33.346184Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Applying replicated topic deletion [3mtopic_id[0m[2m=[0m10
+[2m2026-02-04T04:35:33.346866Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m10 [3mtopic_name[0m[2m=[0mdelete_replication_1770179732323250

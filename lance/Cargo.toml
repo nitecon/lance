@@ -1,0 +1,55 @@
+[package]
+name = "lance"
+description = "LANCE - Log-based Asynchronous Networked Compute Engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "lance"
+path = "src/main.rs"
+
+[[bin]]
+name = "lnc"
+path = "src/cli.rs"
+
+[dependencies]
+lnc-core = { workspace = true }
+lnc-io = { workspace = true }
+lnc-network = { workspace = true }
+lnc-index = { workspace = true }
+lnc-metrics = { workspace = true }
+lnc-replication = { workspace = true }
+lnc-recovery = { workspace = true }
+lnc = { path = "../lnc" }
+
+bytes = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+flume = { workspace = true }
+crossbeam = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+clap = { version = "4.4", features = ["derive"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[features]
+default = []
+tls = ["lnc-network/tls"]
+
+[dev-dependencies]
+tempfile = "3.10"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "latency"
+harness = false

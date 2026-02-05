@@ -1,0 +1,19 @@
+[package]
+name = "lnc-core"
+description = "Core types and primitives for LANCE - TLV, SortKey, LoanableBatch, buffer pool"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+zerocopy = { workspace = true }
+thiserror = { workspace = true }
+crossbeam = { workspace = true }
+crc32fast = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"

@@ -1,0 +1,96 @@
+[2m2026-02-04T04:35:13.880612Z[0m [32m INFO[0m [2mlance[0m[2m:[0m Starting LANCE [3mnode_id[0m[2m=[0m0 [3mlisten[0m[2m=[0m127.0.0.1:1992 [3mmetrics[0m[2m=[0m127.0.0.1:9090 [3mhealth[0m[2m=[0m127.0.0.1:8080 [3mdata_dir[0m[2m=[0mC:\Users\nitec\Documents\Projects\lance\scripts\..\test-data\single
+[2m2026-02-04T04:35:13.881280Z[0m [32m INFO[0m [2mlance[0m[2m:[0m LANCE v0.1.0
+[2m2026-02-04T04:35:13.881379Z[0m [33m WARN[0m [2mlance[0m[2m:[0m io_uring: not available (non-Linux platform)
+[2m2026-02-04T04:35:13.881444Z[0m [32m INFO[0m [2mlance[0m[2m:[0m CRC32C: SSE4.2 accelerated
+[2m2026-02-04T04:35:14.083981Z[0m [32m INFO[0m [2mlance[0m[2m:[0m Prometheus metrics exporter started [3maddr[0m[2m=[0m127.0.0.1:9090
+[2m2026-02-04T04:35:14.084441Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Server starting [3mnode_id[0m[2m=[0m0 [3mlisten[0m[2m=[0m127.0.0.1:1992 [3mmode[0m[2m=[0ml1
+[2m2026-02-04T04:35:14.084637Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Performing startup recovery checks
+[2m2026-02-04T04:35:14.084642Z[0m [32m INFO[0m [2mlance::health[0m[2m:[0m Health server listening [3maddr[0m[2m=[0m127.0.0.1:8080
+[2m2026-02-04T04:35:14.084894Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Startup recovery complete
+[2m2026-02-04T04:35:14.086609Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Running in standalone mode (L1), cluster coordinator disabled
+[2m2026-02-04T04:35:14.086839Z[0m [32m INFO[0m [2mlance::ingestion[0m[2m:[0m Ingestion actor started
+[2m2026-02-04T04:35:14.086848Z[0m [32m INFO[0m [2mlance::replication[0m[2m:[0m Replication actor started [3mmode[0m[2m=[0mL1 (Log-Based) [3mnode_id[0m[2m=[0m0 [3mfollowers[0m[2m=[0m0
+[2m2026-02-04T04:35:14.086942Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Listening for connections [3maddr[0m[2m=[0m127.0.0.1:1992
+[2m2026-02-04T04:35:14.087080Z[0m [32m INFO[0m [2mlance::health[0m[2m:[0m Startup complete
+[2m2026-02-04T04:35:14.087144Z[0m [32m INFO[0m [2mlance::health[0m[2m:[0m Server ready
+[2m2026-02-04T04:35:14.087211Z[0m [32m INFO[0m [2mlance::retention[0m[2m:[0m Retention service started [3minterval_secs[0m[2m=[0m60 [3mdry_run[0m[2m=[0mfalse
+[2m2026-02-04T04:35:14.097211Z[0m [34mDEBUG[0m [2mlance::retention[0m[2m:[0m Retention cycle complete, no segments expired
+[2m2026-02-04T04:35:14.864615Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62913
+[2m2026-02-04T04:35:20.309069Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62931
+[2m2026-02-04T04:35:20.309646Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62927
+[2m2026-02-04T04:35:20.309911Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62932
+[2m2026-02-04T04:35:20.310150Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62928
+[2m2026-02-04T04:35:20.310437Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62938
+[2m2026-02-04T04:35:20.310620Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62936
+[2m2026-02-04T04:35:20.310828Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62933
+[2m2026-02-04T04:35:20.311046Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62926
+[2m2026-02-04T04:35:20.311046Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created topic [3mtopic_id[0m[2m=[0m2 [3mtopic_name[0m[2m=[0mingest_sync_1770179720309431 [3mhas_retention[0m[2m=[0mfalse
+[2m2026-02-04T04:35:20.311380Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62940
+[2m2026-02-04T04:35:20.311426Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created topic [3mtopic_id[0m[2m=[0m1 [3mtopic_name[0m[2m=[0mcreate_list_test_1770179720309445 [3mhas_retention[0m[2m=[0mfalse
+[2m2026-02-04T04:35:20.311763Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created topic [3mtopic_id[0m[2m=[0m3 [3mtopic_name[0m[2m=[0mlifecycle_test_1770179720309568 [3mhas_retention[0m[2m=[0mfalse
+[2m2026-02-04T04:35:20.311809Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62934
+[2m2026-02-04T04:35:20.311912Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created topic [3mtopic_id[0m[2m=[0m4 [3mtopic_name[0m[2m=[0mconcurrent_0_1770179720309566 [3mhas_retention[0m[2m=[0mfalse
+[2m2026-02-04T04:35:20.312266Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created topic [3mtopic_id[0m[2m=[0m5 [3mtopic_name[0m[2m=[0mthroughput_1770179720309469 [3mhas_retention[0m[2m=[0mfalse
+[2m2026-02-04T04:35:20.312578Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created topic [3mtopic_id[0m[2m=[0m6 [3mtopic_name[0m[2m=[0mresume_test_1770179720309598 [3mhas_retention[0m[2m=[0mfalse
+[2m2026-02-04T04:35:20.312671Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62930
+[2m2026-02-04T04:35:20.312798Z[0m [32m INFO[0m [2mlance::ingestion[0m[2m:[0m Created topic writer [3mtopic_id[0m[2m=[0m0 [3msegment[0m[2m=[0mC:\Users\nitec\Documents\Projects\lance\scripts\..\test-data\single\segments\0\0_1770179720312613600.lnc
+[2m2026-02-04T04:35:20.313314Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m1 [3mtopic_name[0m[2m=[0mcreate_list_test_1770179720309445
+[2m2026-02-04T04:35:20.313471Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer subscribed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m6 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:20.313544Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62929
+[2m2026-02-04T04:35:20.313587Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created topic [3mtopic_id[0m[2m=[0m7 [3mtopic_name[0m[2m=[0mmulti_subscriber_1770179720310095 [3mhas_retention[0m[2m=[0mfalse
+[2m2026-02-04T04:35:20.313831Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created topic [3mtopic_id[0m[2m=[0m8 [3mtopic_name[0m[2m=[0mconcurrent_1_1770179720312942 [3mhas_retention[0m[2m=[0mfalse
+[2m2026-02-04T04:35:20.314129Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Subscribe request processed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m6 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:20.314238Z[0m [32m INFO[0m [2mlance::ingestion[0m[2m:[0m Created topic writer [3mtopic_id[0m[2m=[0m3 [3msegment[0m[2m=[0mC:\Users\nitec\Documents\Projects\lance\scripts\..\test-data\single\segments\3\0_1770179720314045600.lnc
+[2m2026-02-04T04:35:20.314389Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62939
+[2m2026-02-04T04:35:20.314962Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created topic [3mtopic_id[0m[2m=[0m9 [3mtopic_name[0m[2m=[0mdelete_test_1770179720309391 [3mhas_retention[0m[2m=[0mfalse
+[2m2026-02-04T04:35:20.314974Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer subscribed [3mconsumer_id[0m[2m=[0m1001 [3mtopic_id[0m[2m=[0m7 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:20.315037Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m3 [3mtopic_name[0m[2m=[0mlifecycle_test_1770179720309568
+[2m2026-02-04T04:35:20.315577Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62941
+[2m2026-02-04T04:35:20.315643Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created topic [3mtopic_id[0m[2m=[0m10 [3mtopic_name[0m[2m=[0mconcurrent_2_1770179720314949 [3mhas_retention[0m[2m=[0mfalse
+[2m2026-02-04T04:35:20.315979Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Subscribe request processed [3mconsumer_id[0m[2m=[0m1001 [3mtopic_id[0m[2m=[0m7 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:20.316199Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created topic [3mtopic_id[0m[2m=[0m11 [3mtopic_name[0m[2m=[0msequential_1770179720309390 [3mhas_retention[0m[2m=[0mfalse
+[2m2026-02-04T04:35:20.316325Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m9 [3mtopic_name[0m[2m=[0mdelete_test_1770179720309391
+[2m2026-02-04T04:35:20.316615Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62937
+[2m2026-02-04T04:35:20.316805Z[0m [32m INFO[0m [2mlance::ingestion[0m[2m:[0m Created topic writer [3mtopic_id[0m[2m=[0m6 [3msegment[0m[2m=[0mC:\Users\nitec\Documents\Projects\lance\scripts\..\test-data\single\segments\6\0_1770179720316662300.lnc
+[2m2026-02-04T04:35:20.316935Z[0m [34mDEBUG[0m [2mlance::subscription[0m[2m:[0m Offset committed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m6 [3moffset[0m[2m=[0m5
+[2m2026-02-04T04:35:20.317751Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62935
+[2m2026-02-04T04:35:20.318238Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m CommitOffset request processed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m6 [3mcommitted_offset[0m[2m=[0m5
+[2m2026-02-04T04:35:20.318332Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created topic [3mtopic_id[0m[2m=[0m12 [3mtopic_name[0m[2m=[0mpipelined_1770179720309490 [3mhas_retention[0m[2m=[0mfalse
+[2m2026-02-04T04:35:20.318567Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62942
+[2m2026-02-04T04:35:20.318804Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer unsubscribed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m6
+[2m2026-02-04T04:35:20.319122Z[0m [32m INFO[0m [2mlance::ingestion[0m[2m:[0m Created topic writer [3mtopic_id[0m[2m=[0m4 [3msegment[0m[2m=[0mC:\Users\nitec\Documents\Projects\lance\scripts\..\test-data\single\segments\4\0_1770179720318961600.lnc
+[2m2026-02-04T04:35:20.319156Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created topic [3mtopic_id[0m[2m=[0m13 [3mtopic_name[0m[2m=[0mget_by_id_test_1770179720309399 [3mhas_retention[0m[2m=[0mfalse
+[2m2026-02-04T04:35:20.319179Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62943
+[2m2026-02-04T04:35:20.319246Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Unsubscribe request processed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m6 [3mwas_subscribed[0m[2m=[0mtrue
+[2m2026-02-04T04:35:20.319872Z[0m [32m INFO[0m [2mlance::ingestion[0m[2m:[0m Created topic writer [3mtopic_id[0m[2m=[0m8 [3msegment[0m[2m=[0mC:\Users\nitec\Documents\Projects\lance\scripts\..\test-data\single\segments\8\0_1770179720319671400.lnc
+[2m2026-02-04T04:35:20.320008Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62944
+[2m2026-02-04T04:35:20.320625Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m13 [3mtopic_name[0m[2m=[0mget_by_id_test_1770179720309399
+[2m2026-02-04T04:35:20.320626Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Created topic [3mtopic_id[0m[2m=[0m14 [3mtopic_name[0m[2m=[0mlarge_payload_1770179720309608 [3mhas_retention[0m[2m=[0mfalse
+[2m2026-02-04T04:35:20.320677Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer subscribed [3mconsumer_id[0m[2m=[0m1002 [3mtopic_id[0m[2m=[0m7 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:20.320756Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62945
+[2m2026-02-04T04:35:20.320875Z[0m [32m INFO[0m [2mlance::ingestion[0m[2m:[0m Created topic writer [3mtopic_id[0m[2m=[0m10 [3msegment[0m[2m=[0mC:\Users\nitec\Documents\Projects\lance\scripts\..\test-data\single\segments\10\0_1770179720320710500.lnc
+[2m2026-02-04T04:35:20.321162Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Subscribe request processed [3mconsumer_id[0m[2m=[0m1002 [3mtopic_id[0m[2m=[0m7 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:20.321479Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer subscribed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m6 [3mstart_offset[0m[2m=[0m5
+[2m2026-02-04T04:35:20.322139Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer subscribed [3mconsumer_id[0m[2m=[0m1003 [3mtopic_id[0m[2m=[0m7 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:20.322229Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Subscribe request processed [3mconsumer_id[0m[2m=[0m2001 [3mtopic_id[0m[2m=[0m6 [3mstart_offset[0m[2m=[0m5
+[2m2026-02-04T04:35:20.322448Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Subscribe request processed [3mconsumer_id[0m[2m=[0m1003 [3mtopic_id[0m[2m=[0m7 [3mstart_offset[0m[2m=[0m0
+[2m2026-02-04T04:35:20.323110Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m Connection accepted [3mpeer[0m[2m=[0m127.0.0.1:62946
+[2m2026-02-04T04:35:20.323469Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m6 [3mtopic_name[0m[2m=[0mresume_test_1770179720309598
+[2m2026-02-04T04:35:20.325102Z[0m [32m INFO[0m [2mlance::ingestion[0m[2m:[0m Created topic writer [3mtopic_id[0m[2m=[0m7 [3msegment[0m[2m=[0mC:\Users\nitec\Documents\Projects\lance\scripts\..\test-data\single\segments\7\0_1770179720324961700.lnc
+[2m2026-02-04T04:35:20.325291Z[0m [34mDEBUG[0m [2mlance::subscription[0m[2m:[0m Offset committed [3mconsumer_id[0m[2m=[0m1001 [3mtopic_id[0m[2m=[0m7 [3moffset[0m[2m=[0m5
+[2m2026-02-04T04:35:20.325414Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m CommitOffset request processed [3mconsumer_id[0m[2m=[0m1001 [3mtopic_id[0m[2m=[0m7 [3mcommitted_offset[0m[2m=[0m5
+[2m2026-02-04T04:35:20.325668Z[0m [34mDEBUG[0m [2mlance::subscription[0m[2m:[0m Offset committed [3mconsumer_id[0m[2m=[0m1002 [3mtopic_id[0m[2m=[0m7 [3moffset[0m[2m=[0m10
+[2m2026-02-04T04:35:20.325782Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m CommitOffset request processed [3mconsumer_id[0m[2m=[0m1002 [3mtopic_id[0m[2m=[0m7 [3mcommitted_offset[0m[2m=[0m10
+[2m2026-02-04T04:35:20.326111Z[0m [34mDEBUG[0m [2mlance::subscription[0m[2m:[0m Offset committed [3mconsumer_id[0m[2m=[0m1003 [3mtopic_id[0m[2m=[0m7 [3moffset[0m[2m=[0m15
+[2m2026-02-04T04:35:20.326292Z[0m [34mDEBUG[0m [2mlance::server[0m[2m:[0m CommitOffset request processed [3mconsumer_id[0m[2m=[0m1003 [3mtopic_id[0m[2m=[0m7 [3mcommitted_offset[0m[2m=[0m15
+[2m2026-02-04T04:35:20.326663Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer unsubscribed [3mconsumer_id[0m[2m=[0m1001 [3mtopic_id[0m[2m=[0m7
+[2m2026-02-04T04:35:20.326779Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Unsubscribe request processed [3mconsumer_id[0m[2m=[0m1001 [3mtopic_id[0m[2m=[0m7 [3mwas_subscribed[0m[2m=[0mtrue
+[2m2026-02-04T04:35:20.326974Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer unsubscribed [3mconsumer_id[0m[2m=[0m1002 [3mtopic_id[0m[2m=[0m7
+[2m2026-02-04T04:35:20.327097Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Unsubscribe request processed [3mconsumer_id[0m[2m=[0m1002 [3mtopic_id[0m[2m=[0m7 [3mwas_subscribed[0m[2m=[0mtrue
+[2m2026-02-04T04:35:20.327447Z[0m [32m INFO[0m [2mlance::subscription[0m[2m:[0m Consumer unsubscribed [3mconsumer_id[0m[2m=[0m1003 [3mtopic_id[0m[2m=[0m7
+[2m2026-02-04T04:35:20.327557Z[0m [32m INFO[0m [2mlance::server[0m[2m:[0m Unsubscribe request processed [3mconsumer_id[0m[2m=[0m1003 [3mtopic_id[0m[2m=[0m7 [3mwas_subscribed[0m[2m=[0mtrue
+[2m2026-02-04T04:35:20.328216Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m7 [3mtopic_name[0m[2m=[0mmulti_subscriber_1770179720310095
+[2m2026-02-04T04:35:20.339590Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m4 [3mtopic_name[0m[2m=[0mconcurrent_0_1770179720309566
+[2m2026-02-04T04:35:20.340479Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m8 [3mtopic_name[0m[2m=[0mconcurrent_1_1770179720312942
+[2m2026-02-04T04:35:20.341268Z[0m [32m INFO[0m [2mlance::topic[0m[2m:[0m Deleted topic [3mtopic_id[0m[2m=[0m10 [3mtopic_name[0m[2m=[0mconcurrent_2_1770179720314949
+[2m2026-02-04T04:35:24.329154Z[0m [32m INFO[0m [2mlance::ingestion[0m[2m:[0m Segment rotated [3mtopic_id[0m[2m=[0m0 [3mold_segment[0m[2m=[0mC:\Users\nitec\Documents\Projects\lance\scripts\..\test-data\single\segments\0\0_1770179720312613600.lnc [3mnew_segment[0m[2m=[0mC:\Users\nitec\Documents\Projects\lance\scripts\..\test-data\single\segments\0\105757_1770179724326688600.lnc

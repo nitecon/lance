@@ -1,0 +1,17 @@
+[package]
+name = "lnc-recovery"
+description = "Recovery layer for LANCE - WAL replay, segment recovery, index rebuild"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lnc-core = { workspace = true }
+lnc-io = { workspace = true }
+lnc-index = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

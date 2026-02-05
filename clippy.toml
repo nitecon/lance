@@ -14,7 +14,7 @@ too-many-arguments-threshold = 7
 type-complexity-threshold = 250
 
 # MSRV - Minimum Supported Rust Version
-msrv = "1.75.0"
+msrv = "1.85.0"
 
 # Allow certain patterns we use intentionally
 allowed-duplicate-crates = []

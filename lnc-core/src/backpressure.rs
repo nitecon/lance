@@ -200,7 +200,12 @@ impl BackpressureMonitor {
 
         if mem_pct >= self.config.memory_warning_pct {
             score += 2;
-            if mem_pct >= (self.config.memory_warning_pct + self.config.memory_critical_pct) / 2 {
+            if mem_pct
+                >= u8::midpoint(
+                    self.config.memory_warning_pct,
+                    self.config.memory_critical_pct,
+                )
+            {
                 score += 1;
             }
         }

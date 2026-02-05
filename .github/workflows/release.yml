@@ -64,18 +64,20 @@ jobs:
         
       - name: Package
         run: |
+          VERSION=${{ github.ref_name }}
           mkdir -p dist
           cp target/x86_64-unknown-linux-gnu/release/lance dist/
           cp target/x86_64-unknown-linux-gnu/release/lnc dist/
           cp LICENSE dist/
           cd dist
-          tar -czvf lance-linux-x86_64.tar.gz lance lnc LICENSE
+          tar -czvf lance-${VERSION}-linux-x86_64.tar.gz lance lnc LICENSE
           rm lance lnc LICENSE
           
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v4
         with:
           name: lance-linux-x86_64
-          path: dist/lance-linux-x86_64.tar.gz
+          path: dist/*.tar.gz
+          compression-level: 0
 
   # Build for Linux ARM64
   build-linux-aarch64:
@@ -101,18 +103,20 @@ jobs:
         
       - name: Package
         run: |
+          VERSION=${{ github.ref_name }}
           mkdir -p dist
           cp target/aarch64-unknown-linux-gnu/release/lance dist/
           cp target/aarch64-unknown-linux-gnu/release/lnc dist/
           cp LICENSE dist/
           cd dist
-          tar -czvf lance-linux-aarch64.tar.gz lance lnc LICENSE
+          tar -czvf lance-${VERSION}-linux-aarch64.tar.gz lance lnc LICENSE
           rm lance lnc LICENSE
           
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v4
         with:
           name: lance-linux-aarch64
-          path: dist/lance-linux-aarch64.tar.gz
+          path: dist/*.tar.gz
+          compression-level: 0
 
   # Build for macOS x86_64
   build-macos-x86_64:
@@ -131,18 +135,20 @@ jobs:
         
       - name: Package
         run: |
+          VERSION=${{ github.ref_name }}
           mkdir -p dist
           cp target/x86_64-apple-darwin/release/lance dist/
           cp target/x86_64-apple-darwin/release/lnc dist/
           cp LICENSE dist/
           cd dist
-          tar -czvf lance-macos-x86_64.tar.gz lance lnc LICENSE
+          tar -czvf lance-${VERSION}-macos-x86_64.tar.gz lance lnc LICENSE
           rm lance lnc LICENSE
           
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v4
         with:
           name: lance-macos-x86_64
-          path: dist/lance-macos-x86_64.tar.gz
+          path: dist/*.tar.gz
+          compression-level: 0
 
   # Build for macOS ARM64 (Apple Silicon)
   build-macos-aarch64:
@@ -161,18 +167,50 @@ jobs:
         
       - name: Package
         run: |
+          VERSION=${{ github.ref_name }}
           mkdir -p dist
           cp target/aarch64-apple-darwin/release/lance dist/
           cp target/aarch64-apple-darwin/release/lnc dist/
           cp LICENSE dist/
           cd dist
-          tar -czvf lance-macos-aarch64.tar.gz lance lnc LICENSE
+          tar -czvf lance-${VERSION}-macos-aarch64.tar.gz lance lnc LICENSE
           rm lance lnc LICENSE
           
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v4
         with:
           name: lance-macos-aarch64
-          path: dist/lance-macos-aarch64.tar.gz
+          path: dist/*.tar.gz
+          compression-level: 0
+
+  # Build Windows client (lnc only - server requires io_uring/Linux)
+  build-windows-x86_64:
+    name: Build Windows x86_64 (Client)
+    needs: [fmt, clippy, test]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      
+      - name: Build client
+        run: cargo build --release --target x86_64-pc-windows-msvc -p lnc
+        
+      - name: Package
+        shell: pwsh
+        run: |
+          $VERSION = "${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item target/x86_64-pc-windows-msvc/release/lnc.exe dist/
+          Copy-Item LICENSE dist/
+          Compress-Archive -Path dist/lnc.exe, dist/LICENSE -DestinationPath "dist/lnc-${VERSION}-windows-x86_64.zip"
+          
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lnc-windows-x86_64
+          path: dist/*.zip
+          compression-level: 0
 
   # Build Docker image and push to Docker Hub + GHCR
   build-docker:
@@ -251,6 +289,7 @@ jobs:
       - build-linux-aarch64
       - build-macos-x86_64
       - build-macos-aarch64
+      - build-windows-x86_64
       - build-docker
     runs-on: ubuntu-latest
     permissions:
@@ -259,22 +298,24 @@ jobs:
       - uses: actions/checkout@v4
       
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
           
       - name: Prepare release assets
         run: |
+          VERSION=${{ github.ref_name }}
           mkdir -p release
-          cp artifacts/lance-linux-x86_64/lance-linux-x86_64.tar.gz release/
-          cp artifacts/lance-linux-aarch64/lance-linux-aarch64.tar.gz release/
-          cp artifacts/lance-macos-x86_64/lance-macos-x86_64.tar.gz release/
-          cp artifacts/lance-macos-aarch64/lance-macos-aarch64.tar.gz release/
+          cp artifacts/lance-linux-x86_64/*.tar.gz release/
+          cp artifacts/lance-linux-aarch64/*.tar.gz release/
+          cp artifacts/lance-macos-x86_64/*.tar.gz release/
+          cp artifacts/lance-macos-aarch64/*.tar.gz release/
+          cp artifacts/lnc-windows-x86_64/*.zip release/
           
       - name: Generate checksums
         run: |
           cd release
-          sha256sum *.tar.gz > SHA256SUMS.txt
+          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
           
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -284,10 +325,8 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
           generate_release_notes: true
           files: |
-            release/lance-linux-x86_64.tar.gz
-            release/lance-linux-aarch64.tar.gz
-            release/lance-macos-x86_64.tar.gz
-            release/lance-macos-aarch64.tar.gz
+            release/*.tar.gz
+            release/*.zip
             release/SHA256SUMS.txt
           body: |
             ## LANCE ${{ github.ref_name }}
@@ -296,12 +335,30 @@ jobs:
             
             ### Downloads
             
+            #### Server + Client Packages
+            
+            Full distribution containing both the `lance` server and `lnc` CLI client:
+            
             | Platform | Architecture | File |
             |----------|--------------|------|
-            | Linux | x86_64 | `lance-linux-x86_64.tar.gz` |
-            | Linux | ARM64 | `lance-linux-aarch64.tar.gz` |
-            | macOS | Intel | `lance-macos-x86_64.tar.gz` |
-            | macOS | Apple Silicon | `lance-macos-aarch64.tar.gz` |
+            | Linux | x86_64 | `lance-${{ github.ref_name }}-linux-x86_64.tar.gz` |
+            | Linux | ARM64 | `lance-${{ github.ref_name }}-linux-aarch64.tar.gz` |
+            | macOS | Intel | `lance-${{ github.ref_name }}-macos-x86_64.tar.gz` |
+            | macOS | Apple Silicon | `lance-${{ github.ref_name }}-macos-aarch64.tar.gz` |
+            
+            **Contents:** `lance` (server), `lnc` (client), `LICENSE`
+            
+            #### Client-Only Package
+            
+            The `lnc` CLI client for connecting to LANCE servers from Windows:
+            
+            | Platform | Architecture | File |
+            |----------|--------------|------|
+            | Windows | x86_64 | `lnc-${{ github.ref_name }}-windows-x86_64.zip` |
+            
+            **Contents:** `lnc.exe` (client), `LICENSE`
+            
+            > **Why no Windows server?** The LANCE server uses Linux's `io_uring` for high-performance async I/O, which is not available on Windows. Windows users can run the server via Docker or WSL2, or connect to remote LANCE servers using the native Windows client.
             
             ### Docker
             
@@ -323,5 +380,6 @@ jobs:
             
             - **Linux**: Kernel 5.15+ for io_uring support
             - **macOS**: macOS 11+
+            - **Windows**: Windows 10+ (client only)
             
             See [documentation](https://github.com/${{ github.repository }}/blob/main/docs/Architecture.md) for deployment guide.

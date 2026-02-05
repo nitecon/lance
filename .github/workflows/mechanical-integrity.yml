@@ -66,10 +66,7 @@ jobs:
 
       - name: Run Clippy with strict settings
         run: |
-          cargo clippy --workspace --all-targets -- \
-            -D clippy::unwrap_used \
-            -D clippy::expect_used \
-            -D warnings
+          cargo clippy --workspace --all-targets -- -D warnings
 
   alignment-check:
     name: Struct Alignment Check

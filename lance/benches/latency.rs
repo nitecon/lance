@@ -47,7 +47,7 @@ fn bench_sort_key_ops(c: &mut Criterion) {
 
 /// Benchmark buffer slice operations (zero-copy path)
 fn bench_buffer_slice(c: &mut Criterion) {
-    use bytes::{Bytes, BytesMut};
+    use bytes::BytesMut;
 
     let mut buf = BytesMut::with_capacity(65536);
     buf.extend_from_slice(&[0u8; 65536]);
@@ -66,9 +66,10 @@ fn bench_buffer_slice(c: &mut Criterion) {
 #[cfg(test)]
 mod latency_gates {
     use super::*;
-    use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+
+    #[cfg(feature = "alloc-counter")]
+    use std::alloc::{GlobalAlloc, Layout, System};
 
     const P50_LIMIT_NS: u128 = 500;
     const P99_LIMIT_NS: u128 = 5_000;

@@ -202,20 +202,30 @@ impl Compressor {
     fn compress_raw(&self, data: &[u8]) -> CompressionResult<Vec<u8>> {
         match self.algorithm {
             CompressionAlgorithm::None => Ok(data.to_vec()),
-            #[cfg(feature = "lz4")]
-            CompressionAlgorithm::Lz4 => Ok(lz4_flex::compress_prepend_size(data)),
-            #[cfg(not(feature = "lz4"))]
-            CompressionAlgorithm::Lz4 => {
-                Err(CompressionError::UnsupportedAlgorithm(self.algorithm as u8))
-            },
-            #[cfg(feature = "zstd")]
-            CompressionAlgorithm::Zstd => zstd::encode_all(std::io::Cursor::new(data), self.level)
-                .map_err(|e| CompressionError::CompressionFailed(e.to_string())),
-            #[cfg(not(feature = "zstd"))]
-            CompressionAlgorithm::Zstd => {
-                Err(CompressionError::UnsupportedAlgorithm(self.algorithm as u8))
-            },
+            CompressionAlgorithm::Lz4 => self.compress_lz4(data),
+            CompressionAlgorithm::Zstd => self.compress_zstd(data),
         }
+    }
+
+    #[cfg(feature = "lz4")]
+    fn compress_lz4(&self, data: &[u8]) -> CompressionResult<Vec<u8>> {
+        Ok(lz4_flex::compress_prepend_size(data))
+    }
+
+    #[cfg(not(feature = "lz4"))]
+    fn compress_lz4(&self, _data: &[u8]) -> CompressionResult<Vec<u8>> {
+        Err(CompressionError::UnsupportedAlgorithm(self.algorithm as u8))
+    }
+
+    #[cfg(feature = "zstd")]
+    fn compress_zstd(&self, data: &[u8]) -> CompressionResult<Vec<u8>> {
+        zstd::encode_all(std::io::Cursor::new(data), self.level)
+            .map_err(|e| CompressionError::CompressionFailed(e.to_string()))
+    }
+
+    #[cfg(not(feature = "zstd"))]
+    fn compress_zstd(&self, _data: &[u8]) -> CompressionResult<Vec<u8>> {
+        Err(CompressionError::UnsupportedAlgorithm(self.algorithm as u8))
     }
 
     /// Raw decompression without header (internal use)
@@ -227,23 +237,37 @@ impl Compressor {
     ) -> CompressionResult<Bytes> {
         match algorithm {
             CompressionAlgorithm::None => Ok(Bytes::copy_from_slice(data)),
-            #[cfg(feature = "lz4")]
-            CompressionAlgorithm::Lz4 => lz4_flex::decompress_size_prepended(data)
-                .map(Bytes::from)
-                .map_err(|e| CompressionError::DecompressionFailed(e.to_string())),
-            #[cfg(not(feature = "lz4"))]
-            CompressionAlgorithm::Lz4 => {
-                Err(CompressionError::UnsupportedAlgorithm(algorithm as u8))
-            },
-            #[cfg(feature = "zstd")]
-            CompressionAlgorithm::Zstd => zstd::decode_all(std::io::Cursor::new(data))
-                .map(Bytes::from)
-                .map_err(|e| CompressionError::DecompressionFailed(e.to_string())),
-            #[cfg(not(feature = "zstd"))]
-            CompressionAlgorithm::Zstd => {
-                Err(CompressionError::UnsupportedAlgorithm(algorithm as u8))
-            },
+            CompressionAlgorithm::Lz4 => Self::decompress_lz4(data),
+            CompressionAlgorithm::Zstd => Self::decompress_zstd(data),
         }
+    }
+
+    #[cfg(feature = "lz4")]
+    fn decompress_lz4(data: &[u8]) -> CompressionResult<Bytes> {
+        lz4_flex::decompress_size_prepended(data)
+            .map(Bytes::from)
+            .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))
+    }
+
+    #[cfg(not(feature = "lz4"))]
+    fn decompress_lz4(_data: &[u8]) -> CompressionResult<Bytes> {
+        Err(CompressionError::UnsupportedAlgorithm(
+            CompressionAlgorithm::Lz4 as u8,
+        ))
+    }
+
+    #[cfg(feature = "zstd")]
+    fn decompress_zstd(data: &[u8]) -> CompressionResult<Bytes> {
+        zstd::decode_all(std::io::Cursor::new(data))
+            .map(Bytes::from)
+            .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))
+    }
+
+    #[cfg(not(feature = "zstd"))]
+    fn decompress_zstd(_data: &[u8]) -> CompressionResult<Bytes> {
+        Err(CompressionError::UnsupportedAlgorithm(
+            CompressionAlgorithm::Zstd as u8,
+        ))
     }
 
     /// Check if compression would be beneficial for this data size

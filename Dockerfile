@@ -60,7 +60,7 @@ RUN if [ "$BUILD_MODE" = "release" ]; then \
 # =============================================================================
 # Stage 2: Runtime (Production)
 # =============================================================================
-FROM debian:bookworm-slim AS runtime
+FROM debian:stable-slim AS runtime
 
 ARG VERSION
 ARG BUILD_MODE=release

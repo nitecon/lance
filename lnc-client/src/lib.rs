@@ -64,21 +64,33 @@
 //! ### Consumer (Grouped)
 //!
 //! ```rust,no_run
-//! use lnc_client::{GroupedConsumer, GroupConfig};
+//! use lnc_client::{AssignmentStrategy, GroupCoordinator, GroupConfig, GroupedConsumer, WorkerConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let consumer = GroupedConsumer::connect(
+//!     // Start coordinator (typically one per consumer group)
+//!     let coordinator = GroupCoordinator::start(
 //!         "127.0.0.1:1992",
-//!         GroupConfig::new("my-group", vec![1, 2, 3]),
+//!         GroupConfig::new("my-group")
+//!             .with_topics(vec![1, 2, 3])
+//!             .with_assignment_strategy(AssignmentStrategy::RoundRobin),
 //!     ).await?;
-//!     
+//!
+//!     // Workers join the group
+//!     let mut worker = GroupedConsumer::join(
+//!         "127.0.0.1:1992",
+//!         coordinator.join_address(),
+//!         WorkerConfig::new("worker-1"),
+//!     ).await?;
+//!
+//!     // Worker processes assigned topics
 //!     loop {
-//!         let records = consumer.poll().await?;
-//!         for record in records {
-//!             println!("Received: {:?}", record);
+//!         let topics: Vec<u32> = worker.assignments().to_vec();
+//!         for topic_id in topics {
+//!             if let Some(_records) = worker.poll(topic_id).await? {
+//!                 worker.commit(topic_id).await?;
+//!             }
 //!         }
-//!         consumer.commit().await?;
 //!     }
 //! }
 //! ```

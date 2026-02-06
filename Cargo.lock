@@ -960,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "clap",
@@ -1008,7 +1008,7 @@ checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 
 [[package]]
 name = "lnc"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "chrono",
@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "lnc-client"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "libc",
@@ -1038,17 +1038,15 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "tracing-subscriber",
  "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "lnc-core"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "crc32fast",
- "criterion",
  "crossbeam",
  "libc",
  "thiserror 2.0.18",
@@ -1057,7 +1055,7 @@ dependencies = [
 
 [[package]]
 name = "lnc-index"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "lnc-core",
  "memmap2",
@@ -1068,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "lnc-io"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "crossbeam",
@@ -1082,23 +1080,20 @@ dependencies = [
 
 [[package]]
 name = "lnc-metrics"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "tokio",
- "tonic",
 ]
 
 [[package]]
 name = "lnc-network"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "bytes",
- "crc32fast",
  "lnc-core",
  "lnc-metrics",
  "lz4_flex",
@@ -1106,16 +1101,13 @@ dependencies = [
  "rustls-pemfile",
  "tokio",
  "tokio-rustls",
- "tokio-test",
- "tracing",
  "webpki-roots 0.26.11",
- "zerocopy",
  "zstd",
 ]
 
 [[package]]
 name = "lnc-recovery"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "lnc-core",
  "lnc-index",
@@ -1126,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "lnc-replication"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "flatbuffers",
@@ -2107,17 +2099,6 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
-]
-
-[[package]]
-name = "tokio-test"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
-dependencies = [
- "futures-core",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]

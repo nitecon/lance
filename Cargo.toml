@@ -14,21 +14,24 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.4"
 edition = "2024"
 authors = ["LANCE Team"]
 license = "Apache-2.0"
 rust-version = "1.85"
+repository = "https://github.com/nitecon/lance"
+homepage = "https://github.com/nitecon/lance"
+documentation = "https://docs.rs/lnc-client"
 
 [workspace.dependencies]
-lnc-core = { path = "lnc-core" }
-lnc-io = { path = "lnc-io" }
-lnc-network = { path = "lnc-network" }
-lnc-index = { path = "lnc-index" }
-lnc-metrics = { path = "lnc-metrics" }
-lnc-replication = { path = "lnc-replication" }
-lnc-recovery = { path = "lnc-recovery" }
-lnc-client = { path = "lnc-client" }
+lnc-core = { path = "lnc-core", version = "0.1.4" }
+lnc-io = { path = "lnc-io", version = "0.1.4" }
+lnc-network = { path = "lnc-network", version = "0.1.4" }
+lnc-index = { path = "lnc-index", version = "0.1.4" }
+lnc-metrics = { path = "lnc-metrics", version = "0.1.4" }
+lnc-replication = { path = "lnc-replication", version = "0.1.4" }
+lnc-recovery = { path = "lnc-recovery", version = "0.1.4" }
+lnc-client = { path = "lnc-client", version = "0.1.4" }
 
 bytes = "1.5"
 zerocopy = { version = "0.8", features = ["derive"] }

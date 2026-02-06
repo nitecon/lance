@@ -6,6 +6,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["metrics", "telemetry", "opentelemetry", "lance"]
+categories = ["development-tools::profiling"]
+readme = "README.md"
 
 [dependencies]
 metrics = { workspace = true }
@@ -13,5 +18,3 @@ metrics-exporter-prometheus = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
-tonic = { workspace = true }
-tokio = { workspace = true }

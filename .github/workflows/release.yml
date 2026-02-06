@@ -12,8 +12,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  DOCKERHUB_IMAGE: nitecon/lance
-  GHCR_IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   # Quality gates - all must pass before release
@@ -46,6 +44,40 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features --workspace
+
+  # Publish to crates.io
+  publish-crates:
+    name: Publish to crates.io
+    needs: [fmt, clippy, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      
+      - name: Publish lnc-core
+        run: cargo publish -p lnc-core --token ${{ secrets.CRATES_IO_TOKEN }}
+        continue-on-error: true
+        
+      - name: Wait for crates.io indexing
+        run: sleep 30
+        
+      - name: Publish lnc-metrics
+        run: cargo publish -p lnc-metrics --token ${{ secrets.CRATES_IO_TOKEN }}
+        continue-on-error: true
+        
+      - name: Wait for crates.io indexing
+        run: sleep 30
+        
+      - name: Publish lnc-network
+        run: cargo publish -p lnc-network --token ${{ secrets.CRATES_IO_TOKEN }}
+        continue-on-error: true
+        
+      - name: Wait for crates.io indexing
+        run: sleep 30
+        
+      - name: Publish lnc-client
+        run: cargo publish -p lnc-client --token ${{ secrets.CRATES_IO_TOKEN }}
 
   # Build for Linux x86_64
   build-linux-x86_64:
@@ -182,105 +214,6 @@ jobs:
           path: dist/*.tar.gz
           compression-level: 0
 
-  # Build Windows client (lnc only - server requires io_uring/Linux)
-  build-windows-x86_64:
-    name: Build Windows x86_64 (Client)
-    needs: [fmt, clippy, test]
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
-      
-      - name: Build client
-        run: cargo build --release --target x86_64-pc-windows-msvc -p lnc
-        
-      - name: Package
-        shell: pwsh
-        run: |
-          $VERSION = "${{ github.ref_name }}"
-          New-Item -ItemType Directory -Force -Path dist
-          Copy-Item target/x86_64-pc-windows-msvc/release/lnc.exe dist/
-          Copy-Item LICENSE dist/
-          Compress-Archive -Path dist/lnc.exe, dist/LICENSE -DestinationPath "dist/lnc-${VERSION}-windows-x86_64.zip"
-          
-      - uses: actions/upload-artifact@v4
-        with:
-          name: lnc-windows-x86_64
-          path: dist/*.zip
-          compression-level: 0
-
-  # Build Docker image and push to Docker Hub + GHCR
-  build-docker:
-    name: Build Docker Image
-    needs: [fmt, clippy, test]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Determine Docker tags
-        id: tag
-        run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            TAG_NAME=${GITHUB_REF#refs/tags/}
-            VERSION=${TAG_NAME#v}
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-            echo "is_tag=true" >> $GITHUB_OUTPUT
-          else
-            echo "version=${{ github.sha }}" >> $GITHUB_OUTPUT
-            echo "is_tag=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-          
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ${{ env.DOCKERHUB_IMAGE }}
-            ${{ env.GHCR_IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ steps.tag.outputs.is_tag == 'true' }}
-            type=sha,enable=${{ steps.tag.outputs.is_tag != 'true' }}
-            
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64,linux/arm64
-          build-args: |
-            VERSION=${{ steps.tag.outputs.tag_name || github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: true
-          sbom: true
-
   # Create GitHub Release
   release:
     name: Create Release
@@ -289,8 +222,6 @@ jobs:
       - build-linux-aarch64
       - build-macos-x86_64
       - build-macos-aarch64
-      - build-windows-x86_64
-      - build-docker
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -310,12 +241,11 @@ jobs:
           cp artifacts/lance-linux-aarch64/*.tar.gz release/
           cp artifacts/lance-macos-x86_64/*.tar.gz release/
           cp artifacts/lance-macos-aarch64/*.tar.gz release/
-          cp artifacts/lnc-windows-x86_64/*.zip release/
           
       - name: Generate checksums
         run: |
           cd release
-          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+          sha256sum *.tar.gz > SHA256SUMS.txt
           
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -326,7 +256,6 @@ jobs:
           generate_release_notes: true
           files: |
             release/*.tar.gz
-            release/*.zip
             release/SHA256SUMS.txt
           body: |
             ## LANCE ${{ github.ref_name }}
@@ -346,28 +275,26 @@ jobs:
             | macOS | Intel | `lance-${{ github.ref_name }}-macos-x86_64.tar.gz` |
             | macOS | Apple Silicon | `lance-${{ github.ref_name }}-macos-aarch64.tar.gz` |
             
-            **Contents:** `lance` (server), `lnc` (client), `LICENSE`
+            **Contents:** `lance` (server), `lnc` (CLI), `LICENSE`
             
-            #### Client-Only Package
+            #### Windows Users
             
-            The `lnc` CLI client for connecting to LANCE servers from Windows:
+            There is no native Windows binary. The `lnc` CLI is designed to work directly with the server and has Linux-specific dependencies (io_uring). Windows users should:
             
-            | Platform | Architecture | File |
-            |----------|--------------|------|
-            | Windows | x86_64 | `lnc-${{ github.ref_name }}-windows-x86_64.zip` |
-            
-            **Contents:** `lnc.exe` (client), `LICENSE`
-            
-            > **Why no Windows server?** The LANCE server uses Linux's `io_uring` for high-performance async I/O, which is not available on Windows. Windows users can run the server via Docker or WSL2, or connect to remote LANCE servers using the native Windows client.
+            1. **WSL2 (Recommended)**: Download the Linux x86_64 binary and run it within WSL2
+            2. **Docker**: Use the Docker image for server deployment
+            3. **Rust Library**: For application integration, use `cargo add lnc-client` (cross-platform)
             
             ### Docker
             
             ```bash
-            # Docker Hub
             docker pull nitecon/lance:${{ github.ref_name }}
+            ```
             
-            # GitHub Container Registry
-            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ### Rust Client Library
+            
+            ```bash
+            cargo add lnc-client
             ```
             
             ### Verify Checksums
@@ -379,7 +306,7 @@ jobs:
             ### Requirements
             
             - **Linux**: Kernel 5.15+ for io_uring support
-            - **macOS**: macOS 11+
-            - **Windows**: Windows 10+ (client only)
+            - **macOS**: macOS 11+ (server builds but io_uring features disabled)
+            - **Windows**: Use WSL2 with Linux binary, or Docker
             
             See [documentation](https://github.com/${{ github.repository }}/blob/main/docs/Architecture.md) for deployment guide.

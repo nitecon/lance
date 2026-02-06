@@ -6,15 +6,17 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["networking", "protocol", "lance", "lwp"]
+categories = ["network-programming"]
+readme = "README.md"
 
 [dependencies]
 lnc-core = { workspace = true }
 lnc-metrics = { workspace = true }
 bytes = { workspace = true }
-zerocopy = { workspace = true }
 tokio = { workspace = true }
-tracing = { workspace = true }
-crc32fast = { workspace = true }
 
 # TLS support (optional feature)
 tokio-rustls = { version = "0.26", optional = true }
@@ -33,4 +35,3 @@ lz4 = ["lz4_flex"]
 compression = ["lz4", "zstd"]
 
 [dev-dependencies]
-tokio-test = "0.4"

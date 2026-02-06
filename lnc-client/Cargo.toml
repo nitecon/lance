@@ -1,15 +1,21 @@
 [package]
 name = "lnc-client"
-description = "LANCE client library - LWP protocol implementation"
+description = "LANCE client library - Rust client for the LANCE streaming platform"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/lnc-client"
+keywords = ["streaming", "messaging", "kafka", "client", "async"]
+categories = ["network-programming", "asynchronous"]
+readme = "README.md"
 
 [dependencies]
 lnc-core = { workspace = true }
-lnc-network = { path = "../lnc-network", features = ["tls"] }
+lnc-network = { workspace = true, features = ["tls"] }
 bytes = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = "0.26"
@@ -28,5 +34,4 @@ dangerous-testing = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
-tracing-subscriber = { workspace = true }
 tempfile = "3.14"

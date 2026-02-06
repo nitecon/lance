@@ -6,6 +6,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["streaming", "messaging", "lance", "core"]
+categories = ["data-structures", "encoding"]
+readme = "README.md"
 
 [dependencies]
 bytes = { workspace = true }
@@ -16,4 +21,3 @@ crc32fast = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-criterion = "0.5"

@@ -27,10 +27,6 @@
 use std::path::Path;
 
 #[cfg(feature = "tls")]
-use std::fs::File;
-#[cfg(feature = "tls")]
-use std::io::BufReader;
-#[cfg(feature = "tls")]
 use std::sync::Arc;
 
 /// TLS configuration for LANCE connections
@@ -191,7 +187,7 @@ impl TlsAcceptor {
 
     #[cfg(feature = "tls")]
     fn build_acceptor(config: &TlsConfig) -> TlsResult<tokio_rustls::TlsAcceptor> {
-        use rustls::pki_types::CertificateDer;
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
         let cert_path = config
             .cert_path
@@ -202,11 +198,9 @@ impl TlsAcceptor {
             .as_ref()
             .ok_or_else(|| TlsError::ConfigError("Key path required".into()))?;
 
-        // Load certificates
-        let cert_file = File::open(cert_path)
-            .map_err(|e| TlsError::CertificateError(format!("{}: {}", cert_path, e)))?;
-        let mut cert_reader = BufReader::new(cert_file);
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        // Load certificates using PemObject API
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+            .map_err(|e| TlsError::CertificateError(format!("{}: {}", cert_path, e)))?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -214,13 +208,9 @@ impl TlsAcceptor {
             return Err(TlsError::CertificateError("No certificates found".into()));
         }
 
-        // Load private key
-        let key_file =
-            File::open(key_path).map_err(|e| TlsError::KeyError(format!("{}: {}", key_path, e)))?;
-        let mut key_reader = BufReader::new(key_file);
-        let key = rustls_pemfile::private_key(&mut key_reader)
-            .map_err(|e| TlsError::KeyError(format!("Failed to parse key: {}", e)))?
-            .ok_or_else(|| TlsError::KeyError("No private key found".into()))?;
+        // Load private key using PemObject API
+        let key = PrivateKeyDer::from_pem_file(key_path)
+            .map_err(|e| TlsError::KeyError(format!("{}: {}", key_path, e)))?;
 
         // Build server config
         let server_config = rustls::ServerConfig::builder()
@@ -278,16 +268,14 @@ impl TlsConnector {
     #[cfg(feature = "tls")]
     fn build_connector(config: &TlsConfig) -> TlsResult<tokio_rustls::TlsConnector> {
         use rustls::RootCertStore;
-        use rustls::pki_types::CertificateDer;
+        use rustls_pki_types::{CertificateDer, pem::PemObject};
 
         let mut root_store = RootCertStore::empty();
 
         // Load custom CA if provided
         if let Some(ref ca_path) = config.ca_path {
-            let ca_file = File::open(ca_path)
-                .map_err(|e| TlsError::CaError(format!("{}: {}", ca_path, e)))?;
-            let mut ca_reader = BufReader::new(ca_file);
-            let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut ca_reader)
+            let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(ca_path)
+                .map_err(|e| TlsError::CaError(format!("{}: {}", ca_path, e)))?
                 .filter_map(|r| r.ok())
                 .collect();
 

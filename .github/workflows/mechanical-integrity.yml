@@ -60,7 +60,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
@@ -118,7 +118,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build workspace
         run: cargo build --workspace --all-features
@@ -136,4 +136,4 @@ jobs:
         run: cargo install cargo-deny --locked
 
       - name: Check dependencies
-        run: cargo deny check || echo "Note: cargo deny not configured yet"
+        run: cargo deny check

@@ -28,6 +28,7 @@ RUN_TEE_TESTS=false
 RUN_BENCHMARKS=false
 RUN_ALL=false
 LOCAL_ONLY=false
+TARGET_ENDPOINT=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -70,6 +71,14 @@ while [[ $# -gt 0 ]]; do
             LOCAL_ONLY=true
             shift
             ;;
+        --target)
+            TARGET_ENDPOINT="$2"
+            shift 2
+            ;;
+        --target=*)
+            TARGET_ENDPOINT="${1#*=}"
+            shift
+            ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -82,6 +91,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --benchmark        Run performance benchmarks"
             echo "  --all              Run all tests including TEE and benchmarks"
             echo "  --local            Run local tests only (no Docker, no cluster)"
+            echo "  --target ENDPOINT  Run tests against a running endpoint (e.g., localhost:1992)"
             echo "  --verbose, -v      Verbose output"
             echo "  --help, -h         Show this help"
             exit 0
@@ -166,15 +176,15 @@ check_kernel_tee_support() {
         return 1
     fi
     
-    log "  ✓ Kernel supports io_uring TEE operations"
+    log " 	[OK] Kernel supports io_uring TEE operations"
     
     # Check if io_uring is available
     if [ ! -e /proc/sys/kernel/io_uring_disabled ]; then
         # Older kernels don't have this sysctl, check differently
         if [ -e /proc/sys/kernel/io_uring_group ]; then
-            log "  ✓ io_uring is available"
+            log "  	[OK] io_uring is available"
         else
-            log "  ⚠ Cannot verify io_uring status (assuming available)"
+            log "  [WARN]  Cannot verify io_uring status (assuming available)"
         fi
     else
         IO_URING_DISABLED=$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo "0")
@@ -182,7 +192,7 @@ check_kernel_tee_support() {
             log_error "io_uring is disabled on this system"
             return 1
         fi
-        log "  ✓ io_uring is enabled"
+        log "  	[OK] io_uring is enabled"
     fi
     
     return 0
@@ -345,7 +355,7 @@ run_tee_tests() {
     
     echo ""
     if [ $TEST_EXIT_CODE -eq 0 ]; then
-        log "✓ All TEE tests passed!"
+        log "[OK] All TEE tests passed!"
     else
         log_error "Some TEE tests failed"
     fi
@@ -459,7 +469,145 @@ run_l2_quorum_tests() {
     
     echo ""
     if [ $TEST_EXIT_CODE -eq 0 ]; then
-        log "✓ All L2 quorum tests passed!"
+        log "[OK] All L2 quorum tests passed!"
+    fi
+}
+
+verify_target_endpoint() {
+    local endpoint="$1"
+    local host="${endpoint%:*}"
+    local port="${endpoint#*:}"
+    
+    log "Verifying target endpoint: $endpoint"
+    
+    # Extract metrics and health ports (assume standard offsets from client port)
+    # Client: 1992, Metrics: 9090, Health: 8080
+    local metrics_port=9090
+    local health_port=8080
+    
+    # If port is 1992, use defaults. Otherwise calculate offset
+    if [ "$port" != "1992" ]; then
+        metrics_port=$((port + 7098))  # 1992 -> 9090
+        health_port=$((port + 6088))   # 1992 -> 8080
+    fi
+    
+    echo ""
+    log "=== Endpoint Connectivity ==="
+    
+    # Test client port
+    if nc -z "$host" "$port" 2>/dev/null; then
+        log "  [OK] Client port ($host:$port): reachable"
+    else
+        log_error "  [FAIL] Client port ($host:$port): not reachable"
+        TEST_EXIT_CODE=1
+        return 1
+    fi
+    
+    echo ""
+    log "=== Health Check ==="
+    
+    # Try health endpoint
+    local health_response
+    health_response=$(curl -s --connect-timeout 5 "http://$host:$health_port/health/ready" 2>/dev/null || echo "")
+    
+    if echo "$health_response" | grep -q '"status":"ready"'; then
+        log "  [OK] Health endpoint ($host:$health_port): ready"
+        log "    Response: $health_response"
+    elif [ -n "$health_response" ]; then
+        log "  [WARN]  Health endpoint ($host:$health_port): responded but not ready"
+        log "    Response: $health_response"
+    else
+        log "  [WARN]  Health endpoint ($host:$health_port): not reachable (may be on different port)"
+    fi
+    
+    echo ""
+    log "=== Metrics Verification ==="
+    
+    # Try metrics endpoint
+    local metrics_response
+    metrics_response=$(curl -s --connect-timeout 5 "http://$host:$metrics_port/metrics" 2>/dev/null || echo "")
+    local metrics_length=${#metrics_response}
+    
+    if [ "$metrics_length" -gt 100 ]; then
+        local metric_count=$(echo "$metrics_response" | grep -c "^lance_" 2>/dev/null || echo "0")
+        if [ "$metric_count" -gt 0 ]; then
+            log "  [OK] Metrics endpoint ($host:$metrics_port): OK"
+            log "    Response size: $metrics_length bytes"
+            log "    LANCE metrics found: $metric_count"
+            echo ""
+            log "  Sample metrics:"
+            echo "$metrics_response" | grep "^lance_" | head -10 | while read -r line; do
+                log "    $line"
+            done
+        else
+            log "  [WARN]  Metrics endpoint ($host:$metrics_port): responding but no lance_* metrics"
+            log "    Response size: $metrics_length bytes"
+            log "    This may indicate metrics are not being exported properly."
+            TEST_EXIT_CODE=1
+        fi
+    elif [ -n "$metrics_response" ]; then
+        log "  [WARN]  Metrics endpoint ($host:$metrics_port): response too short ($metrics_length bytes)"
+        log "    Response: $metrics_response"
+        TEST_EXIT_CODE=1
+    else
+        log "  [WARN]  Metrics endpoint ($host:$metrics_port): not reachable (may be on different port)"
+    fi
+    
+    return 0
+}
+
+
+run_target_tests() {
+    local endpoint="$1"
+    
+    log "Running tests against target endpoint: $endpoint"
+    echo ""
+    
+    # First verify the endpoint
+    verify_target_endpoint "$endpoint"
+    
+    echo ""
+    log "=== Integration Tests ==="
+    
+    # Set environment for tests
+    export LANCE_TEST_ADDR="$endpoint"
+    export LANCE_NODE1_ADDR="$endpoint"
+    export LANCE_NODE2_ADDR="$endpoint"
+    export LANCE_NODE3_ADDR="$endpoint"
+    
+    log "  LANCE_TEST_ADDR = $LANCE_TEST_ADDR"
+    echo ""
+    
+    # Run integration tests
+    TEST_ARGS=(
+        "test"
+        "--package" "lnc-client"
+        "--test" "integration"
+        "--"
+        "--ignored"
+        "--nocapture"
+    )
+    
+    # Add test filter if specified
+    if [ -n "$TEST_FILTER" ]; then
+        TEST_ARGS+=("$TEST_FILTER")
+        log "  Filter: $TEST_FILTER"
+    fi
+    
+    # Skip cluster tests since we're targeting a single endpoint
+    TEST_ARGS+=("--skip" "cluster")
+    
+    log "  Command: cargo ${TEST_ARGS[*]}"
+    echo ""
+    
+    cd "$PROJECT_DIR"
+    cargo "${TEST_ARGS[@]}" || TEST_EXIT_CODE=$?
+    
+    echo ""
+    if [ $TEST_EXIT_CODE -eq 0 ]; then
+        log "[OK] All target tests passed!"
+    else
+        log_error "Some tests failed (exit code: $TEST_EXIT_CODE)"
     fi
 }
 
@@ -477,6 +625,9 @@ log "  Skip cluster: $SKIP_CLUSTER"
 log "  TEE tests: $RUN_TEE_TESTS"
 log "  Benchmarks: $RUN_BENCHMARKS"
 log "  Run all: $RUN_ALL"
+if [ -n "$TARGET_ENDPOINT" ]; then
+    log "  Target endpoint: $TARGET_ENDPOINT"
+fi
 if [ -n "$TEST_FILTER" ]; then
     log "  Filter: $TEST_FILTER"
 fi
@@ -489,6 +640,37 @@ if [ "$RUN_TEE_TESTS" = true ]; then
         log "Continuing with standard tests only..."
         RUN_TEE_TESTS=false
     fi
+fi
+
+# Target mode: run tests against a running endpoint
+if [ -n "$TARGET_ENDPOINT" ]; then
+    log "Running in target mode against: $TARGET_ENDPOINT"
+    echo ""
+    
+    run_target_tests "$TARGET_ENDPOINT"
+    
+    # Run benchmarks if requested
+    if [ "$RUN_BENCHMARKS" = true ]; then
+        echo ""
+        echo "========================================"
+        echo "  Performance Benchmarks"
+        echo "========================================"
+        echo ""
+        run_benchmarks
+    fi
+    
+    # Final summary for target mode
+    echo ""
+    echo "========================================"
+    echo "  Target Test Summary"
+    echo "========================================"
+    if [ $TEST_EXIT_CODE -eq 0 ]; then
+        log "[OK] All target tests completed successfully!"
+    else
+        log_error "Some tests failed (exit code: $TEST_EXIT_CODE)"
+    fi
+    
+    exit $TEST_EXIT_CODE
 fi
 
 # Local mode: skip Docker entirely
@@ -525,7 +707,7 @@ if [ "$LOCAL_ONLY" = true ]; then
     echo "  Local Test Summary"
     echo "========================================"
     if [ $TEST_EXIT_CODE -eq 0 ]; then
-        log "✓ All local tests completed successfully!"
+        log "[OK] All local tests completed successfully!"
     else
         log_error "Some tests failed (exit code: $TEST_EXIT_CODE)"
     fi
@@ -571,7 +753,7 @@ echo "========================================"
 echo "  Test Summary"
 echo "========================================"
 if [ $TEST_EXIT_CODE -eq 0 ]; then
-    log "✓ All tests completed successfully!"
+    log "[OK] All tests completed successfully!"
 else
     log_error "Some tests failed (exit code: $TEST_EXIT_CODE)"
 fi

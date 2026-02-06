@@ -136,6 +136,23 @@ async fn main() {
         shutdown_tx.subscribe(),
     ));
 
+    // Start periodic metrics export task
+    let metrics_shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut shutdown_rx = metrics_shutdown_rx;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    lnc_metrics::export_to_prometheus();
+                }
+                _ = shutdown_rx.recv() => {
+                    break;
+                }
+            }
+        }
+    });
+
     let server_handle = tokio::spawn(server::run(
         config,
         shutdown_tx.subscribe(),

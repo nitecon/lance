@@ -13,7 +13,8 @@ param(
     [switch]$SkipCluster,
     [switch]$NoBuild,
     [switch]$Keep,
-    [switch]$Verbose
+    [switch]$Verbose,
+    [string]$Target = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -268,6 +269,152 @@ function Invoke-Tests {
     }
 }
 
+function Test-TargetEndpoint {
+    param([string]$Endpoint)
+    
+    $parts = $Endpoint -split ':'
+    $host_ = $parts[0]
+    $port = [int]$parts[1]
+    
+    Write-Status "Verifying target endpoint: $Endpoint" "Cyan"
+    
+    # Default ports
+    $metricsPort = 9090
+    $healthPort = 8080
+    
+    # If not default port, try to calculate
+    if ($port -ne 1992) {
+        $metricsPort = $port + 7098
+        $healthPort = $port + 6088
+    }
+    
+    Write-Host ""
+    Write-Status "=== Endpoint Connectivity ===" "Yellow"
+    
+    # Test client port
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $tcp.Connect($host_, $port)
+        $tcp.Close()
+        Write-Status "  ✓ Client port (${host_}:${port}): reachable" "Green"
+    } catch {
+        Write-Status "  ✗ Client port (${host_}:${port}): not reachable" "Red"
+        $script:TestExitCode = 1
+        return $false
+    }
+    
+    Write-Host ""
+    Write-Status "=== Health Check ===" "Yellow"
+    
+    # Try health endpoint
+    try {
+        $healthResponse = Invoke-RestMethod -Uri "http://${host_}:${healthPort}/health/ready" -TimeoutSec 5 -ErrorAction SilentlyContinue
+        if ($healthResponse.status -eq "ready") {
+            Write-Status "  ✓ Health endpoint (${host_}:${healthPort}): ready" "Green"
+            Write-Status "    Response: $($healthResponse | ConvertTo-Json -Compress)" "Gray"
+        } else {
+            Write-Status "  ⚠ Health endpoint (${host_}:${healthPort}): responded but not ready" "Yellow"
+        }
+    } catch {
+        Write-Status "  ⚠ Health endpoint (${host_}:${healthPort}): not reachable (may be on different port)" "Yellow"
+    }
+    
+    Write-Host ""
+    Write-Status "=== Metrics Verification ===" "Yellow"
+    
+    # Try metrics endpoint
+    try {
+        $metricsResponse = Invoke-WebRequest -Uri "http://${host_}:${metricsPort}/metrics" -TimeoutSec 5 -ErrorAction Stop
+        $metricsContent = $metricsResponse.Content
+        $metricsLength = $metricsContent.Length
+        
+        if ($metricsLength -gt 100) {
+            $lanceMetrics = ($metricsContent -split "`n" | Where-Object { $_ -match "^lance_" })
+            $metricCount = $lanceMetrics.Count
+            
+            if ($metricCount -gt 0) {
+                Write-Status "  ✓ Metrics endpoint (${host_}:${metricsPort}): OK" "Green"
+                Write-Status "    Response size: $metricsLength bytes" "Gray"
+                Write-Status "    LANCE metrics found: $metricCount" "Gray"
+                Write-Host ""
+                Write-Status "  Sample metrics:" "Cyan"
+                $lanceMetrics | Select-Object -First 10 | ForEach-Object {
+                    Write-Status "    $_" "Gray"
+                }
+            } else {
+                Write-Status "  ⚠ Metrics endpoint (${host_}:${metricsPort}): responding but no lance_* metrics" "Yellow"
+                Write-Status "    Response size: $metricsLength bytes" "Gray"
+                Write-Status "    This may indicate metrics are not being exported properly." "Yellow"
+                $script:TestExitCode = 1
+            }
+        } else {
+            Write-Status "  ⚠ Metrics endpoint (${host_}:${metricsPort}): response too short ($metricsLength bytes)" "Yellow"
+            $script:TestExitCode = 1
+        }
+    } catch {
+        Write-Status "  ⚠ Metrics endpoint (${host_}:${metricsPort}): not reachable (may be on different port)" "Yellow"
+    }
+    
+    return $true
+}
+
+function Invoke-TargetTests {
+    param([string]$Endpoint)
+    
+    Write-Status "Running tests against target endpoint: $Endpoint" "Cyan"
+    Write-Host ""
+    
+    # Verify endpoint first
+    if (-not (Test-TargetEndpoint -Endpoint $Endpoint)) {
+        return
+    }
+    
+    Write-Host ""
+    Write-Status "=== Integration Tests ===" "Yellow"
+    
+    # Set environment for tests
+    $env:LANCE_TEST_ADDR = $Endpoint
+    $env:LANCE_NODE1_ADDR = $Endpoint
+    $env:LANCE_NODE2_ADDR = $Endpoint
+    $env:LANCE_NODE3_ADDR = $Endpoint
+    
+    Write-Status "  LANCE_TEST_ADDR = $env:LANCE_TEST_ADDR" "Gray"
+    Write-Host ""
+    
+    $testArgs = @(
+        "test",
+        "--package", "lnc-client",
+        "--test", "integration",
+        "--",
+        "--ignored",
+        "--nocapture",
+        "--skip", "cluster"
+    )
+    
+    if ($Filter) {
+        $testArgs += $Filter
+        Write-Status "  Filter: $Filter" "Gray"
+    }
+    
+    Write-Status "  Command: cargo $($testArgs -join ' ')" "Gray"
+    Write-Host ""
+    
+    Push-Location $ProjectDir
+    try {
+        & cargo @testArgs
+        $script:TestExitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    
+    Write-Host ""
+    if ($script:TestExitCode -eq 0) {
+        Write-Status "✓ All target tests passed!" "Green"
+    } else {
+        Write-Status "Some tests failed (exit code: $script:TestExitCode)" "Red"
+    }
+}
+
 # Main
 try {
     Write-Host ""
@@ -277,6 +424,31 @@ try {
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host ""
     
+    # Target mode: run tests against a running endpoint
+    if ($Target) {
+        Write-Status "Configuration:" "Cyan"
+        Write-Status "  Target endpoint: $Target" "Gray"
+        if ($Filter) {
+            Write-Status "  Filter: $Filter" "Gray"
+        }
+        Write-Host ""
+        
+        Invoke-TargetTests -Endpoint $Target
+        
+        Write-Host ""
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "  Target Test Summary" -ForegroundColor Cyan
+        Write-Host "========================================" -ForegroundColor Cyan
+        if ($script:TestExitCode -eq 0) {
+            Write-Status "✓ All target tests completed successfully!" "Green"
+        } else {
+            Write-Status "Some tests failed (exit code: $script:TestExitCode)" "Red"
+        }
+        
+        exit $script:TestExitCode
+    }
+    
+    # Docker mode
     Test-DockerAvailable
     Build-Images
     Start-Cluster

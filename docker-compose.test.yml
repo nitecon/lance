@@ -96,6 +96,29 @@ services:
       retries: 5
       start_period: 10s
 
+  # System Under Test - runs health checks against the cluster
+  sut:
+    image: alpine:latest
+    container_name: lance-sut
+    depends_on:
+      lance-node0:
+        condition: service_healthy
+      lance-node1:
+        condition: service_healthy
+      lance-node2:
+        condition: service_healthy
+    networks:
+      - lance-cluster
+    command: >
+      sh -c "
+        echo 'All LANCE nodes are healthy!'
+        echo 'Verifying cluster connectivity...'
+        nc -z lance-node0 1992 && echo 'Node 0: OK' || exit 1
+        nc -z lance-node1 1992 && echo 'Node 1: OK' || exit 1
+        nc -z lance-node2 1992 && echo 'Node 2: OK' || exit 1
+        echo 'Cluster health check passed!'
+      "
+
 networks:
   lance-cluster:
     driver: bridge

@@ -99,7 +99,6 @@ services:
   # System Under Test - runs health checks against the cluster
   sut:
     image: alpine:latest
-    container_name: lance-sut
     depends_on:
       lance-node0:
         condition: service_healthy

@@ -2,22 +2,35 @@ use std::fmt;
 
 use std::net::SocketAddr;
 
+/// Errors that can occur during client operations
 #[derive(Debug)]
 pub enum ClientError {
+    /// Failed to establish a connection to the server
     ConnectionFailed(std::io::Error),
+    /// Connection was closed by the server
     ConnectionClosed,
+    /// I/O error during communication
     IoError(std::io::Error),
+    /// Protocol-level error (malformed data, invalid state)
     ProtocolError(String),
+    /// Received an unexpected or invalid response from the server
     InvalidResponse(String),
+    /// Operation timed out
     Timeout,
+    /// CRC checksum mismatch indicating data corruption
     CrcMismatch {
+        /// Expected CRC value
         expected: u32,
+        /// Actual CRC value received
         actual: u32,
     },
+    /// Server is applying backpressure, client should slow down
     ServerBackpressure,
+    /// Server returned an error message
     ServerError(String),
     /// Server is not the leader, redirect to the specified address
     NotLeader {
+        /// Address of the current leader, if known
         leader_addr: Option<SocketAddr>,
     },
     /// TLS handshake or configuration error

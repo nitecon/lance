@@ -9,7 +9,7 @@
 //!
 //! - **Async/await** - Built on Tokio for high-performance async I/O
 //! - **Producer** - Batch records with configurable batching and backpressure
-//! - **Consumer** - Standalone and grouped consumer modes
+//! - **Consumer** - Standalone ([`standalone`]) and grouped ([`grouped`]) consumer modes
 //! - **Connection pooling** - Automatic reconnection and cluster-aware routing
 //! - **TLS support** - Secure connections with rustls
 //! - **Zero-copy** - Efficient record parsing with minimal allocations
@@ -86,7 +86,6 @@
 //! ## Modules
 //!
 //! - [`producer`] - High-level producer with batching and async send
-//! - [`consumer`] - Low-level consumer primitives
 //! - [`standalone`] - Standalone consumer for direct offset control
 //! - [`grouped`] - Grouped consumer with automatic partition assignment
 //! - [`connection`] - Connection pooling and cluster-aware routing

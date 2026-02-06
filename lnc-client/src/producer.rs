@@ -216,10 +216,15 @@ impl ProducerMetrics {
 /// Snapshot of producer metrics
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
+    /// Total number of records sent
     pub records_sent: u64,
+    /// Total number of bytes sent
     pub bytes_sent: u64,
+    /// Total number of batches sent
     pub batches_sent: u64,
+    /// Total number of errors encountered
     pub errors: u64,
+    /// Current buffer size in bytes
     pub buffer_size: u64,
 }
 

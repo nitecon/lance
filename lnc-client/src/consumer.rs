@@ -44,6 +44,7 @@ impl Default for ConsumerConfig {
 }
 
 impl ConsumerConfig {
+    /// Create a new consumer configuration for the specified topic
     pub fn new(topic_id: u32) -> Self {
         Self {
             topic_id,
@@ -51,11 +52,13 @@ impl ConsumerConfig {
         }
     }
 
+    /// Set the maximum bytes to fetch per poll operation
     pub fn with_max_fetch_bytes(mut self, bytes: u32) -> Self {
         self.max_fetch_bytes = bytes;
         self
     }
 
+    /// Set the starting position for consumption
     pub fn with_start_position(mut self, position: SeekPosition) -> Self {
         self.start_position = position;
         self
@@ -462,6 +465,7 @@ impl Default for StreamingConsumerConfig {
 }
 
 impl StreamingConsumerConfig {
+    /// Create a new streaming consumer configuration for the specified topic
     pub fn new(topic_id: u32) -> Self {
         Self {
             topic_id,
@@ -469,21 +473,25 @@ impl StreamingConsumerConfig {
         }
     }
 
+    /// Set the maximum bytes per batch
     pub fn with_max_batch_bytes(mut self, bytes: u32) -> Self {
         self.max_batch_bytes = bytes;
         self
     }
 
+    /// Set the starting position for consumption
     pub fn with_start_position(mut self, position: SeekPosition) -> Self {
         self.start_position = position;
         self
     }
 
+    /// Set the consumer group for coordinated consumption
     pub fn with_consumer_group(mut self, group: impl Into<String>) -> Self {
         self.consumer_group = Some(group.into());
         self
     }
 
+    /// Set the auto-commit interval in milliseconds (0 = disabled)
     pub fn with_auto_commit_interval(mut self, interval_ms: u64) -> Self {
         self.auto_commit_interval_ms = interval_ms;
         self

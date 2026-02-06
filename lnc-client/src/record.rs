@@ -144,13 +144,28 @@ impl Record {
 #[derive(Debug, Clone)]
 pub enum RecordParseError {
     /// Not enough data for TLV header
-    InsufficientHeader { needed: usize, available: usize },
+    InsufficientHeader {
+        /// Number of bytes needed
+        needed: usize,
+        /// Number of bytes available
+        available: usize,
+    },
     /// Not enough data for payload
-    InsufficientPayload { needed: usize, available: usize },
+    InsufficientPayload {
+        /// Number of bytes needed for payload
+        needed: usize,
+        /// Number of bytes available
+        available: usize,
+    },
     /// Invalid record type
     InvalidType(u8),
     /// Payload length exceeds maximum
-    PayloadTooLarge { length: u32, max: u32 },
+    PayloadTooLarge {
+        /// Actual payload length
+        length: u32,
+        /// Maximum allowed length
+        max: u32,
+    },
 }
 
 impl fmt::Display for RecordParseError {

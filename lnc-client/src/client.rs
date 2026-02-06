@@ -100,10 +100,14 @@ fn expect_success_response(frame: Frame) -> Result<()> {
     }
 }
 
+/// Authentication configuration for client connections
 #[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
+    /// Whether mutual TLS (mTLS) authentication is enabled
     pub mtls_enabled: bool,
+    /// Path to the client certificate file for mTLS
     pub client_cert_path: Option<String>,
+    /// Path to the client private key file for mTLS
     pub client_key_path: Option<String>,
 }
 
@@ -116,10 +120,14 @@ pub struct RetentionInfo {
     pub max_bytes: u64,
 }
 
+/// Information about a topic
 #[derive(Debug, Clone)]
 pub struct TopicInfo {
+    /// Unique topic identifier
     pub id: u32,
+    /// Topic name
     pub name: String,
+    /// Unix timestamp when the topic was created
     pub created_at: u64,
     /// Retention policy configuration (None = no retention policy set)
     pub retention: Option<RetentionInfo>,
@@ -128,23 +136,31 @@ pub struct TopicInfo {
 /// Result of a fetch operation
 #[derive(Debug, Clone)]
 pub struct FetchResult {
+    /// Raw data fetched from the topic
     pub data: Bytes,
+    /// Offset to use for the next fetch operation
     pub next_offset: u64,
+    /// Number of bytes returned in this fetch
     pub bytes_returned: u32,
+    /// Number of records in the fetched data
     pub record_count: u32,
 }
 
 /// Result of a subscribe operation
 #[derive(Debug, Clone)]
 pub struct SubscribeResult {
+    /// Assigned consumer identifier
     pub consumer_id: u64,
+    /// Starting offset for consumption
     pub start_offset: u64,
 }
 
 /// Result of a commit offset operation
 #[derive(Debug, Clone)]
 pub struct CommitResult {
+    /// Consumer identifier that committed the offset
     pub consumer_id: u64,
+    /// The offset that was successfully committed
     pub committed_offset: u64,
 }
 
@@ -161,12 +177,18 @@ pub struct ClusterStatus {
     pub peer_states: std::collections::HashMap<u16, String>,
 }
 
+/// Configuration for the LANCE client
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
+    /// Server address to connect to
     pub addr: SocketAddr,
+    /// Timeout for establishing connections
     pub connect_timeout: Duration,
+    /// Timeout for read operations
     pub read_timeout: Duration,
+    /// Timeout for write operations
     pub write_timeout: Duration,
+    /// Interval between keepalive messages
     pub keepalive_interval: Duration,
     /// Optional TLS configuration for encrypted connections
     pub tls: Option<TlsClientConfig>,
@@ -188,6 +210,7 @@ impl Default for ClientConfig {
 }
 
 impl ClientConfig {
+    /// Create a new client configuration with the specified server address
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
@@ -207,6 +230,9 @@ impl ClientConfig {
     }
 }
 
+/// LANCE protocol client for communicating with LANCE servers
+///
+/// Provides methods for ingesting data, managing topics, and consuming records.
 pub struct LanceClient {
     stream: ClientStream,
     config: ClientConfig,
@@ -298,6 +324,7 @@ impl LanceClient {
         })
     }
 
+    /// Connect to a LANCE server using an address string
     pub async fn connect_to(addr: &str) -> Result<Self> {
         let socket_addr: SocketAddr = addr
             .parse()
@@ -317,11 +344,13 @@ impl LanceClient {
         self.batch_id.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    /// Send an ingest request to the default topic (topic 0)
     pub async fn send_ingest(&mut self, payload: Bytes, record_count: u32) -> Result<u64> {
         self.send_ingest_to_topic(0, payload, record_count, None)
             .await
     }
 
+    /// Send an ingest request to a specific topic
     pub async fn send_ingest_to_topic(
         &mut self,
         topic_id: u32,
@@ -356,11 +385,13 @@ impl LanceClient {
         Ok(batch_id)
     }
 
+    /// Send an ingest request and wait for acknowledgment (default topic)
     pub async fn send_ingest_sync(&mut self, payload: Bytes, record_count: u32) -> Result<u64> {
         self.send_ingest_to_topic_sync(0, payload, record_count, None)
             .await
     }
 
+    /// Send an ingest request to a specific topic and wait for acknowledgment
     pub async fn send_ingest_to_topic_sync(
         &mut self,
         topic_id: u32,
@@ -407,6 +438,7 @@ impl LanceClient {
         }
     }
 
+    /// Receive an acknowledgment for a previously sent ingest request
     pub async fn recv_ack(&mut self) -> Result<u64> {
         let frame = self.recv_frame().await?;
 
@@ -426,6 +458,7 @@ impl LanceClient {
         }
     }
 
+    /// Send a keepalive message to maintain the connection
     pub async fn send_keepalive(&mut self) -> Result<()> {
         let frame = Frame::new_keepalive();
         let frame_bytes = encode_frame(&frame);
@@ -442,6 +475,7 @@ impl LanceClient {
         Ok(())
     }
 
+    /// Receive a keepalive response from the server
     pub async fn recv_keepalive(&mut self) -> Result<()> {
         let frame = self.recv_frame().await?;
 
@@ -457,6 +491,7 @@ impl LanceClient {
         }
     }
 
+    /// Ping the server and measure round-trip latency
     pub async fn ping(&mut self) -> Result<Duration> {
         let start = std::time::Instant::now();
         self.send_keepalive().await?;
@@ -464,6 +499,7 @@ impl LanceClient {
         Ok(start.elapsed())
     }
 
+    /// Create a new topic with the given name
     pub async fn create_topic(&mut self, name: &str) -> Result<TopicInfo> {
         let frame = Frame::new_create_topic(name);
         let frame_bytes = encode_frame(&frame);
@@ -481,6 +517,7 @@ impl LanceClient {
         self.parse_topic_response(response)
     }
 
+    /// List all topics on the server
     pub async fn list_topics(&mut self) -> Result<Vec<TopicInfo>> {
         let frame = Frame::new_list_topics();
         let frame_bytes = encode_frame(&frame);
@@ -498,6 +535,7 @@ impl LanceClient {
         self.parse_topic_list_response(response)
     }
 
+    /// Get information about a specific topic
     pub async fn get_topic(&mut self, topic_id: u32) -> Result<TopicInfo> {
         let frame = Frame::new_get_topic(topic_id);
         let frame_bytes = encode_frame(&frame);
@@ -515,6 +553,7 @@ impl LanceClient {
         self.parse_topic_response(response)
     }
 
+    /// Delete a topic by its ID
     pub async fn delete_topic(&mut self, topic_id: u32) -> Result<()> {
         let frame = Frame::new_delete_topic(topic_id);
         let frame_bytes = encode_frame(&frame);
@@ -1025,10 +1064,12 @@ impl LanceClient {
         }
     }
 
+    /// Get a reference to the client configuration
     pub fn config(&self) -> &ClientConfig {
         &self.config
     }
 
+    /// Close the client connection
     pub async fn close(mut self) -> Result<()> {
         self.stream.shutdown().await?;
         Ok(())

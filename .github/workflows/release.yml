@@ -62,28 +62,28 @@ jobs:
           sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
       
       - name: Publish lnc-core
-        run: cargo publish -p lnc-core --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p lnc-core --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
         continue-on-error: true
         
       - name: Wait for crates.io indexing
         run: sleep 30
         
       - name: Publish lnc-metrics
-        run: cargo publish -p lnc-metrics --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p lnc-metrics --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
         continue-on-error: true
         
       - name: Wait for crates.io indexing
         run: sleep 30
         
       - name: Publish lnc-network
-        run: cargo publish -p lnc-network --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p lnc-network --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
         continue-on-error: true
         
       - name: Wait for crates.io indexing
         run: sleep 30
         
       - name: Publish lnc-client
-        run: cargo publish -p lnc-client --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p lnc-client --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   # Build for Linux x86_64
   build-linux-x86_64:

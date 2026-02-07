@@ -607,6 +607,45 @@ impl ClusterCoordinator {
         Ok(())
     }
 
+    /// Gracefully shut down the cluster coordinator.
+    ///
+    /// If this node is the leader, voluntarily steps down so that followers
+    /// can detect the leadership vacancy faster. Then disconnects all peer
+    /// connections, which causes immediate "Broken pipe" detection on the
+    /// remote side — much faster than waiting for heartbeat timeout.
+    /// This reduces the leadership gap during rolling restarts from
+    /// heartbeat_timeout + election_timeout (~500ms+) to just election_timeout (~300ms).
+    pub async fn graceful_shutdown(&self) {
+        let was_leader = {
+            let mut raft = self.raft.write().await;
+            if raft.is_leader() {
+                let term = raft.current_term();
+                info!(
+                    target: "lance::cluster",
+                    node_id = self.config.node_id,
+                    term,
+                    "Stepping down from leadership before shutdown"
+                );
+                raft.step_down_voluntarily();
+                true
+            } else {
+                false
+            }
+        };
+
+        // Disconnect all peers — this causes immediate error detection on remote
+        // nodes (Broken pipe / Connection reset) rather than waiting for heartbeat
+        // timeout. Remote peers will then start election immediately.
+        self.peers.disconnect_all().await;
+
+        info!(
+            target: "lance::cluster",
+            node_id = self.config.node_id,
+            was_leader,
+            "Cluster coordinator shutdown complete"
+        );
+    }
+
     /// Run the cluster coordination loop
     pub async fn run(&self, mut shutdown: broadcast::Receiver<()>) {
         info!(
@@ -628,10 +667,7 @@ impl ClusterCoordinator {
                     self.on_election_check().await;
                 }
                 _ = shutdown.recv() => {
-                    info!(
-                        target: "lance::cluster",
-                        "Cluster coordinator shutting down"
-                    );
+                    self.graceful_shutdown().await;
                     break;
                 }
             }

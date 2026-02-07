@@ -428,6 +428,20 @@ impl PeerManager {
         }
     }
 
+    pub async fn disconnect_all(&self) {
+        let mut peers = self.peers.write().await;
+        for (peer_id, conn) in peers.iter_mut() {
+            if conn.is_connected() {
+                conn.disconnect();
+                info!(
+                    target: "lance::replication",
+                    peer_id = *peer_id,
+                    "Disconnected peer during shutdown"
+                );
+            }
+        }
+    }
+
     pub async fn send_to_peer(
         &self,
         peer_id: u16,

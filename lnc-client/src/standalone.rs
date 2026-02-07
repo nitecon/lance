@@ -163,10 +163,7 @@ impl StandaloneConsumer {
     /// - Offset store cannot be initialized
     /// - Subscription fails
     pub async fn connect(addr: &str, config: StandaloneConfig) -> Result<Self> {
-        let socket_addr = addr.parse().map_err(|e| {
-            crate::error::ClientError::ProtocolError(format!("Invalid address: {}", e))
-        })?;
-        let mut client_config = ClientConfig::new(socket_addr);
+        let mut client_config = ClientConfig::new(addr);
         client_config.connect_timeout = config.connect_timeout;
 
         let client = LanceClient::connect(client_config).await?;

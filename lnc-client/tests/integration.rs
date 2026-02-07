@@ -10,14 +10,11 @@
 
 use bytes::Bytes;
 use lnc_client::{ClientConfig, LanceClient};
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-fn get_test_addr() -> SocketAddr {
+fn get_test_addr() -> String {
     std::env::var("LANCE_TEST_ADDR")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 1992)))
+        .unwrap_or_else(|_| "127.0.0.1:1992".to_string())
 }
 
 fn test_config() -> ClientConfig {
@@ -67,7 +64,7 @@ async fn test_connect_and_close() {
 #[tokio::test]
 #[ignore = "requires running LANCE server"]
 async fn test_connect_with_string_addr() {
-    let addr = format!("{}", get_test_addr());
+    let addr = get_test_addr();
     println!("Testing connection to {}", addr);
 
     let client = LanceClient::connect_to(&addr).await;
@@ -555,7 +552,7 @@ async fn test_multiple_topics_concurrent_ingest() {
 #[tokio::test]
 async fn test_connect_to_invalid_address() {
     let config = ClientConfig {
-        addr: SocketAddr::from(([127, 0, 0, 1], 19999)), // Unlikely to be listening
+        addr: "127.0.0.1:19999".to_string(), // Unlikely to be listening
         connect_timeout: Duration::from_secs(1),
         ..Default::default()
     };
@@ -875,9 +872,9 @@ async fn test_consumer_offset_store_persistence() {
 //   LANCE_NODE2_ADDR=127.0.0.1:1993
 //   LANCE_NODE3_ADDR=127.0.0.1:1994
 
-fn get_node_addr(node: u8) -> Option<SocketAddr> {
+fn get_node_addr(node: u8) -> Option<String> {
     let var_name = format!("LANCE_NODE{}_ADDR", node);
-    std::env::var(&var_name).ok().and_then(|s| s.parse().ok())
+    std::env::var(&var_name).ok()
 }
 
 fn cluster_config(node: u8) -> Option<ClientConfig> {
@@ -1657,10 +1654,9 @@ async fn test_mtls_client_certificate() {
 #[ignore = "requires LANCE server with TLS enabled"]
 async fn test_tls_with_client_config_integration() {
     use lnc_client::TlsClientConfig;
-    use std::net::SocketAddr;
 
     // Test TLS configuration via ClientConfig.with_tls()
-    let addr: SocketAddr = get_test_addr();
+    let addr = get_test_addr();
     let tls = TlsClientConfig::new();
     let config = ClientConfig::new(addr).with_tls(tls);
 
@@ -1685,10 +1681,9 @@ async fn test_tls_with_client_config_integration() {
 #[ignore = "requires LANCE server with TLS enabled"]
 async fn test_tls_certificate_validation() {
     use lnc_client::TlsClientConfig;
-    use std::net::SocketAddr;
 
     // Test that invalid CA certificate fails validation
-    let addr: SocketAddr = get_test_addr();
+    let addr = get_test_addr();
     let tls = TlsClientConfig::new().with_ca_cert("/nonexistent/ca.pem");
 
     let config = ClientConfig::new(addr).with_tls(tls);
@@ -1739,7 +1734,7 @@ async fn test_tls_cluster_communication() {
 async fn test_connection_pool_basic() {
     use lnc_client::{ConnectionPool, ConnectionPoolConfig};
 
-    let addr = format!("{}", get_test_addr());
+    let addr = get_test_addr();
     let config = ConnectionPoolConfig::new()
         .with_max_connections(5)
         .with_min_idle(1);
@@ -1774,7 +1769,7 @@ async fn test_connection_pool_concurrent_access() {
     use lnc_client::{ConnectionPool, ConnectionPoolConfig};
     use std::sync::Arc;
 
-    let addr = format!("{}", get_test_addr());
+    let addr = get_test_addr();
     let config = ConnectionPoolConfig::new()
         .with_max_connections(3)
         .with_acquire_timeout(Duration::from_secs(5));
@@ -1808,7 +1803,7 @@ async fn test_connection_pool_concurrent_access() {
 async fn test_reconnecting_client_basic() {
     use lnc_client::ReconnectingClient;
 
-    let addr = format!("{}", get_test_addr());
+    let addr = get_test_addr();
     let mut client = ReconnectingClient::connect(&addr).await.unwrap();
 
     // Use the client
@@ -1827,7 +1822,7 @@ async fn test_reconnecting_client_leader_failover() {
     use lnc_client::ReconnectingClient;
     use std::net::SocketAddr;
 
-    let addr = format!("{}", get_test_addr());
+    let addr = get_test_addr();
     let mut client = ReconnectingClient::connect(&addr)
         .await
         .unwrap()
@@ -1872,7 +1867,7 @@ async fn test_producer_connect_and_send() {
         .with_batch_size(1024)
         .with_linger_ms(10);
 
-    let addr = format!("{}", get_test_addr());
+    let addr = get_test_addr();
     let producer = Producer::connect(&addr, config).await.unwrap();
 
     // Create a topic first
@@ -1911,7 +1906,7 @@ async fn test_producer_batching_and_flush() {
         .with_batch_size(16 * 1024)  // Large batch
         .with_linger_ms(1000); // Long linger
 
-    let addr = format!("{}", get_test_addr());
+    let addr = get_test_addr();
     let producer = Producer::connect(&addr, config).await.unwrap();
 
     // Create a topic
@@ -1953,7 +1948,7 @@ async fn test_producer_metrics_tracking() {
         .with_batch_size(1024)
         .with_linger_ms(5);
 
-    let addr = format!("{}", get_test_addr());
+    let addr = get_test_addr();
     let producer = Producer::connect(&addr, config).await.unwrap();
 
     // Create a topic

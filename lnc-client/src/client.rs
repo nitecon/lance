@@ -5,6 +5,7 @@ use lnc_network::{
     ControlCommand, Frame, FrameType, LWP_HEADER_SIZE, TlsConnector, encode_frame, parse_frame,
 };
 use std::net::SocketAddr;
+use tokio::net::lookup_host;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
@@ -180,8 +181,8 @@ pub struct ClusterStatus {
 /// Configuration for the LANCE client
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// Server address to connect to
-    pub addr: SocketAddr,
+    /// Server address to connect to (supports both IP:port and hostname:port)
+    pub addr: String,
     /// Timeout for establishing connections
     pub connect_timeout: Duration,
     /// Timeout for read operations
@@ -197,9 +198,7 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            addr: "127.0.0.1:1992"
-                .parse()
-                .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 1992))),
+            addr: "127.0.0.1:1992".to_string(),
             connect_timeout: Duration::from_secs(10),
             read_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(10),
@@ -211,9 +210,13 @@ impl Default for ClientConfig {
 
 impl ClientConfig {
     /// Create a new client configuration with the specified server address
-    pub fn new(addr: SocketAddr) -> Self {
+    ///
+    /// The address can be either an IP:port (e.g., "127.0.0.1:1992") or
+    /// a hostname:port (e.g., "lance.example.com:1992"). DNS resolution
+    /// is performed asynchronously during connection.
+    pub fn new(addr: impl Into<String>) -> Self {
         Self {
-            addr,
+            addr: addr.into(),
             ..Default::default()
         }
     }
@@ -242,7 +245,29 @@ pub struct LanceClient {
 }
 
 impl LanceClient {
+    /// Resolve an address string (hostname:port or IP:port) to a SocketAddr
+    ///
+    /// This performs DNS resolution for hostnames and validates IP addresses.
+    async fn resolve_address(addr: &str) -> Result<SocketAddr> {
+        // First, try parsing as a SocketAddr directly (for IP:port format)
+        if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+            return Ok(socket_addr);
+        }
+
+        // If direct parsing fails, perform DNS resolution (for hostname:port format)
+        let mut addrs = lookup_host(addr)
+            .await
+            .map_err(|e| ClientError::ProtocolError(format!("DNS resolution failed for '{}': {}", addr, e)))?;
+
+        addrs.next().ok_or_else(|| {
+            ClientError::ProtocolError(format!("No addresses found for '{}'", addr))
+        })
+    }
+
     /// Connect to LANCE server, automatically using TLS if configured
+    ///
+    /// The address in the config can be either an IP:port or hostname:port.
+    /// DNS resolution is performed automatically for hostnames.
     pub async fn connect(config: ClientConfig) -> Result<Self> {
         // If TLS is configured in ClientConfig, use TLS connection
         if let Some(ref tls_config) = config.tls {
@@ -251,7 +276,11 @@ impl LanceClient {
 
         debug!(addr = %config.addr, "Connecting to LANCE server");
 
-        let stream = tokio::time::timeout(config.connect_timeout, TcpStream::connect(config.addr))
+        // Resolve address (handles both IP:port and hostname:port)
+        let socket_addr = Self::resolve_address(&config.addr).await?;
+        debug!(resolved_addr = %socket_addr, "Resolved server address");
+
+        let stream = tokio::time::timeout(config.connect_timeout, TcpStream::connect(socket_addr))
             .await
             .map_err(|_| ClientError::Timeout)?
             .map_err(ClientError::ConnectionFailed)?;
@@ -272,14 +301,14 @@ impl LanceClient {
     /// Connect to LANCE server with TLS encryption
     ///
     /// # Arguments
-    /// * `config` - Client configuration with server address
+    /// * `config` - Client configuration with server address (IP:port or hostname:port)
     /// * `tls_config` - TLS configuration including certificates
     ///
     /// # Example
     /// ```rust,ignore
     /// use lnc_client::{ClientConfig, TlsClientConfig, LanceClient};
     ///
-    /// let config = ClientConfig::new("127.0.0.1:1992".parse().unwrap());
+    /// let config = ClientConfig::new("lance.example.com:1992");
     /// let tls = TlsClientConfig::new()
     ///     .with_ca_cert("/path/to/ca.pem");
     ///
@@ -288,9 +317,13 @@ impl LanceClient {
     pub async fn connect_tls(config: ClientConfig, tls_config: TlsClientConfig) -> Result<Self> {
         debug!(addr = %config.addr, "Connecting to LANCE server with TLS");
 
+        // Resolve address (handles both IP:port and hostname:port)
+        let socket_addr = Self::resolve_address(&config.addr).await?;
+        debug!(resolved_addr = %socket_addr, "Resolved server address");
+
         // First establish TCP connection
         let tcp_stream =
-            tokio::time::timeout(config.connect_timeout, TcpStream::connect(config.addr))
+            tokio::time::timeout(config.connect_timeout, TcpStream::connect(socket_addr))
                 .await
                 .map_err(|_| ClientError::Timeout)?
                 .map_err(ClientError::ConnectionFailed)?;
@@ -302,10 +335,12 @@ impl LanceClient {
         let connector =
             TlsConnector::new(network_config).map_err(|e| ClientError::TlsError(e.to_string()))?;
 
-        // Determine server name for SNI
-        let server_name = tls_config
-            .server_name
-            .unwrap_or_else(|| config.addr.ip().to_string());
+        // Determine server name for SNI - prefer configured name, then extract hostname from address
+        let server_name = tls_config.server_name.unwrap_or_else(|| {
+            // Extract hostname from address (remove port if present)
+            config.addr.rsplit_once(':').map(|(host, _)| host.to_string())
+                .unwrap_or_else(|| socket_addr.ip().to_string())
+        });
 
         // Perform TLS handshake
         let tls_stream = connector
@@ -325,19 +360,19 @@ impl LanceClient {
     }
 
     /// Connect to a LANCE server using an address string
+    ///
+    /// The address can be either an IP:port (e.g., "127.0.0.1:1992") or
+    /// a hostname:port (e.g., "lance.example.com:1992").
     pub async fn connect_to(addr: &str) -> Result<Self> {
-        let socket_addr: SocketAddr = addr
-            .parse()
-            .map_err(|e| ClientError::ProtocolError(format!("Invalid address: {}", e)))?;
-        Self::connect(ClientConfig::new(socket_addr)).await
+        Self::connect(ClientConfig::new(addr)).await
     }
 
     /// Connect to LANCE server with TLS using address string
+    ///
+    /// The address can be either an IP:port (e.g., "127.0.0.1:1992") or
+    /// a hostname:port (e.g., "lance.example.com:1992").
     pub async fn connect_tls_to(addr: &str, tls_config: TlsClientConfig) -> Result<Self> {
-        let socket_addr: SocketAddr = addr
-            .parse()
-            .map_err(|e| ClientError::ProtocolError(format!("Invalid address: {}", e)))?;
-        Self::connect_tls(ClientConfig::new(socket_addr), tls_config).await
+        Self::connect_tls(ClientConfig::new(addr), tls_config).await
     }
 
     fn next_batch_id(&self) -> u64 {

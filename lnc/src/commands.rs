@@ -652,15 +652,8 @@ pub async fn set_retention(
     max_bytes: u64,
 ) -> Result<()> {
     use lnc_client::{ClientConfig, LanceClient};
-    use std::net::ToSocketAddrs;
 
-    let addr = server_addr
-        .to_socket_addrs()
-        .map_err(|e| lnc_core::LanceError::Config(format!("Invalid server address: {}", e)))?
-        .next()
-        .ok_or_else(|| lnc_core::LanceError::Config("No address resolved".to_string()))?;
-
-    let config = ClientConfig::new(addr);
+    let config = ClientConfig::new(server_addr);
     let mut client = LanceClient::connect(config).await.map_err(client_err)?;
 
     client
@@ -697,15 +690,8 @@ pub async fn create_topic(
     max_bytes: Option<u64>,
 ) -> Result<()> {
     use lnc_client::{ClientConfig, LanceClient};
-    use std::net::ToSocketAddrs;
 
-    let addr = server_addr
-        .to_socket_addrs()
-        .map_err(|e| lnc_core::LanceError::Config(format!("Invalid server address: {}", e)))?
-        .next()
-        .ok_or_else(|| lnc_core::LanceError::Config("No address resolved".to_string()))?;
-
-    let config = ClientConfig::new(addr);
+    let config = ClientConfig::new(server_addr);
     let mut client = LanceClient::connect(config).await.map_err(client_err)?;
 
     let topic = if max_age_secs.is_some() || max_bytes.is_some() {
@@ -766,15 +752,8 @@ fn format_bytes(bytes: u64) -> String {
 /// List all topics from a remote server
 pub async fn list_topics_remote(server_addr: &str) -> Result<()> {
     use lnc_client::{ClientConfig, LanceClient};
-    use std::net::ToSocketAddrs;
 
-    let addr = server_addr
-        .to_socket_addrs()
-        .map_err(|e| lnc_core::LanceError::Config(format!("Invalid server address: {}", e)))?
-        .next()
-        .ok_or_else(|| lnc_core::LanceError::Config("No address resolved".to_string()))?;
-
-    let config = ClientConfig::new(addr);
+    let config = ClientConfig::new(server_addr);
     let mut client = LanceClient::connect(config).await.map_err(client_err)?;
 
     let topics = client.list_topics().await.map_err(client_err)?;
@@ -832,15 +811,8 @@ pub async fn list_topics_remote(server_addr: &str) -> Result<()> {
 /// Get details of a specific topic from a remote server
 pub async fn get_topic_remote(server_addr: &str, topic_id: u32) -> Result<()> {
     use lnc_client::{ClientConfig, LanceClient};
-    use std::net::ToSocketAddrs;
 
-    let addr = server_addr
-        .to_socket_addrs()
-        .map_err(|e| lnc_core::LanceError::Config(format!("Invalid server address: {}", e)))?
-        .next()
-        .ok_or_else(|| lnc_core::LanceError::Config("No address resolved".to_string()))?;
-
-    let config = ClientConfig::new(addr);
+    let config = ClientConfig::new(server_addr);
     let mut client = LanceClient::connect(config).await.map_err(client_err)?;
 
     let topic = client.get_topic(topic_id).await.map_err(client_err)?;
@@ -877,7 +849,6 @@ pub async fn get_topic_remote(server_addr: &str, topic_id: u32) -> Result<()> {
 pub async fn delete_topic_remote(server_addr: &str, topic_id: u32, force: bool) -> Result<()> {
     use lnc_client::{ClientConfig, LanceClient};
     use std::io::{self, Write};
-    use std::net::ToSocketAddrs;
 
     if !force {
         print!(
@@ -900,13 +871,7 @@ pub async fn delete_topic_remote(server_addr: &str, topic_id: u32, force: bool) 
         }
     }
 
-    let addr = server_addr
-        .to_socket_addrs()
-        .map_err(|e| lnc_core::LanceError::Config(format!("Invalid server address: {}", e)))?
-        .next()
-        .ok_or_else(|| lnc_core::LanceError::Config("No address resolved".to_string()))?;
-
-    let config = ClientConfig::new(addr);
+    let config = ClientConfig::new(server_addr);
     let mut client = LanceClient::connect(config).await.map_err(client_err)?;
 
     client.delete_topic(topic_id).await.map_err(client_err)?;
@@ -919,15 +884,8 @@ pub async fn delete_topic_remote(server_addr: &str, topic_id: u32, force: bool) 
 /// Show cluster status and health
 pub async fn cluster_status(server_addr: &str) -> Result<()> {
     use lnc_client::{ClientConfig, LanceClient};
-    use std::net::ToSocketAddrs;
 
-    let addr = server_addr
-        .to_socket_addrs()
-        .map_err(|e| lnc_core::LanceError::Config(format!("Invalid server address: {}", e)))?
-        .next()
-        .ok_or_else(|| lnc_core::LanceError::Config("No address resolved".to_string()))?;
-
-    let config = ClientConfig::new(addr);
+    let config = ClientConfig::new(server_addr);
     let mut client = LanceClient::connect(config).await.map_err(client_err)?;
 
     let status = client.get_cluster_status().await.map_err(client_err)?;
@@ -978,15 +936,8 @@ pub async fn ingest_data(
     use bytes::Bytes;
     use lnc_client::{ClientConfig, LanceClient};
     use std::io::{self, BufRead, Read};
-    use std::net::ToSocketAddrs;
 
-    let addr = server_addr
-        .to_socket_addrs()
-        .map_err(|e| lnc_core::LanceError::Config(format!("Invalid server address: {}", e)))?
-        .next()
-        .ok_or_else(|| lnc_core::LanceError::Config("No address resolved".to_string()))?;
-
-    let config = ClientConfig::new(addr);
+    let config = ClientConfig::new(server_addr);
     let mut client = LanceClient::connect(config).await.map_err(client_err)?;
 
     // Open input source

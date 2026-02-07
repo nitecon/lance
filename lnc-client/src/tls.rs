@@ -156,12 +156,10 @@ mod tests {
     #[test]
     fn test_client_config_with_tls() {
         use crate::ClientConfig;
-        use std::net::SocketAddr;
 
-        let addr: SocketAddr = "127.0.0.1:1992".parse().unwrap();
         let tls = TlsClientConfig::new().with_server_name("lance.example.com");
 
-        let config = ClientConfig::new(addr).with_tls(tls);
+        let config = ClientConfig::new("127.0.0.1:1992").with_tls(tls);
 
         assert!(config.is_tls_enabled());
         assert!(config.tls.is_some());
@@ -174,10 +172,8 @@ mod tests {
     #[test]
     fn test_client_config_without_tls() {
         use crate::ClientConfig;
-        use std::net::SocketAddr;
 
-        let addr: SocketAddr = "127.0.0.1:1992".parse().unwrap();
-        let config = ClientConfig::new(addr);
+        let config = ClientConfig::new("127.0.0.1:1992");
 
         assert!(!config.is_tls_enabled());
         assert!(config.tls.is_none());

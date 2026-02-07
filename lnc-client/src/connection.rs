@@ -250,7 +250,7 @@ impl PooledConnection {
 
 /// Connection pool for managing LANCE client connections
 pub struct ConnectionPool {
-    addr: SocketAddr,
+    addr: String,
     config: ConnectionPoolConfig,
     connections: Arc<Mutex<VecDeque<PooledConnection>>>,
     semaphore: Arc<Semaphore>,
@@ -260,13 +260,12 @@ pub struct ConnectionPool {
 
 impl ConnectionPool {
     /// Create a new connection pool
+    ///
+    /// The address can be either an IP:port (e.g., "127.0.0.1:1992") or
+    /// a hostname:port (e.g., "lance.example.com:1992").
     pub async fn new(addr: &str, config: ConnectionPoolConfig) -> Result<Self> {
-        let socket_addr: SocketAddr = addr
-            .parse()
-            .map_err(|e| ClientError::ProtocolError(format!("Invalid address: {}", e)))?;
-
         let pool = Self {
-            addr: socket_addr,
+            addr: addr.to_string(),
             config: config.clone(),
             connections: Arc::new(Mutex::new(VecDeque::new())),
             semaphore: Arc::new(Semaphore::new(config.max_connections)),
@@ -288,7 +287,7 @@ impl ConnectionPool {
         // Start health check task if enabled
         if !config.health_check_interval.is_zero() {
             let pool_clone = ConnectionPool {
-                addr: pool.addr,
+                addr: pool.addr.clone(),
                 config: pool.config.clone(),
                 connections: pool.connections.clone(),
                 semaphore: pool.semaphore.clone(),
@@ -383,7 +382,7 @@ impl ConnectionPool {
 
     /// Create a new connection
     async fn create_connection(&self) -> Result<PooledConnection> {
-        let mut client_config = ClientConfig::new(self.addr);
+        let mut client_config = ClientConfig::new(&self.addr);
         client_config.connect_timeout = self.config.connect_timeout;
 
         let client = match &self.config.tls_config {
@@ -551,12 +550,11 @@ pub struct ReconnectingClient {
 
 impl ReconnectingClient {
     /// Create a new reconnecting client
+    ///
+    /// The address can be either an IP:port (e.g., "127.0.0.1:1992") or
+    /// a hostname:port (e.g., "lance.example.com:1992").
     pub async fn connect(addr: &str) -> Result<Self> {
-        let socket_addr: SocketAddr = addr
-            .parse()
-            .map_err(|e| ClientError::ProtocolError(format!("Invalid address: {}", e)))?;
-
-        let config = ClientConfig::new(socket_addr);
+        let config = ClientConfig::new(addr);
         let client = LanceClient::connect(config.clone()).await?;
 
         Ok(Self {
@@ -574,12 +572,11 @@ impl ReconnectingClient {
     }
 
     /// Create a new reconnecting client with TLS
+    ///
+    /// The address can be either an IP:port (e.g., "127.0.0.1:1992") or
+    /// a hostname:port (e.g., "lance.example.com:1992").
     pub async fn connect_tls(addr: &str, tls_config: TlsClientConfig) -> Result<Self> {
-        let socket_addr: SocketAddr = addr
-            .parse()
-            .map_err(|e| ClientError::ProtocolError(format!("Invalid address: {}", e)))?;
-
-        let config = ClientConfig::new(socket_addr);
+        let config = ClientConfig::new(addr);
         let client = LanceClient::connect_tls(config.clone(), tls_config.clone()).await?;
 
         Ok(Self {
@@ -623,7 +620,7 @@ impl ReconnectingClient {
         self.leader_addr = Some(addr);
         if self.follow_leader {
             // Update config to connect to leader on next reconnect
-            self.config.addr = addr;
+            self.config.addr = addr.to_string();
         }
     }
 
@@ -725,6 +722,8 @@ pub struct ClusterClient {
 
 impl ClusterClient {
     /// Create a new cluster client with seed nodes
+    ///
+    /// Seed addresses can be either IP:port or hostname:port format.
     pub async fn connect(seed_addrs: &[&str]) -> Result<Self> {
         let nodes: Vec<SocketAddr> = seed_addrs.iter().filter_map(|s| s.parse().ok()).collect();
 
@@ -734,7 +733,7 @@ impl ClusterClient {
             ));
         }
 
-        let config = ClientConfig::new(nodes[0]);
+        let config = ClientConfig::new(nodes[0].to_string());
         let mut cluster = Self {
             nodes,
             primary: None,
@@ -759,7 +758,7 @@ impl ClusterClient {
             ));
         }
 
-        let config = ClientConfig::new(nodes[0]).with_tls(tls_config.clone());
+        let config = ClientConfig::new(nodes[0].to_string()).with_tls(tls_config.clone());
         let mut cluster = Self {
             nodes,
             primary: None,
@@ -784,7 +783,7 @@ impl ClusterClient {
     async fn discover_cluster(&mut self) -> Result<()> {
         for &node in &self.nodes.clone() {
             let mut config = self.config.clone();
-            config.addr = node;
+            config.addr = node.to_string();
 
             match LanceClient::connect(config).await {
                 Ok(mut client) => {
@@ -802,7 +801,7 @@ impl ClusterClient {
 
                             // Connect to primary if found
                             if let Some(primary_addr) = self.primary {
-                                self.config.addr = primary_addr;
+                                self.config.addr = primary_addr.to_string();
                                 self.client =
                                     Some(LanceClient::connect(self.config.clone()).await?);
                             } else {

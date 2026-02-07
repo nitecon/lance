@@ -252,10 +252,7 @@ impl GroupCoordinator {
 
         // Discover topics if not specified
         if config.topics.is_empty() {
-            let socket_addr: SocketAddr = config.server_addr.parse().map_err(|e| {
-                ClientError::ProtocolError(format!("Invalid server address: {}", e))
-            })?;
-            let client_config = ClientConfig::new(socket_addr);
+            let client_config = ClientConfig::new(&config.server_addr);
             let mut client = LanceClient::connect(client_config).await?;
             let topics = client.list_topics().await?;
             config.topics = topics.iter().map(|t| t.id).collect();

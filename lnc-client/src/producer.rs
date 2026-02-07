@@ -240,12 +240,12 @@ pub struct Producer {
 
 impl Producer {
     /// Connect to a LANCE server and create a producer
+    ///
+    /// The address can be either an IP:port (e.g., "127.0.0.1:1992") or
+    /// a hostname:port (e.g., "lance.example.com:1992"). DNS resolution
+    /// is performed automatically for hostnames.
     pub async fn connect(addr: &str, config: ProducerConfig) -> Result<Self> {
-        let socket_addr = addr
-            .parse()
-            .map_err(|e| ClientError::ProtocolError(format!("Invalid address: {}", e)))?;
-
-        let mut client_config = ClientConfig::new(socket_addr);
+        let mut client_config = ClientConfig::new(addr);
         client_config.connect_timeout = config.connect_timeout;
 
         let client = LanceClient::connect(client_config).await?;

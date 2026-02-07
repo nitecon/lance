@@ -1,14 +1,11 @@
 use crate::{ClientConfig, LanceClient};
 use bytes::Bytes;
-use std::net::SocketAddr;
 use std::time::Duration;
 
 fn test_config() -> ClientConfig {
     ClientConfig {
         addr: std::env::var("LANCE_TEST_ADDR")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 1992))),
+            .unwrap_or_else(|_| "127.0.0.1:1992".to_string()),
         connect_timeout: Duration::from_secs(5),
         read_timeout: Duration::from_secs(10),
         write_timeout: Duration::from_secs(5),

@@ -552,6 +552,37 @@ pub fn init_prometheus_exporter(
     );
     metrics::describe_counter!("lance_zero_copy_sends_total", "Zero-copy sends completed");
 
+    // Cluster health metrics
+    metrics::describe_gauge!("lance_cluster_leader_id", "Current cluster leader node ID");
+    metrics::describe_gauge!("lance_cluster_current_term", "Current Raft term");
+    metrics::describe_gauge!("lance_cluster_node_count", "Total nodes in cluster");
+    metrics::describe_gauge!(
+        "lance_cluster_healthy_nodes",
+        "Number of healthy (connected) nodes"
+    );
+    metrics::describe_gauge!(
+        "lance_cluster_is_leader",
+        "Whether this node is the leader (1=yes, 0=no)"
+    );
+    metrics::describe_gauge!(
+        "lance_cluster_quorum_available",
+        "Whether quorum is available (1=yes, 0=no)"
+    );
+
+    // Replication lag metrics
+    metrics::describe_gauge!(
+        "lance_replication_lag_bytes",
+        "Replication lag in bytes behind leader"
+    );
+    metrics::describe_gauge!(
+        "lance_replication_last_sync_ms",
+        "Time since last successful replication sync in milliseconds"
+    );
+    metrics::describe_gauge!(
+        "lance_replication_pending_ops",
+        "Number of pending replication operations"
+    );
+
     // ==========================================================================
     // 4 GOLDEN SIGNALS METRICS
     // ==========================================================================

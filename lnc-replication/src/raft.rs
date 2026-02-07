@@ -305,9 +305,11 @@ impl RaftNode {
         }
 
         if resp.vote_granted {
-            // Count the vote (we use candidate_id from request context)
-            // In a real implementation, you'd track which node responded
-            self.votes_received.insert(0); // Placeholder for actual voter ID
+            // Count the vote — caller must pass the actual voter node ID
+            // via the resp.term field context or track externally.
+            // For pre-vote we track grants via an external counter,
+            // so this path is only reached if the coordinator feeds
+            // individual responses. We return early based on quorum.
         }
 
         // Check if we have enough pre-votes
@@ -582,6 +584,8 @@ impl RaftNode {
     fn become_leader(&mut self) {
         self.state = RaftState::Leader;
         self.leader_id = Some(self.node_id);
+        // Reset election timeout so we don't immediately re-trigger elections
+        self.reset_election_timeout();
 
         // Create new fencing token
         self.fencing_token = Some(FencingToken::new(self.current_term, self.node_id));

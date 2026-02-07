@@ -18,7 +18,7 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, broadcast};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Events emitted by the cluster coordinator
 #[derive(Debug, Clone)]
@@ -268,6 +268,50 @@ impl ClusterCoordinator {
         let repl_addr = self.peer_addr(leader_id).await?;
         // Client port is replication port - 1
         Some(SocketAddr::new(repl_addr.ip(), repl_addr.port() - 1))
+    }
+
+    /// Re-resolve DNS for raw peer hostname strings and update the peer map.
+    /// This handles pod IP changes in Kubernetes (e.g. after pod restart).
+    /// No-op if raw_peer_strings is empty (all peers were specified as IPs).
+    pub async fn refresh_peer_addresses(&self) {
+        if self.config.raw_peer_strings.is_empty() {
+            return;
+        }
+
+        for (idx, peer_str) in self.config.raw_peer_strings.iter().enumerate() {
+            let (node_id, host_port) = if peer_str.contains('@') {
+                let parts: Vec<&str> = peer_str.splitn(2, '@').collect();
+                if parts.len() == 2 {
+                    if let Ok(id) = parts[0].parse::<u16>() {
+                        (id, parts[1].to_string())
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            } else {
+                (idx as u16, peer_str.to_string())
+            };
+
+            // Skip self
+            if node_id == self.config.node_id {
+                continue;
+            }
+
+            // Skip if already a valid SocketAddr (IP, no DNS needed)
+            if host_port.parse::<SocketAddr>().is_ok() {
+                continue;
+            }
+
+            // Re-resolve DNS
+            if let Ok(mut addrs) = tokio::net::lookup_host(&host_port).await {
+                if let Some(addr) = addrs.next() {
+                    // add_peer now upserts — updates address if changed
+                    self.peers.add_peer(node_id, addr).await;
+                }
+            }
+        }
     }
 
     /// Get connected peer count
@@ -672,16 +716,25 @@ impl ClusterCoordinator {
     }
 
     async fn on_election_check(&self) {
-        let should_start_election = {
+        let (should_start_election, is_leader) = {
             let raft = self.raft.read().await;
-            raft.election_timeout_elapsed()
+            (
+                raft.election_timeout_elapsed(),
+                raft.state() == RaftState::Leader,
+            )
         };
+
+        // Leaders send heartbeats, they don't start elections
+        if is_leader {
+            return;
+        }
 
         if should_start_election {
             info!(
                 target: "lance::cluster",
                 "Election timeout elapsed, starting election"
             );
+            lnc_metrics::increment_raft_elections_started();
             self.start_election().await;
         }
     }
@@ -702,7 +755,7 @@ impl ClusterCoordinator {
         for (peer_id, result) in results {
             match result {
                 Ok(()) => {
-                    debug!(
+                    trace!(
                         target: "lance::cluster",
                         peer_id,
                         "Sent heartbeat"
@@ -729,25 +782,53 @@ impl ClusterCoordinator {
         };
 
         if let Some(request) = pre_vote_request {
-            let msg = ReplicationMessage::PreVoteRequest(request);
-            let results = self.peers.broadcast(&msg).await;
+            // Send PreVoteRequest to each peer and collect actual responses
+            let peer_ids: Vec<u16> = self.peers.peer_states().await.keys().copied().collect();
 
-            let mut grants = 1; // Count self
-            for (peer_id, result) in results {
-                if result.is_ok() {
-                    // In a full implementation, we'd wait for and process responses
-                    debug!(
-                        target: "lance::cluster",
-                        peer_id,
-                        "Sent pre-vote request"
-                    );
-                    grants += 1;
+            let mut grants = 1usize; // Count self
+            for peer_id in peer_ids {
+                match self
+                    .peers
+                    .send_pre_vote_request(peer_id, request.clone())
+                    .await
+                {
+                    Ok(resp) => {
+                        if resp.vote_granted {
+                            grants += 1;
+                            debug!(
+                                target: "lance::cluster",
+                                peer_id,
+                                "Pre-vote granted"
+                            );
+                        } else {
+                            debug!(
+                                target: "lance::cluster",
+                                peer_id,
+                                resp_term = resp.term,
+                                "Pre-vote denied"
+                            );
+                            // If peer has higher term, step down
+                            let mut raft = self.raft.write().await;
+                            if resp.term > raft.current_term() {
+                                raft.handle_pre_vote_response(&resp);
+                                return; // Abort election
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        debug!(
+                            target: "lance::cluster",
+                            peer_id,
+                            error = %e,
+                            "Failed to get pre-vote response"
+                        );
+                    },
                 }
             }
 
-            // Check if we have enough votes to proceed to real election
-            let total_peers = self.peers.connected_peer_count().await + 1;
-            let majority = (total_peers / 2) + 1;
+            // Check if we have enough pre-votes for majority
+            let total_nodes = self.peers.connected_peer_count().await + 1;
+            let majority = (total_nodes / 2) + 1;
 
             if grants >= majority {
                 info!(
@@ -800,62 +881,36 @@ impl ClusterCoordinator {
             self.persist_state(raft.current_term(), None);
         }
 
-        let msg = ReplicationMessage::VoteRequest(vote_request);
-
         // Get peer IDs before sending
         let peer_ids: Vec<u16> = self.peers.peer_states().await.keys().copied().collect();
 
-        // Send vote requests and collect responses
+        // Send VoteRequest to each peer and process actual responses
         for peer_id in peer_ids {
-            // Send vote request
-            if let Err(e) = self.peers.send_to_peer(peer_id, &msg).await {
-                debug!(
-                    target: "lance::cluster",
-                    peer_id,
-                    error = %e,
-                    "Failed to send vote request"
-                );
-                continue;
-            }
-
-            debug!(
-                target: "lance::cluster",
-                peer_id,
-                "Sent vote request"
-            );
-
-            // Try to receive response with a short timeout
-            // Note: In a production system, we'd use async response handling
-            // For now, we'll use a simplified approach where we assume
-            // peers that received the message will grant the vote
-            // (since they process it in handle_peer_connection)
-        }
-
-        // For now, assume connected peers grant votes (simplified)
-        // A full implementation would track actual responses
-        let connected_peers = self.peers.connected_peer_count().await;
-        let total_votes = connected_peers + 1; // +1 for self
-
-        // Simulate receiving vote grants from connected peers
-        {
-            let mut raft = self.raft.write().await;
-            let peer_states = self.peers.peer_states().await;
-            for (peer_id, state) in peer_states {
-                if state == PeerState::Connected {
-                    // Simulate a granted vote response
-                    let resp = crate::codec::VoteResponse {
-                        term: raft.current_term(),
-                        vote_granted: true,
+            match self
+                .peers
+                .send_vote_request(peer_id, vote_request.clone())
+                .await
+            {
+                Ok(resp) => {
+                    let won = {
+                        let mut raft = self.raft.write().await;
+                        raft.handle_vote_response(peer_id, &resp)
                     };
-                    if raft.handle_vote_response(peer_id, &resp) {
-                        // We became leader!
-                        if let Some(token) = raft.fencing_token() {
-                            let term = raft.current_term();
+
+                    if won {
+                        // We became leader with real votes!
+                        lnc_metrics::increment_raft_elections_won();
+                        let (term, token) = {
+                            let raft = self.raft.read().await;
+                            (raft.current_term(), raft.fencing_token())
+                        };
+
+                        if let Some(token) = token {
                             info!(
                                 target: "lance::cluster",
                                 term,
                                 fencing_token = %token,
-                                votes = total_votes,
+                                peer_id,
                                 "Became leader"
                             );
 
@@ -864,11 +919,43 @@ impl ClusterCoordinator {
                                 fencing_token: token,
                             });
                         }
+
+                        // Update cached state immediately
+                        self.update_cached_leader_state(true).await;
                         return;
                     }
-                }
+
+                    if resp.vote_granted {
+                        debug!(
+                            target: "lance::cluster",
+                            peer_id,
+                            "Vote granted (not yet quorum)"
+                        );
+                    } else {
+                        debug!(
+                            target: "lance::cluster",
+                            peer_id,
+                            resp_term = resp.term,
+                            "Vote denied"
+                        );
+                    }
+                },
+                Err(e) => {
+                    debug!(
+                        target: "lance::cluster",
+                        peer_id,
+                        error = %e,
+                        "Failed to get vote response"
+                    );
+                },
             }
         }
+
+        // If we get here, we didn't win the election
+        info!(
+            target: "lance::cluster",
+            "Election did not reach quorum, reverting to follower"
+        );
     }
 }
 

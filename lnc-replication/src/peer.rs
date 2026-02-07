@@ -4,6 +4,7 @@
 //! Supports optional TLS encryption when the `tls` feature is enabled.
 
 use crate::codec::{AppendEntriesRequest, AppendEntriesResponse};
+use crate::codec::{PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse};
 use crate::codec::{ReplicationCodec, ReplicationMessage};
 use crate::follower::{FollowerHealth, FollowerStatus};
 use std::collections::HashMap;
@@ -359,20 +360,38 @@ impl PeerManager {
 
     pub async fn add_peer(&self, peer_id: u16, addr: SocketAddr) {
         let mut peers = self.peers.write().await;
-        if let std::collections::hash_map::Entry::Vacant(e) = peers.entry(peer_id) {
-            let conn = PeerConnection::new(peer_id, addr, self.config.clone());
-            e.insert(conn);
+        match peers.entry(peer_id) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let conn = PeerConnection::new(peer_id, addr, self.config.clone());
+                e.insert(conn);
 
-            // Initialize health tracking for this peer
-            let mut health = self.health.write().await;
-            health.insert(peer_id, FollowerHealth::new(peer_id));
+                // Initialize health tracking for this peer
+                let mut health = self.health.write().await;
+                health.insert(peer_id, FollowerHealth::new(peer_id));
 
-            info!(
-                target: "lance::replication",
-                peer_id,
-                addr = %addr,
-                "Added peer with health tracking"
-            );
+                info!(
+                    target: "lance::replication",
+                    peer_id,
+                    addr = %addr,
+                    "Added peer with health tracking"
+                );
+            },
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let existing = e.get();
+                if existing.addr != addr {
+                    info!(
+                        target: "lance::replication",
+                        peer_id,
+                        old_addr = %existing.addr,
+                        new_addr = %addr,
+                        "Peer address changed, updating connection"
+                    );
+                    let mut conn = PeerConnection::new(peer_id, addr, self.config.clone());
+                    // Preserve disconnect state so reconnect logic kicks in
+                    std::mem::swap(e.get_mut(), &mut conn);
+                    // Old connection is dropped here
+                }
+            },
         }
     }
 
@@ -454,6 +473,56 @@ impl PeerManager {
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Expected AppendEntriesResponse",
+            )),
+        }
+    }
+
+    /// Send a PreVoteRequest to a peer and wait for the PreVoteResponse.
+    pub async fn send_pre_vote_request(
+        &self,
+        peer_id: u16,
+        request: PreVoteRequest,
+    ) -> Result<PreVoteResponse, std::io::Error> {
+        let msg = ReplicationMessage::PreVoteRequest(request);
+        self.send_to_peer(peer_id, &msg).await?;
+
+        let mut peers = self.peers.write().await;
+        let conn = peers
+            .get_mut(&peer_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Peer not found"))?;
+
+        let response_msg = conn.recv().await?;
+
+        match response_msg {
+            ReplicationMessage::PreVoteResponse(resp) => Ok(resp),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Expected PreVoteResponse",
+            )),
+        }
+    }
+
+    /// Send a VoteRequest to a peer and wait for the VoteResponse.
+    pub async fn send_vote_request(
+        &self,
+        peer_id: u16,
+        request: VoteRequest,
+    ) -> Result<VoteResponse, std::io::Error> {
+        let msg = ReplicationMessage::VoteRequest(request);
+        self.send_to_peer(peer_id, &msg).await?;
+
+        let mut peers = self.peers.write().await;
+        let conn = peers
+            .get_mut(&peer_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Peer not found"))?;
+
+        let response_msg = conn.recv().await?;
+
+        match response_msg {
+            ReplicationMessage::VoteResponse(resp) => Ok(resp),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Expected VoteResponse",
             )),
         }
     }

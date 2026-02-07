@@ -226,10 +226,29 @@ impl LeaderConnectionPool {
 
         // Create a new connection
         debug!(leader = %addr, "Creating new connection to leader");
-        let stream = tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(addr))
-            .await
-            .map_err(|_| ForwardError::Timeout)?
-            .map_err(ForwardError::ConnectionFailed)?;
+        let stream =
+            match tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(addr)).await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        target: "lance::forward",
+                        leader = %addr,
+                        error = %e,
+                        "Failed to connect to leader"
+                    );
+                    return Err(ForwardError::ConnectionFailed(e));
+                },
+                Err(_) => {
+                    tracing::warn!(
+                        target: "lance::forward",
+                        leader = %addr,
+                        timeout_secs = self.config.connect_timeout.as_secs(),
+                        "Connect to leader timed out"
+                    );
+                    return Err(ForwardError::Timeout);
+                },
+            };
 
         stream
             .set_nodelay(true)
@@ -254,7 +273,17 @@ impl LeaderConnectionPool {
     /// Forward a write request to the leader and return the response
     ///
     /// This is the main forwarding function used by connection handlers.
+    /// The entire operation is bounded by `forward_timeout` to prevent
+    /// indefinite hangs on stale or broken connections.
     pub async fn forward_write(&self, request_bytes: &[u8]) -> Result<Vec<u8>, ForwardError> {
+        let timeout = self.config.forward_timeout;
+        tokio::time::timeout(timeout, self.forward_write_inner(request_bytes))
+            .await
+            .map_err(|_| ForwardError::Timeout)?
+    }
+
+    /// Inner forwarding logic (called within forward_timeout)
+    async fn forward_write_inner(&self, request_bytes: &[u8]) -> Result<Vec<u8>, ForwardError> {
         let start = std::time::Instant::now();
 
         let mut conn = self.acquire().await?;

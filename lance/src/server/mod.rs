@@ -34,7 +34,7 @@ use lnc_replication::{
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Main server entry point
 pub async fn run(
@@ -244,13 +244,21 @@ pub async fn run(
             pool.on_leader_change(Some(leader_addr)).await;
         }
 
-        // Start leader change watcher task
+        // Start leader change watcher task with periodic DNS re-resolution
         let pool_for_watcher = Arc::clone(&pool);
         let coord_for_watcher = Arc::clone(coord);
         tokio::spawn(async move {
             let mut last_leader = coord_for_watcher.leader_addr();
+            let mut dns_refresh_counter: u64 = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                // Re-resolve peer DNS every 30s (60 ticks × 500ms) to handle pod IP changes
+                dns_refresh_counter += 1;
+                if dns_refresh_counter % 60 == 0 {
+                    coord_for_watcher.refresh_peer_addresses().await;
+                }
+
                 let current_leader = coord_for_watcher.leader_addr();
                 if current_leader != last_leader {
                     info!(
@@ -391,7 +399,7 @@ pub async fn run(
                 match accept_result {
                     Ok((stream, addr)) => {
                         lnc_metrics::increment_connections();
-                        debug!(target: "lance::server", peer = %addr, "Connection accepted");
+                        trace!(target: "lance::server", peer = %addr, "Connection accepted");
 
                         let tx = ingestion_sender.clone();
                         let pool = Arc::clone(&batch_pool);

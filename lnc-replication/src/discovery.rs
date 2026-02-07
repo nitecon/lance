@@ -214,6 +214,9 @@ pub struct ClusterConfig {
     pub heartbeat_interval: Duration,
     pub election_timeout_min: Duration,
     pub election_timeout_max: Duration,
+    /// Raw peer strings (e.g. "lance-0.lance-headless:1993") for periodic DNS re-resolution.
+    /// Empty if peers were specified as IP addresses.
+    pub raw_peer_strings: Vec<String>,
 }
 
 impl Default for ClusterConfig {
@@ -224,6 +227,7 @@ impl Default for ClusterConfig {
                 .parse()
                 .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 1993))),
             discovery: DiscoveryMethod::default(),
+            raw_peer_strings: Vec::new(),
             heartbeat_interval: Duration::from_millis(150),
             election_timeout_min: Duration::from_millis(300),
             election_timeout_max: Duration::from_millis(500),

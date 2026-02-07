@@ -4,8 +4,7 @@ use std::time::Duration;
 
 fn test_config() -> ClientConfig {
     ClientConfig {
-        addr: std::env::var("LANCE_TEST_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:1992".to_string()),
+        addr: std::env::var("LANCE_TEST_ADDR").unwrap_or_else(|_| "127.0.0.1:1992".to_string()),
         connect_timeout: Duration::from_secs(5),
         read_timeout: Duration::from_secs(10),
         write_timeout: Duration::from_secs(5),

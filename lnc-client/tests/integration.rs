@@ -13,8 +13,7 @@ use lnc_client::{ClientConfig, LanceClient};
 use std::time::{Duration, Instant};
 
 fn get_test_addr() -> String {
-    std::env::var("LANCE_TEST_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:1992".to_string())
+    std::env::var("LANCE_TEST_ADDR").unwrap_or_else(|_| "127.0.0.1:1992".to_string())
 }
 
 fn test_config() -> ClientConfig {

@@ -5,13 +5,13 @@ use lnc_network::{
     ControlCommand, Frame, FrameType, LWP_HEADER_SIZE, TlsConnector, encode_frame, parse_frame,
 };
 use std::net::SocketAddr;
-use tokio::net::lookup_host;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::net::lookup_host;
 use tracing::{debug, trace, warn};
 
 /// Wrapper enum for TCP and TLS streams to avoid dynamic dispatch
@@ -255,13 +255,13 @@ impl LanceClient {
         }
 
         // If direct parsing fails, perform DNS resolution (for hostname:port format)
-        let mut addrs = lookup_host(addr)
-            .await
-            .map_err(|e| ClientError::ProtocolError(format!("DNS resolution failed for '{}': {}", addr, e)))?;
+        let mut addrs = lookup_host(addr).await.map_err(|e| {
+            ClientError::ProtocolError(format!("DNS resolution failed for '{}': {}", addr, e))
+        })?;
 
-        addrs.next().ok_or_else(|| {
-            ClientError::ProtocolError(format!("No addresses found for '{}'", addr))
-        })
+        addrs
+            .next()
+            .ok_or_else(|| ClientError::ProtocolError(format!("No addresses found for '{}'", addr)))
     }
 
     /// Connect to LANCE server, automatically using TLS if configured
@@ -338,7 +338,10 @@ impl LanceClient {
         // Determine server name for SNI - prefer configured name, then extract hostname from address
         let server_name = tls_config.server_name.unwrap_or_else(|| {
             // Extract hostname from address (remove port if present)
-            config.addr.rsplit_once(':').map(|(host, _)| host.to_string())
+            config
+                .addr
+                .rsplit_once(':')
+                .map(|(host, _)| host.to_string())
                 .unwrap_or_else(|| socket_addr.ip().to_string())
         });
 

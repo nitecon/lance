@@ -425,7 +425,28 @@ lance/
 
 ## 10. CI/CD & Review Gates
 
-### 10.1 Automated Checks
+### 10.1 Required Pre-Completion Checks
+
+All PRs **must pass** the following checks before merge:
+
+| Check | Command | Purpose |
+|-------|---------|---------|
+| **Format** | `cargo fmt --all -- --check` | Enforce consistent code style |
+| **Lint** | `cargo clippy --workspace --all-targets -- -D warnings` | Catch common mistakes and enforce idioms |
+| **Compile** | `cargo check --all-targets --workspace` | Verify all code compiles (including tests, benches) |
+| **Dependencies** | `cargo deny check` | Audit licenses, security advisories, and banned crates |
+
+Run all checks locally before pushing:
+
+```bash
+# Quick validation script
+cargo fmt --all -- --check && \
+cargo clippy --workspace --all-targets -- -D warnings && \
+cargo check --all-targets --workspace && \
+cargo deny check
+```
+
+### 10.2 Automated CI Checks
 
 ```yaml
 # .github/workflows/mechanical-integrity.yml
@@ -457,7 +478,7 @@ jobs:
         run: cargo clippy -- -D clippy::unwrap_used -D clippy::expect_used
 ```
 
-### 10.2 Human Review Checklist
+### 10.3 Human Review Checklist
 
 Before approving any PR touching `lnc-core`, `lnc-io`, or `lnc-network`:
 

@@ -260,17 +260,33 @@ impl Config {
     }
 
     /// Parse peer addresses from config strings like "host:port" or "node_id@host:port"
-    /// This version resolves hostnames to IP addresses asynchronously
+    /// This version resolves hostnames to IP addresses asynchronously with retry logic
+    /// for Kubernetes environments where peers may not be immediately available.
+    /// Default: 30 retries with 2 second intervals (60 seconds total) to handle
+    /// StatefulSet sequential pod creation delays.
     pub async fn parse_peers_async(&self) -> Vec<PeerInfo> {
-        let mut peers = Vec::new();
+        self.parse_peers_with_retry(30, Duration::from_secs(2))
+            .await
+    }
 
+    /// Parse peers with configurable retry count and interval.
+    /// Retries DNS resolution for unresolved peers until all are found or retries exhausted.
+    pub async fn parse_peers_with_retry(
+        &self,
+        max_retries: u32,
+        retry_interval: Duration,
+    ) -> Vec<PeerInfo> {
+        let mut peers = Vec::new();
+        let mut unresolved: Vec<(u16, String)> = Vec::new();
+
+        // First pass: collect all peer info and try initial resolution
         for (idx, peer_str) in self.peers.iter().enumerate() {
             // Support both "host:port" and "node_id@host:port" formats
             let (node_id, host_port) = if peer_str.contains('@') {
                 let parts: Vec<&str> = peer_str.splitn(2, '@').collect();
                 if parts.len() == 2 {
                     if let Ok(id) = parts[0].parse::<u16>() {
-                        (id, parts[1])
+                        (id, parts[1].to_string())
                     } else {
                         continue;
                     }
@@ -278,7 +294,7 @@ impl Config {
                     continue;
                 }
             } else {
-                (idx as u16, peer_str.as_str())
+                (idx as u16, peer_str.to_string())
             };
 
             // Skip self
@@ -292,28 +308,91 @@ impl Config {
                 continue;
             }
 
-            // Resolve hostname using DNS lookup
-            match tokio::net::lookup_host(host_port).await {
-                Ok(mut addrs) => {
-                    if let Some(addr) = addrs.next() {
+            // Mark for DNS resolution
+            unresolved.push((node_id, host_port));
+        }
+
+        // Calculate expected peer count (excluding self)
+        let expected_peers = self
+            .peers
+            .iter()
+            .enumerate()
+            .filter(|(idx, p)| {
+                let node_id = if p.contains('@') {
+                    p.split('@').next().and_then(|s| s.parse::<u16>().ok())
+                } else {
+                    Some(*idx as u16)
+                };
+                node_id.is_some_and(|id| id != self.node_id)
+            })
+            .count();
+
+        // Retry loop for DNS resolution
+        for attempt in 0..=max_retries {
+            if unresolved.is_empty() {
+                break;
+            }
+
+            let mut still_unresolved = Vec::new();
+
+            for (node_id, host_port) in unresolved {
+                // Resolve and immediately extract first address to avoid borrow issues
+                let resolved_addr: Option<SocketAddr> = tokio::net::lookup_host(host_port.as_str())
+                    .await
+                    .ok()
+                    .and_then(|mut addrs| addrs.next());
+
+                match resolved_addr {
+                    Some(addr) => {
                         tracing::debug!(
                             target: "lance::config",
-                            peer = peer_str,
+                            peer = %host_port,
                             resolved = %addr,
                             node_id,
+                            attempt,
                             "Resolved peer hostname"
                         );
                         peers.push(PeerInfo::new(node_id, addr));
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        target: "lance::config",
-                        peer = peer_str,
-                        error = %e,
-                        "Failed to resolve peer hostname"
-                    );
-                },
+                    },
+                    None => {
+                        if attempt < max_retries {
+                            tracing::debug!(
+                                target: "lance::config",
+                                peer = %host_port,
+                                attempt,
+                                max_retries,
+                                "Peer not yet resolvable, will retry"
+                            );
+                        } else {
+                            tracing::warn!(
+                                target: "lance::config",
+                                peer = %host_port,
+                                "Failed to resolve peer hostname after all retries"
+                            );
+                        }
+                        still_unresolved.push((node_id, host_port));
+                    },
+                }
+            }
+
+            unresolved = still_unresolved;
+
+            // If we have all expected peers, no need to retry
+            if peers.len() >= expected_peers {
+                break;
+            }
+
+            // Wait before next retry if there are still unresolved peers
+            if !unresolved.is_empty() && attempt < max_retries {
+                tracing::info!(
+                    target: "lance::config",
+                    resolved = peers.len(),
+                    pending = unresolved.len(),
+                    attempt = attempt + 1,
+                    max_retries,
+                    "Waiting for peer DNS resolution"
+                );
+                tokio::time::sleep(retry_interval).await;
             }
         }
 

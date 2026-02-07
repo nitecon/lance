@@ -399,6 +399,76 @@ peers = ["lance-2:9000", "lance-3:9000"]
 
 ---
 
+## Kubernetes Deployment
+
+A production-ready Kubernetes StatefulSet configuration is available at [`k8s/lance-cluster.yaml`](k8s/lance-cluster.yaml).
+
+### Quick Start
+
+```bash
+# Create namespace
+kubectl create namespace lance
+
+# Label namespace for io_uring support (requires privileged pods)
+kubectl label namespace lance pod-security.kubernetes.io/enforce=privileged
+
+# Deploy the cluster
+kubectl apply -n lance -f k8s/lance-cluster.yaml
+```
+
+### Configuration Notes
+
+Before deploying, update the following to match your environment:
+
+| Setting | Location | Description |
+|---------|----------|-------------|
+| **`storageClassName`** | `volumeClaimTemplates` | Change `ceph-block` to your cluster's storage class |
+| **DNS names** | `--peers` argument | Update `lance-X.lance-headless` if using a different service name |
+| **Replicas** | `spec.replicas` | Adjust cluster size (update `--peers` accordingly) |
+
+### Using a Config File (Recommended)
+
+For cleaner configuration, mount a ConfigMap with `lance.toml` instead of passing CLI arguments:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lance-config
+data:
+  lance.toml: |
+    [node]
+    data_dir = "/var/lib/lance"
+    
+    [replication]
+    mode = "L2"
+    peers = ["lance-0.lance-headless:1993", "lance-1.lance-headless:1993", "lance-2.lance-headless:1993"]
+```
+
+Then mount it in your StatefulSet:
+
+```yaml
+volumes:
+- name: config
+  configMap:
+    name: lance-config
+containers:
+- name: lance
+  command: ["/usr/local/bin/lance", "--config", "/etc/lance/lance.toml", "--node-id", "$(NODE_ID)"]
+  volumeMounts:
+  - name: config
+    mountPath: /etc/lance
+```
+
+### Security Context
+
+The StatefulSet requires:
+- **`seccompProfile: Unconfined`** — Required for io_uring syscalls
+- **`SYS_ADMIN` capability** — Required for io_uring ring setup
+- **`fsGroup: 1000`** — Matches the `lance` user in the container
+
+---
+
 ## Installation
 
 ### Pre-built Binaries
@@ -434,9 +504,10 @@ cargo add lnc-client
 |---------------------------------------------------|-----------------------------------------|
 | [Architecture](docs/Architecture.md)              | Deep-dive into system design            |
 | [Coding Guidelines](docs/CodingGuidelines.md)     | Engineering standards and requirements  |
+| [Kubernetes Deployment](k8s/lance-cluster.yaml)   | Production StatefulSet configuration    |
 | [LWP Specification](docs/LWP-Specification.md)    | Lance Wire Protocol (LWP) Specification |
 | [Monitoring](docs/Monitoring.md)                  | Monitoring and Observability            |
-| [Recovery](docs/Recoveryprocedures.md) | Recovery Procedures                     |
+| [Recovery](docs/Recoveryprocedures.md)            | Recovery Procedures                     |
 
 ---
 

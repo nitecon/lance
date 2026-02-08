@@ -235,6 +235,7 @@ pub struct Producer {
     batches: Arc<RwLock<HashMap<u32, RecordBatch>>>,
     metrics: Arc<ProducerMetrics>,
     running: Arc<AtomicBool>,
+    connection_healthy: Arc<AtomicBool>,
     flush_tx: mpsc::Sender<oneshot::Sender<Result<()>>>,
 }
 
@@ -258,6 +259,7 @@ impl Producer {
         let batches = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(ProducerMetrics::default());
         let running = Arc::new(AtomicBool::new(true));
+        let connection_healthy = Arc::new(AtomicBool::new(true));
 
         let (flush_tx, mut flush_rx) = mpsc::channel::<oneshot::Sender<Result<()>>>(16);
 
@@ -267,6 +269,7 @@ impl Producer {
         let batches_clone = batches.clone();
         let metrics_clone = metrics.clone();
         let running_clone = running.clone();
+        let healthy_clone = connection_healthy.clone();
 
         tokio::spawn(async move {
             let mut linger_interval = interval(Duration::from_millis(linger_ms.max(1)));
@@ -278,12 +281,14 @@ impl Producer {
                             break;
                         }
                         // Check for batches that should be sent due to linger timeout
-                        let _ = Self::flush_expired_batches(
+                        if Self::flush_expired_batches(
                             &client_clone,
                             &batches_clone,
                             &metrics_clone,
                             linger_ms,
-                        ).await;
+                        ).await.is_err() {
+                            healthy_clone.store(false, Ordering::SeqCst);
+                        }
                     }
                     Some(ack_tx) = flush_rx.recv() => {
                         // Explicit flush requested
@@ -304,6 +309,7 @@ impl Producer {
             batches,
             metrics,
             running,
+            connection_healthy,
             flush_tx,
         })
     }
@@ -313,6 +319,10 @@ impl Producer {
     /// This method buffers the record and returns a future that resolves
     /// when the record has been acknowledged by the server.
     pub async fn send(&self, topic_id: u32, data: &[u8]) -> Result<SendAck> {
+        if !self.connection_healthy.load(Ordering::SeqCst) {
+            return Err(ClientError::ConnectionClosed);
+        }
+
         let (ack_tx, ack_rx) = oneshot::channel();
 
         // Check buffer memory limit
@@ -346,7 +356,13 @@ impl Producer {
     /// Send a record without waiting for acknowledgment
     ///
     /// Returns immediately after buffering. Use `flush()` to ensure delivery.
+    /// **Note**: If the connection dies, this method will return
+    /// `Err(ClientError::ConnectionClosed)`. Check `is_healthy()` for status.
     pub async fn send_async(&self, topic_id: u32, data: &[u8]) -> Result<()> {
+        if !self.connection_healthy.load(Ordering::SeqCst) {
+            return Err(ClientError::ConnectionClosed);
+        }
+
         let (ack_tx, _ack_rx) = oneshot::channel();
 
         // Check buffer memory limit
@@ -640,6 +656,15 @@ impl Producer {
                 Err(e)
             },
         }
+    }
+
+    /// Check if the producer connection is healthy
+    ///
+    /// Returns `false` if the background flush task has detected a dead
+    /// connection (e.g., server went down). Callers should drop this
+    /// producer and reconnect.
+    pub fn is_healthy(&self) -> bool {
+        self.connection_healthy.load(Ordering::SeqCst)
     }
 
     /// Get current metrics

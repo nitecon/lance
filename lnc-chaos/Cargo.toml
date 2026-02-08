@@ -1,0 +1,20 @@
+[package]
+name = "lnc-chaos"
+description = "Chaos testing tool for LANCE — continuous produce/consume with ordering verification"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "lnc-chaos"
+path = "src/main.rs"
+
+[dependencies]
+lnc-client = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }

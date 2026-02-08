@@ -1077,12 +1077,37 @@ impl LanceClient {
     }
 
     async fn recv_frame(&mut self) -> Result<Frame> {
+        // Max frame size cap to prevent OOM from malformed headers (16 MB)
+        const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
         loop {
             if self.read_offset >= LWP_HEADER_SIZE {
+                // Grow buffer if the header indicates a payload larger than current capacity
+                let payload_len = u32::from_le_bytes([
+                    self.read_buffer[32],
+                    self.read_buffer[33],
+                    self.read_buffer[34],
+                    self.read_buffer[35],
+                ]) as usize;
+                let total_frame_size = LWP_HEADER_SIZE + payload_len;
+                if total_frame_size > MAX_FRAME_SIZE {
+                    return Err(ClientError::ServerError(format!(
+                        "Frame too large: {} bytes",
+                        total_frame_size
+                    )));
+                }
+                if total_frame_size > self.read_buffer.len() {
+                    self.read_buffer.resize(total_frame_size, 0);
+                }
+
                 if let Some((frame, consumed)) = parse_frame(&self.read_buffer[..self.read_offset])?
                 {
                     self.read_buffer.copy_within(consumed..self.read_offset, 0);
                     self.read_offset -= consumed;
+                    // Shrink buffer back to default if it was grown for a large frame
+                    if self.read_buffer.len() > 64 * 1024 && self.read_offset < 64 * 1024 {
+                        self.read_buffer.resize(64 * 1024, 0);
+                    }
                     return Ok(frame);
                 }
             }

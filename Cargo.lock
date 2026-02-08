@@ -1026,6 +1026,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lnc-chaos"
+version = "0.1.4"
+dependencies = [
+ "bytes",
+ "clap",
+ "lnc-client",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lnc-client"
 version = "0.1.4"
 dependencies = [

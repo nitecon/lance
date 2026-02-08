@@ -227,17 +227,21 @@ mod tests {
 
     #[test]
     fn test_rate_limiter_basic() {
-        let limiter = ConsumerRateLimiter::new(1000); // 1KB/s
+        // Use rate < 1000 so integer division in refill rounds to 0 for
+        // small elapsed times: (100 * 1ms) / 1000 == 0.  This makes the
+        // test deterministic — it would need ≥10 ms of wall-clock drift
+        // before a single token is refilled.
+        let limiter = ConsumerRateLimiter::new(100); // 100 B/s
 
         // Should be able to consume up to rate limit
-        let consumed = limiter.try_consume(500);
-        assert_eq!(consumed, 500);
+        let consumed = limiter.try_consume(60);
+        assert_eq!(consumed, 60);
 
-        let consumed = limiter.try_consume(500);
-        assert_eq!(consumed, 500);
+        let consumed = limiter.try_consume(40);
+        assert_eq!(consumed, 40);
 
-        // Should be exhausted now (before refill)
-        let consumed = limiter.try_consume(100);
+        // Should be exhausted now (test executes in <10 ms, so no refill)
+        let consumed = limiter.try_consume(10);
         assert_eq!(consumed, 0);
     }
 

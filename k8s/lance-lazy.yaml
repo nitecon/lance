@@ -1,0 +1,122 @@
+# Lance Lazy — 3 replicas, async replication (l2)
+---
+# Headless service for StatefulSet DNS (pod discovery)
+apiVersion: v1
+kind: Service
+metadata:
+  name: lance-lazy-headless
+  labels:
+    app: lance-lazy
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: lance-lazy
+  ports:
+  - name: client
+    port: 1992
+    targetPort: 1992
+  - name: replication
+    port: 1993
+    targetPort: 1993
+---
+# LoadBalancer service for external access
+apiVersion: v1
+kind: Service
+metadata:
+  name: lance-lazy
+  labels:
+    app: lance-lazy
+spec:
+  type: LoadBalancer
+  selector:
+    app: lance-lazy
+  ports:
+  - name: client
+    port: 1992
+    targetPort: 1992
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+  - name: health
+    port: 8080
+    targetPort: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: lance-lazy
+  labels:
+    app: lance-lazy
+spec:
+  serviceName: lance-lazy-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: lance-lazy
+  template:
+    metadata:
+      labels:
+        app: lance-lazy
+    spec:
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+      - name: lance
+        image: nitecon/lance:latest
+        securityContext:
+          seccompProfile:
+            type: Unconfined
+          capabilities:
+            add:
+              - SYS_ADMIN
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          NODE_ID="${HOSTNAME##*-}"
+          exec /usr/local/bin/lance \
+            --node-id "$NODE_ID" \
+            --replication-mode l2 \
+            --peers lance-lazy-0.lance-lazy-headless:1993,lance-lazy-1.lance-lazy-headless:1993,lance-lazy-2.lance-lazy-headless:1993 \
+            --data-dir /var/lib/lance
+        ports:
+        - containerPort: 1992
+          name: client
+        - containerPort: 1993
+          name: replication
+        - containerPort: 9090
+          name: metrics
+        - containerPort: 8080
+          name: health
+        livenessProbe:
+          tcpSocket:
+            port: 1992
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        readinessProbe:
+          tcpSocket:
+            port: 1992
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/lance
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      storageClassName: ceph-block
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 1Gi

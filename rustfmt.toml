@@ -1,5 +1,9 @@
 # Rustfmt configuration for LANCE
 # https://rust-lang.github.io/rustfmt/
+#
+# NOTE: Only stable options are used here. Nightly-only options are commented
+# out for reference. Install nightly rustfmt to enable them:
+#   rustup component add rustfmt --toolchain nightly
 
 edition = "2021"
 
@@ -7,17 +11,11 @@ edition = "2021"
 max_width = 100
 use_small_heuristics = "Default"
 
-# Imports
-imports_granularity = "Module"
-group_imports = "StdExternalCrate"
+# Imports (stable)
 reorder_imports = true
 reorder_modules = true
-
-# Comments
-wrap_comments = true
-comment_width = 100
-normalize_comments = true
-normalize_doc_attributes = true
+# imports_granularity = "Module"       # nightly
+# group_imports = "StdExternalCrate"   # nightly
 
 # Formatting
 newline_style = "Unix"
@@ -25,21 +23,27 @@ use_field_init_shorthand = true
 use_try_shorthand = true
 
 # Match arms
-match_arm_blocks = true
 match_block_trailing_comma = true
+# match_arm_blocks = true              # nightly
 
 # Functions
 fn_params_layout = "Tall"
 
-# Structs
-struct_lit_single_line = true
-
 # Chains
 chain_width = 60
 
-# Control flow
-control_brace_style = "AlwaysSameLine"
+# Comments (nightly-only, commented out)
+# wrap_comments = true
+# comment_width = 100
+# normalize_comments = true
+# normalize_doc_attributes = true
 
-# Macros
-format_macro_matchers = true
-format_macro_bodies = true
+# Structs (nightly-only)
+# struct_lit_single_line = true
+
+# Control flow (nightly-only)
+# control_brace_style = "AlwaysSameLine"
+
+# Macros (nightly-only)
+# format_macro_matchers = true
+# format_macro_bodies = true

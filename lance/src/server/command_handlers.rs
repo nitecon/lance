@@ -9,7 +9,7 @@
 //! delegating to specific handler functions based on the command type.
 //! This follows the Command pattern to reduce cyclomatic complexity.
 
-use crate::consumer::{ConsumerRateLimiter, FetchRequest};
+use crate::consumer::{ConsumerRateLimiter, FetchRequest, FetchResponse};
 use crate::subscription::SubscriptionManager;
 use crate::topic::{RetentionConfig, TopicListResponse, TopicRegistry};
 use bytes::Bytes;
@@ -124,7 +124,13 @@ impl<'a> ControlCommandDispatcher<'a> {
             req.start_offset,
             req.max_bytes,
         ) {
-            Ok(data) => Frame::new_fetch_response(data),
+            Ok(data) => {
+                let data_len = data.len() as u64;
+                let next_offset = req.start_offset + data_len;
+                let record_count: u32 = if data.is_empty() { 0 } else { 1 };
+                let response = FetchResponse::new(next_offset, record_count, data);
+                Frame::new_fetch_response(Bytes::from(response.encode()))
+            },
             Err(e) => Frame::new_error_response(&e.to_string()),
         }
     }

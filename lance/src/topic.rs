@@ -333,8 +333,18 @@ impl TopicRegistry {
         &self.data_dir
     }
 
-    /// Read data from a topic starting at the specified offset
-    /// Returns bytes read up to max_bytes
+    /// Read data from a topic starting at the specified byte offset.
+    ///
+    /// Scans `.lnc` segment files in the topic directory, sorted by their
+    /// `start_index` (the leading number in the filename). The offset is a
+    /// byte position across all segments concatenated in index order.
+    ///
+    /// Segment filename conventions (set by `lnc_io::SegmentWriter`):
+    ///   - Active  : `{start_index}_{start_timestamp_ns}.lnc`
+    ///   - Closed  : `{start_index}_{start_timestamp_ns}-{end_timestamp_ns}.lnc`
+    ///
+    /// Closed segments are immutable (their size will not change).  Active
+    /// segments (no `-` separator) may still be receiving writes.
     pub fn read_from_offset(
         &self,
         topic_id: u32,
@@ -342,19 +352,84 @@ impl TopicRegistry {
         max_bytes: u32,
     ) -> Result<bytes::Bytes> {
         let topic_dir = self.get_topic_dir(topic_id);
-        let segment_path = topic_dir.join("current.seg");
 
-        if !segment_path.exists() {
+        if !topic_dir.exists() {
             return Ok(bytes::Bytes::new());
         }
 
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = std::fs::File::open(&segment_path)?;
-        file.seek(SeekFrom::Start(start_offset))?;
+        // Collect .lnc segments with parsed metadata
+        // (start_index, size_bytes, is_closed, path)
+        let mut segments: Vec<(u64, u64, bool, std::path::PathBuf)> = Vec::new();
+        for entry in std::fs::read_dir(&topic_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "lnc") {
+                let filename = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(f) => f.to_string(),
+                    None => continue,
+                };
 
-        let mut buffer = vec![0u8; max_bytes as usize];
-        let bytes_read = file.read(&mut buffer)?;
-        buffer.truncate(bytes_read);
+                // Determine closed vs active by presence of '-'
+                let (start_part, is_closed) = if let Some(pos) = filename.find('-') {
+                    (&filename[..pos], true)
+                } else {
+                    (filename.as_str(), false)
+                };
+
+                // Parse start_index from "{start_index}_{timestamp}" prefix
+                let start_index = start_part
+                    .split('_')
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+
+                let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                segments.push((start_index, size_bytes, is_closed, path));
+            }
+        }
+
+        if segments.is_empty() {
+            return Ok(bytes::Bytes::new());
+        }
+
+        // Sort by start_index; closed segments come before active at the
+        // same index (closed was sealed before the active one was created).
+        segments.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2).reverse()));
+
+        // Walk segments to find the one(s) containing start_offset and read
+        use std::io::{Read, Seek, SeekFrom};
+        let mut cumulative: u64 = 0;
+        let mut buffer = Vec::with_capacity(max_bytes as usize);
+        let mut remaining = max_bytes as usize;
+
+        for (_idx, size_bytes, _is_closed, seg_path) in &segments {
+            let seg_end = cumulative + size_bytes;
+
+            // Skip segments entirely before the requested offset
+            if seg_end <= start_offset {
+                cumulative = seg_end;
+                continue;
+            }
+
+            // Byte position within this segment file
+            let pos_in_seg = start_offset.saturating_sub(cumulative);
+
+            let mut file = std::fs::File::open(seg_path)?;
+            file.seek(SeekFrom::Start(pos_in_seg))?;
+
+            let to_read = std::cmp::min(remaining, (*size_bytes - pos_in_seg) as usize);
+            let mut chunk = vec![0u8; to_read];
+            let bytes_read = file.read(&mut chunk)?;
+            chunk.truncate(bytes_read);
+            remaining -= bytes_read;
+            buffer.extend_from_slice(&chunk);
+
+            if remaining == 0 {
+                break;
+            }
+
+            cumulative = seg_end;
+        }
 
         Ok(bytes::Bytes::from(buffer))
     }

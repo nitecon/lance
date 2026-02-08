@@ -630,15 +630,45 @@ fn handle_fetch_request(
 
 #[allow(dead_code)]
 fn find_active_segment(topic_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut segments: Vec<_> = std::fs::read_dir(topic_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
-        .collect();
+    // Active segments use format: {start_index}_{start_ts}.lnc   (no '-')
+    // Closed segments use format: {start_index}_{start_ts}-{end_ts}.lnc
+    // Prefer the active segment; fall back to the latest closed one.
+    let mut active: Option<(u64, std::path::PathBuf)> = None;
+    let mut latest_closed: Option<(u64, std::path::PathBuf)> = None;
 
-    // Sort by name (which includes index) to get the latest
-    segments.sort_by_key(|e| e.file_name());
-    segments.last().map(|e| e.path())
+    for entry in std::fs::read_dir(topic_dir).ok()?.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "lnc") {
+            let filename = path.file_stem()?.to_str()?.to_string();
+
+            let is_closed = filename.contains('-');
+            let start_part = if is_closed {
+                &filename[..filename.find('-').unwrap_or(filename.len())]
+            } else {
+                filename.as_str()
+            };
+
+            let start_index: u64 = start_part
+                .split('_')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            if is_closed {
+                if latest_closed
+                    .as_ref()
+                    .map_or(true, |(idx, _)| start_index > *idx)
+                {
+                    latest_closed = Some((start_index, path));
+                }
+            } else if active.as_ref().map_or(true, |(idx, _)| start_index > *idx) {
+                active = Some((start_index, path));
+            }
+        }
+    }
+
+    // Active segment is the one being written to; prefer it
+    active.or(latest_closed).map(|(_, p)| p)
 }
 
 #[cfg(test)]

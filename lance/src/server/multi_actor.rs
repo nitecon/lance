@@ -3,7 +3,7 @@
 //! Implements N ingestion actors with client hash partitioning per Architecture §5.2.
 //! Uses crossbeam::ArrayQueue for lock-free MPMC communication per CodingGuidelines §3.3.
 
-use super::ingestion::IngestionRequest;
+use super::ingestion::{DataReplicationRequest, IngestionRequest};
 use super::writer::{TopicWriter, create_topic_writer, rotate_topic_segment};
 use crate::config::Config;
 use crate::topic::TopicRegistry;
@@ -61,6 +61,7 @@ impl MultiActorIngestion {
         config: Config,
         topic_registry: Arc<TopicRegistry>,
         queue_capacity: usize,
+        replication_tx: Option<tokio::sync::mpsc::Sender<DataReplicationRequest>>,
     ) -> Result<Self> {
         let actor_count = config.ingestion.actor_count.max(1);
         let pin_cores = &config.ingestion.pin_cores;
@@ -83,6 +84,8 @@ impl MultiActorIngestion {
             let config_clone = config.clone();
             let registry_clone = Arc::clone(&topic_registry);
             let pin_core = pin_cores.get(actor_id).copied();
+
+            let repl_tx_clone = replication_tx.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("ingestion-{}", actor_id))
@@ -107,7 +110,13 @@ impl MultiActorIngestion {
                         }
                     }
 
-                    run_ingestion_actor_sync(actor_id, config_clone, queue, registry_clone);
+                    run_ingestion_actor_sync(
+                        actor_id,
+                        config_clone,
+                        queue,
+                        registry_clone,
+                        repl_tx_clone,
+                    );
                 })
                 .map_err(|e| LanceError::Protocol(format!("Failed to spawn actor: {}", e)))?;
 
@@ -181,6 +190,7 @@ fn run_ingestion_actor_sync(
     config: Config,
     queue: Arc<ArrayQueue<IngestionRequest>>,
     topic_registry: Arc<TopicRegistry>,
+    replication_tx: Option<tokio::sync::mpsc::Sender<DataReplicationRequest>>,
 ) {
     let mut topic_writers: HashMap<u32, TopicWriter> = HashMap::new();
 
@@ -195,18 +205,25 @@ fn run_ingestion_actor_sync(
         match queue.pop() {
             Some(request) => {
                 let topic_id = request.topic_id;
+                let payload = request.payload.clone();
 
-                if let Err(e) =
-                    process_request_sync(&config, &topic_registry, &mut topic_writers, request)
-                {
-                    warn!(
-                        target: "lance::ingestion",
-                        actor_id,
-                        topic_id,
-                        error = %e,
-                        "Failed to process ingestion request"
-                    );
-                    topic_writers.remove(&topic_id);
+                match process_request_sync(&config, &topic_registry, &mut topic_writers, request) {
+                    Ok(()) => {
+                        // After successful local write, queue for replication
+                        if let Some(ref tx) = replication_tx {
+                            let _ = tx.try_send(DataReplicationRequest { topic_id, payload });
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            target: "lance::ingestion",
+                            actor_id,
+                            topic_id,
+                            error = %e,
+                            "Failed to process ingestion request"
+                        );
+                        topic_writers.remove(&topic_id);
+                    },
                 }
             },
             None => {

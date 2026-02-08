@@ -51,7 +51,8 @@ use bytes::{Bytes, BytesMut};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::interval;
 
-use crate::client::{ClientConfig, LanceClient};
+use crate::client::LanceClient;
+use crate::connection::ReconnectingClient;
 use crate::error::{ClientError, Result};
 
 /// Configuration for the producer
@@ -228,9 +229,14 @@ pub struct MetricsSnapshot {
     pub buffer_size: u64,
 }
 
-/// High-level producer with batching and async send
+/// High-level producer with batching and async send.
+///
+/// The producer automatically reconnects on transient failures (connection
+/// drops, FORWARD_FAILED during leader elections, timeouts) with exponential
+/// backoff and DNS re-resolution. Callers never need to handle reconnection
+/// logic — just call `send()` and the library takes care of the rest.
 pub struct Producer {
-    client: Arc<Mutex<LanceClient>>,
+    client: Arc<Mutex<ReconnectingClient>>,
     config: ProducerConfig,
     batches: Arc<RwLock<HashMap<u32, RecordBatch>>>,
     metrics: Arc<ProducerMetrics>,
@@ -245,16 +251,40 @@ impl Producer {
     /// The address can be either an IP:port (e.g., "127.0.0.1:1992") or
     /// a hostname:port (e.g., "lance.example.com:1992"). DNS resolution
     /// is performed automatically for hostnames.
+    ///
+    /// The producer uses automatic reconnection with exponential backoff.
+    /// Transient failures (connection drops, FORWARD_FAILED, timeouts) are
+    /// retried transparently. DNS is re-resolved on each reconnect so that
+    /// load-balanced endpoints route to healthy nodes.
     pub async fn connect(addr: &str, config: ProducerConfig) -> Result<Self> {
-        let mut client_config = ClientConfig::new(addr);
-        client_config.connect_timeout = config.connect_timeout;
+        let rc = ReconnectingClient::connect(addr)
+            .await?
+            .with_unlimited_retries()
+            .with_base_delay(Duration::from_millis(500))
+            .with_max_delay(Duration::from_secs(30));
 
-        let client = LanceClient::connect(client_config).await?;
-        Self::from_client(client, config).await
+        Self::from_reconnecting_client(rc, config).await
     }
 
-    /// Create a producer from an existing client connection
-    pub async fn from_client(client: LanceClient, config: ProducerConfig) -> Result<Self> {
+    /// Create a producer from an existing client connection.
+    ///
+    /// The `addr` is stored for DNS re-resolution on reconnect. If you
+    /// don't need auto-reconnect, pass the same address used to create
+    /// the client.
+    pub async fn from_client(
+        client: LanceClient,
+        addr: &str,
+        config: ProducerConfig,
+    ) -> Result<Self> {
+        let rc = ReconnectingClient::from_existing(client, addr);
+        Self::from_reconnecting_client(rc, config).await
+    }
+
+    /// Create a producer from a ReconnectingClient (internal constructor)
+    async fn from_reconnecting_client(
+        client: ReconnectingClient,
+        config: ProducerConfig,
+    ) -> Result<Self> {
         let client = Arc::new(Mutex::new(client));
         let batches = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(ProducerMetrics::default());
@@ -281,13 +311,19 @@ impl Producer {
                             break;
                         }
                         // Check for batches that should be sent due to linger timeout
-                        if Self::flush_expired_batches(
+                        // Auto-reconnect is handled inside send_batch_static
+                        match Self::flush_expired_batches(
                             &client_clone,
                             &batches_clone,
                             &metrics_clone,
                             linger_ms,
-                        ).await.is_err() {
-                            healthy_clone.store(false, Ordering::SeqCst);
+                        ).await {
+                            Ok(()) => {
+                                healthy_clone.store(true, Ordering::SeqCst);
+                            }
+                            Err(_) => {
+                                healthy_clone.store(false, Ordering::SeqCst);
+                            }
                         }
                     }
                     Some(ack_tx) = flush_rx.recv() => {
@@ -297,6 +333,9 @@ impl Producer {
                             &batches_clone,
                             &metrics_clone,
                         ).await;
+                        if result.is_ok() {
+                            healthy_clone.store(true, Ordering::SeqCst);
+                        }
                         let _ = ack_tx.send(result);
                     }
                 }
@@ -318,11 +357,11 @@ impl Producer {
     ///
     /// This method buffers the record and returns a future that resolves
     /// when the record has been acknowledged by the server.
+    ///
+    /// On transient failures (connection drops, leader elections), the
+    /// producer automatically reconnects and retries. This method only
+    /// returns an error for non-retryable failures or buffer overflow.
     pub async fn send(&self, topic_id: u32, data: &[u8]) -> Result<SendAck> {
-        if !self.connection_healthy.load(Ordering::SeqCst) {
-            return Err(ClientError::ConnectionClosed);
-        }
-
         let (ack_tx, ack_rx) = oneshot::channel();
 
         // Check buffer memory limit
@@ -356,13 +395,8 @@ impl Producer {
     /// Send a record without waiting for acknowledgment
     ///
     /// Returns immediately after buffering. Use `flush()` to ensure delivery.
-    /// **Note**: If the connection dies, this method will return
-    /// `Err(ClientError::ConnectionClosed)`. Check `is_healthy()` for status.
+    /// On transient failures, the producer auto-reconnects in the background.
     pub async fn send_async(&self, topic_id: u32, data: &[u8]) -> Result<()> {
-        if !self.connection_healthy.load(Ordering::SeqCst) {
-            return Err(ClientError::ConnectionClosed);
-        }
-
         let (ack_tx, _ack_rx) = oneshot::channel();
 
         // Check buffer memory limit
@@ -479,7 +513,7 @@ impl Producer {
         Ok(())
     }
 
-    /// Send a batch to the server
+    /// Send a batch to the server with automatic retry on transient errors
     async fn send_batch(&self, batch: RecordBatch) -> Result<()> {
         let topic_id = batch.topic_id;
         let record_count = batch.record_count;
@@ -487,12 +521,44 @@ impl Producer {
         let ack_txs = batch.ack_txs;
         let data = batch.data.freeze();
 
-        // Send to server
-        let result = {
-            let mut client = self.client.lock().await;
-            client
-                .send_ingest_to_topic_sync(topic_id, data.clone(), record_count as u32, None)
-                .await
+        // Retry loop for transient errors (FORWARD_FAILED, connection drops, etc.)
+        const MAX_RETRIES: u32 = 30;
+        let mut attempt = 0u32;
+        let mut backoff = Duration::from_millis(500);
+        const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+        let result = loop {
+            let send_result = {
+                let mut rc = self.client.lock().await;
+                match rc.client().await {
+                    Ok(c) => {
+                        c.send_ingest_to_topic_sync(
+                            topic_id,
+                            data.clone(),
+                            record_count as u32,
+                            None,
+                        )
+                        .await
+                    },
+                    Err(e) => Err(e),
+                }
+            };
+
+            match &send_result {
+                Ok(_) => break send_result,
+                Err(e) if e.is_retryable() && attempt < MAX_RETRIES => {
+                    attempt += 1;
+                    self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                    // Mark connection as failed so next client() call reconnects
+                    {
+                        let mut rc = self.client.lock().await;
+                        rc.mark_failed();
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                },
+                _ => break send_result,
+            }
         };
 
         // Update metrics
@@ -509,6 +575,7 @@ impl Producer {
                     .bytes_sent
                     .fetch_add(byte_count as u64, Ordering::Relaxed);
                 self.metrics.batches_sent.fetch_add(1, Ordering::Relaxed);
+                self.connection_healthy.store(true, Ordering::SeqCst);
 
                 // Notify all senders
                 let ack = SendAck {
@@ -538,7 +605,7 @@ impl Producer {
 
     /// Flush expired batches (called by background task)
     async fn flush_expired_batches(
-        client: &Arc<Mutex<LanceClient>>,
+        client: &Arc<Mutex<ReconnectingClient>>,
         batches: &Arc<RwLock<HashMap<u32, RecordBatch>>>,
         metrics: &Arc<ProducerMetrics>,
         linger_ms: u64,
@@ -577,7 +644,7 @@ impl Producer {
 
     /// Flush all batches (called by background task)
     async fn flush_all_batches(
-        client: &Arc<Mutex<LanceClient>>,
+        client: &Arc<Mutex<ReconnectingClient>>,
         batches: &Arc<RwLock<HashMap<u32, RecordBatch>>>,
         metrics: &Arc<ProducerMetrics>,
     ) -> Result<()> {
@@ -597,9 +664,10 @@ impl Producer {
         Ok(())
     }
 
-    /// Static version of send_batch for use in background tasks
+    /// Static version of send_batch for use in background tasks.
+    /// Includes retry loop with auto-reconnect for transient errors.
     async fn send_batch_static(
-        client: &Arc<Mutex<LanceClient>>,
+        client: &Arc<Mutex<ReconnectingClient>>,
         metrics: &Arc<ProducerMetrics>,
         batch: RecordBatch,
     ) -> Result<()> {
@@ -609,12 +677,43 @@ impl Producer {
         let ack_txs = batch.ack_txs;
         let data = batch.data.freeze();
 
-        // Send to server
-        let result = {
-            let mut client_guard = client.lock().await;
-            client_guard
-                .send_ingest_to_topic_sync(topic_id, data.clone(), record_count as u32, None)
-                .await
+        // Retry loop for transient errors
+        const MAX_RETRIES: u32 = 30;
+        let mut attempt = 0u32;
+        let mut backoff = Duration::from_millis(500);
+        const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+        let result = loop {
+            let send_result = {
+                let mut rc = client.lock().await;
+                match rc.client().await {
+                    Ok(c) => {
+                        c.send_ingest_to_topic_sync(
+                            topic_id,
+                            data.clone(),
+                            record_count as u32,
+                            None,
+                        )
+                        .await
+                    },
+                    Err(e) => Err(e),
+                }
+            };
+
+            match &send_result {
+                Ok(_) => break send_result,
+                Err(e) if e.is_retryable() && attempt < MAX_RETRIES => {
+                    attempt += 1;
+                    metrics.errors.fetch_add(1, Ordering::Relaxed);
+                    {
+                        let mut rc = client.lock().await;
+                        rc.mark_failed();
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                },
+                _ => break send_result,
+            }
         };
 
         // Update metrics

@@ -15,6 +15,7 @@
       <sourceFolder url="file://$MODULE_DIR$/lnc-replication/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/lnc/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lnc-chaos/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

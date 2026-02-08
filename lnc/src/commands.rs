@@ -414,7 +414,7 @@ pub async fn fetch_topic(
         .with_max_fetch_bytes(max_bytes)
         .with_start_position(SeekPosition::Offset(offset));
 
-    let mut consumer = Consumer::new(client, config);
+    let mut consumer = Consumer::new(client, server_addr, config);
 
     println!("Fetching from topic {} at offset {}", topic_id, offset);
     println!("Max bytes: {}", max_bytes);
@@ -558,7 +558,7 @@ pub async fn consume_topic(
         .with_max_fetch_bytes(64 * 1024)
         .with_start_position(start_position);
 
-    let mut consumer = Consumer::new(client, config);
+    let mut consumer = Consumer::new(client, server_addr, config);
 
     // Phase 2: Display startup info
     println!(

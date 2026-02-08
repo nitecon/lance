@@ -16,7 +16,6 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,8 +25,8 @@ use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 use lnc_client::{
-    ClientConfig, FetchResult, LanceClient, Producer, ProducerConfig, RecordIterator, RecordType,
-    encode_record,
+    ClientConfig, Consumer, ConsumerConfig, LanceClient, PollResult, Producer, ProducerConfig,
+    RecordIterator, RecordType, encode_record,
 };
 
 /// LANCE Chaos Testing Tool — validates data integrity during rolling restarts
@@ -84,7 +83,6 @@ struct Stats {
     consumer_reconnects: AtomicU64,
     last_produced_seq: AtomicU64,
     last_consumed_seq: AtomicU64,
-    queue_depth: AtomicU64,
     running: AtomicBool,
 }
 
@@ -103,7 +101,6 @@ impl Stats {
             consumer_reconnects: AtomicU64::new(0),
             last_produced_seq: AtomicU64::new(0),
             last_consumed_seq: AtomicU64::new(0),
-            queue_depth: AtomicU64::new(0),
             running: AtomicBool::new(true),
         }
     }
@@ -137,18 +134,6 @@ fn decode_message(data: &[u8]) -> Option<(u64, u64)> {
         data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
     ]);
     Some((seq, ts))
-}
-
-/// Connect a LanceClient with retry
-async fn connect_client(endpoint: &str) -> Option<LanceClient> {
-    let config: ClientConfig = ClientConfig::new(endpoint);
-    match LanceClient::connect(config).await {
-        Ok(c) => Some(c),
-        Err(e) => {
-            error!("Failed to connect to {}: {}", endpoint, e);
-            None
-        },
-    }
 }
 
 /// Resolve or create the topic, returning the topic_id.
@@ -213,13 +198,8 @@ async fn resolve_topic(endpoint: &str, topic_name: &str, clean: bool) -> Result<
     }
 }
 
-/// Max local queue size to prevent OOM (messages, not bytes)
-const MAX_QUEUE_DEPTH: usize = 500_000;
-
-/// Producer task: generates messages at a constant rate into a local queue,
-/// then burst-drains the queue to the server whenever a connection is available.
-/// During server downtime, messages accumulate in the queue and are sent in a
-/// burst once the connection is re-established.
+/// Producer task: connects once and sends messages in a loop.
+/// The Producer library handles reconnection, backoff, and retry internally.
 async fn producer_task(args: Args, topic_id: u32, stats: Arc<Stats>, ready: Arc<Notify>) {
     let msgs_per_sec = args.rate.max(1) / 60;
     let interval_us = if msgs_per_sec > 0 {
@@ -236,158 +216,64 @@ async fn producer_task(args: Args, topic_id: u32, stats: Arc<Stats>, ready: Arc<
         interval_us
     );
 
+    let config = ProducerConfig::new()
+        .with_batch_size(32 * 1024)
+        .with_linger_ms(1)
+        .with_request_timeout(Duration::from_secs(10));
+
+    // Connect — library retries internally on transient failures
+    let producer = loop {
+        match Producer::connect(&args.endpoint, config.clone()).await {
+            Ok(p) => {
+                info!("Producer connected");
+                break p;
+            },
+            Err(e) => {
+                error!("Producer connect failed: {}, retrying...", e);
+                stats.producer_reconnects.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            },
+        }
+    };
+
     let mut seq: u64 = 1;
-    let mut queue: VecDeque<bytes::Bytes> = VecDeque::new();
-    let mut producer: Option<Producer> = None;
-    let mut backoff_ms: u64 = 1000;
-    const MAX_BACKOFF_MS: u64 = 30_000;
     let mut ticker = tokio::time::interval(Duration::from_micros(interval_us));
 
     // Signal consumer we're starting
     ready.notify_one();
 
     while stats.running.load(Ordering::Relaxed) {
-        // 1. Generate one message per tick (constant rate regardless of connection)
         ticker.tick().await;
 
-        if queue.len() < MAX_QUEUE_DEPTH {
-            let payload = encode_message(seq, args.payload_size);
-            let msg = encode_record(RecordType::Data, &payload);
-            queue.push_back(msg);
-            stats.last_produced_seq.store(seq, Ordering::Relaxed);
-            seq += 1;
-        } else {
-            warn!(queue_depth = queue.len(), "Queue full, dropping message");
-            stats.producer_errors.fetch_add(1, Ordering::Relaxed);
-        }
+        let payload = encode_message(seq, args.payload_size);
+        let msg = encode_record(RecordType::Data, &payload);
 
-        // 2. Check connection health
-        if let Some(ref p) = producer {
-            if !p.is_healthy() {
-                warn!(
-                    queue_depth = queue.len(),
-                    "Producer connection unhealthy, will reconnect"
-                );
-                if let Some(p) = producer.take() {
-                    let _ = p.close().await;
-                }
-                stats.producer_reconnects.fetch_add(1, Ordering::Relaxed);
-                backoff_ms = 1000;
-            }
-        }
-
-        // 3. Reconnect if needed (quick attempt, don't block message generation)
-        if producer.is_none() && !queue.is_empty() {
-            let config = ProducerConfig::new()
-                .with_batch_size(32 * 1024)
-                .with_linger_ms(1)
-                .with_request_timeout(Duration::from_secs(10));
-
-            match tokio::time::timeout(
-                Duration::from_millis(500),
-                Producer::connect(&args.endpoint, config),
-            )
-            .await
-            {
-                Ok(Ok(p)) => {
-                    info!(
-                        queue_depth = queue.len(),
-                        "Producer connected, draining queue"
-                    );
-                    producer = Some(p);
-                    backoff_ms = 1000;
-                },
-                Ok(Err(e)) => {
-                    error!(backoff_ms, "Producer connect failed: {}", e);
-                    stats.producer_reconnects.fetch_add(1, Ordering::Relaxed);
-                    backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-                },
-                Err(_) => {
-                    // Timeout — will retry next tick
-                    stats.producer_reconnects.fetch_add(1, Ordering::Relaxed);
-                    backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-                },
-            }
-        }
-
-        // 4. Burst-drain the queue (send waits for ACK to guarantee no duplicates)
-        if let Some(ref p) = producer {
-            while let Some(msg) = queue.front() {
-                match p.send(topic_id, msg).await {
-                    Ok(_ack) => {
-                        queue.pop_front();
-                        stats.produced.fetch_add(1, Ordering::Relaxed);
-                    },
-                    Err(e) => {
-                        warn!(
-                            queue_depth = queue.len(),
-                            "Producer send error during drain: {}", e
-                        );
-                        stats.producer_errors.fetch_add(1, Ordering::Relaxed);
-                        // Drop producer to force reconnect on next tick
-                        if let Some(p) = producer.take() {
-                            let _ = p.close().await;
-                        }
-                        stats.producer_reconnects.fetch_add(1, Ordering::Relaxed);
-                        backoff_ms = 1000;
-                        break;
-                    },
-                }
-            }
-        }
-
-        // 5. Update queue depth stat
-        stats
-            .queue_depth
-            .store(queue.len() as u64, Ordering::Relaxed);
-    }
-
-    // Graceful shutdown: try to drain remaining queue
-    if !queue.is_empty() {
-        if let Some(ref p) = producer {
-            info!(remaining = queue.len(), "Draining remaining queue...");
-            while let Some(msg) = queue.front() {
-                if p.send(topic_id, msg).await.is_ok() {
-                    queue.pop_front();
-                    stats.produced.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    break;
-                }
-            }
-        }
-        if !queue.is_empty() {
-            warn!(lost = queue.len(), "Queue not fully drained on shutdown");
+        // send() blocks until ACK — library auto-reconnects on transient errors
+        match producer.send(topic_id, &msg).await {
+            Ok(_ack) => {
+                stats.produced.fetch_add(1, Ordering::Relaxed);
+                stats.last_produced_seq.store(seq, Ordering::Relaxed);
+                seq += 1;
+            },
+            Err(e) => {
+                // Non-retryable error after library exhausted retries
+                warn!(seq, "Producer send failed (retries exhausted): {}", e);
+                stats.producer_errors.fetch_add(1, Ordering::Relaxed);
+            },
         }
     }
 
-    if let Some(p) = producer.take() {
-        info!("Producer flushing and closing...");
-        let _ = p.close().await;
-    }
+    info!("Producer flushing and closing...");
+    let _ = producer.close().await;
     info!(
         total_produced = stats.produced.load(Ordering::Relaxed),
-        total_generated = seq - 1,
-        queue_remaining = queue.len(),
+        last_seq = seq - 1,
         "Producer stopped"
     );
 }
 
-/// Attempt a single fetch from the client, returning Ok(result) or Err on connection failure
-async fn do_fetch(
-    client: &mut LanceClient,
-    topic_id: u32,
-    offset: u64,
-    max_bytes: u32,
-) -> Result<FetchResult, String> {
-    client
-        .fetch(topic_id, offset, max_bytes)
-        .await
-        .map_err(|e| format!("{e}"))
-}
-
 /// Process fetched records, verifying sequential ordering.
-/// Returns the updated expected_seq.
-fn process_records(result: &FetchResult, expected_seq: &mut u64, stats: &Stats) {
+fn process_records(result: &PollResult, expected_seq: &mut u64, stats: &Stats) {
     for record_result in RecordIterator::new(result.data.clone()) {
         let record = match record_result {
             Ok(r) => r,
@@ -437,134 +323,84 @@ fn process_records(result: &FetchResult, expected_seq: &mut u64, stats: &Stats) 
     }
 }
 
-/// Seek to the end of existing topic data, returning the tail offset.
-/// This skips any old data from previous runs so verification only covers
-/// messages produced during this session.
-async fn seek_to_end(client: &mut LanceClient, topic_id: u32, max_bytes: u32) -> u64 {
-    let mut offset: u64 = 0;
-    let mut fetches: u64 = 0;
-    loop {
-        match client.fetch(topic_id, offset, max_bytes).await {
-            Ok(result) => {
-                if result.data.is_empty() || result.next_offset == offset {
-                    break;
-                }
-                offset = result.next_offset;
-                fetches += 1;
-                if fetches % 100 == 0 {
-                    info!(offset, fetches, "Still seeking to end of existing data...");
-                }
-            },
-            Err(e) => {
-                warn!(
-                    offset,
-                    "Error during seek-to-end: {}, using offset so far", e
-                );
-                break;
-            },
-        }
-    }
-    if fetches > 0 {
-        info!(
-            offset,
-            fetches, "Skipped existing data, starting verification from tail"
-        );
-    }
-    offset
-}
-
-/// Consumer task: reads messages and verifies sequential ordering
+/// Consumer task: connects once and polls in a loop, verifying ordering.
+/// The Consumer library handles reconnection, backoff, and retry internally.
 async fn consumer_task(args: Args, topic_id: u32, stats: Arc<Stats>, ready: Arc<Notify>) {
     // Wait for producer to start
     ready.notified().await;
     // Small delay to let some messages accumulate
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // 0 = sentinel meaning "not yet initialized"; set from first parsed record
-    let mut expected_seq: u64 = 0;
-    let mut current_offset: u64 = 0;
-    let mut client: Option<LanceClient> = None;
-    let mut backoff_ms: u64 = 1000;
-    const MAX_BACKOFF_MS: u64 = 30_000;
-    let mut seeked = false;
+    let config = ConsumerConfig::new(topic_id).with_max_fetch_bytes(args.max_fetch_bytes);
 
-    while stats.running.load(Ordering::Relaxed) {
-        // Ensure we have a connection
-        if client.is_none() {
-            info!(endpoint = %args.endpoint, "Consumer connecting...");
-            match connect_client(&args.endpoint).await {
-                Some(c) => {
-                    info!(
-                        offset = current_offset,
-                        "Consumer connected, resuming from offset"
-                    );
-                    client = Some(c);
-                    backoff_ms = 1000;
-                },
-                None => {
-                    stats.consumer_reconnects.fetch_add(1, Ordering::Relaxed);
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-                    continue;
-                },
-            }
-        }
-
-        // Take the client out so we own it (avoids borrow issues)
-        let mut c = match client.take() {
-            Some(c) => c,
-            None => continue,
-        };
-
-        // On first connection, seek past any existing data from previous runs
-        if !seeked {
-            info!("Consumer seeking past existing data...");
-            current_offset = seek_to_end(&mut c, topic_id, args.max_fetch_bytes).await;
-            seeked = true;
-            info!(
-                offset = current_offset,
-                "Consumer ready, verifying new messages only"
-            );
-            client = Some(c);
-            continue;
-        }
-
-        match do_fetch(&mut c, topic_id, current_offset, args.max_fetch_bytes).await {
-            Ok(result) => {
-                if !result.data.is_empty() && result.next_offset != current_offset {
-                    process_records(&result, &mut expected_seq, &stats);
-                    current_offset = result.next_offset;
-                } else {
-                    // No new data, poll again shortly
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                // Success — reset backoff and put client back
-                backoff_ms = 1000;
-                client = Some(c);
+    // Connect — library retries internally on transient failures
+    let mut consumer = loop {
+        match Consumer::connect(&args.endpoint, config.clone()).await {
+            Ok(c) => {
+                info!("Consumer connected");
+                break c;
             },
             Err(e) => {
+                error!("Consumer connect failed: {}, retrying...", e);
+                stats.consumer_reconnects.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            },
+        }
+    };
+
+    // Seek past existing data so we only verify new messages
+    info!("Consumer seeking past existing data...");
+    let mut seek_fetches: u64 = 0;
+    loop {
+        match consumer.poll().await {
+            Ok(Some(result)) if !result.end_of_stream => {
+                seek_fetches += 1;
+                if seek_fetches % 100 == 0 {
+                    info!(
+                        offset = consumer.current_offset(),
+                        seek_fetches, "Still seeking to end of existing data..."
+                    );
+                }
+            },
+            _ => break,
+        }
+    }
+    if seek_fetches > 0 {
+        info!(
+            offset = consumer.current_offset(),
+            seek_fetches, "Skipped existing data, starting verification from tail"
+        );
+    }
+    info!(
+        offset = consumer.current_offset(),
+        "Consumer ready, verifying new messages only"
+    );
+
+    // 0 = sentinel meaning "not yet initialized"; set from first parsed record
+    let mut expected_seq: u64 = 0;
+
+    while stats.running.load(Ordering::Relaxed) {
+        // poll() auto-reconnects on transient errors
+        match consumer.poll().await {
+            Ok(Some(result)) => {
+                process_records(&result, &mut expected_seq, &stats);
+            },
+            Ok(None) => {
+                // No new data, poll again shortly
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            },
+            Err(e) => {
+                // Non-retryable error after library exhausted retries
                 warn!(
-                    offset = current_offset,
-                    backoff_ms, "Consumer fetch error: {}", e
+                    offset = consumer.current_offset(),
+                    "Consumer poll failed (retries exhausted): {}", e
                 );
                 stats.consumer_errors.fetch_add(1, Ordering::Relaxed);
-                stats.consumer_reconnects.fetch_add(1, Ordering::Relaxed);
-                // Reset seek state — after a server restart, byte offsets may
-                // shift due to unflushed write loss, so we must re-seek to end.
-                seeked = false;
-                expected_seq = 0;
-                current_offset = 0;
-                // Drop c (don't put it back) to force reconnect
-                drop(c);
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                tokio::time::sleep(Duration::from_secs(1)).await;
             },
         }
     }
 
-    if let Some(c) = client {
-        let _ = c.close().await;
-    }
     let final_seq = if expected_seq > 0 {
         expected_seq - 1
     } else {
@@ -572,7 +408,7 @@ async fn consumer_task(args: Args, topic_id: u32, stats: Arc<Stats>, ready: Arc<
     };
     info!(
         last_consumed = final_seq,
-        offset = current_offset,
+        offset = consumer.current_offset(),
         "Consumer stopped"
     );
 }
@@ -615,12 +451,10 @@ async fn reporter_task(args: Args, stats: Arc<Stats>) {
 
         info!("╔══════════════════════════════════════════════════════════════╗");
         info!("║ [{status}] t={tick} elapsed={elapsed:.1}s");
-        let q_depth = stats.queue_depth.load(Ordering::Relaxed);
-
         info!(
             "║ produced={produced} ({p_rate:.0}/s) | consumed={consumed} ({c_rate:.0}/s) | lag={lag}"
         );
-        info!("║ last_p_seq={last_p_seq} | last_c_seq={last_c_seq} | queue={q_depth}");
+        info!("║ last_p_seq={last_p_seq} | last_c_seq={last_c_seq}");
         info!("║ gaps={gaps} | dups={dups} | ooo={ooo}");
         info!(
             "║ p_err={p_err} c_err={c_err} parse_err={parse_err} | p_reconn={p_reconn} c_reconn={c_reconn}"
@@ -729,10 +563,8 @@ async fn main() {
     info!("╔══════════════════════════════════════════════════════════════╗");
     info!("║                    FINAL REPORT                            ║");
     info!("╠══════════════════════════════════════════════════════════════╣");
-    let q_depth = stats.queue_depth.load(Ordering::Relaxed);
     info!("║ Total produced:  {produced}");
     info!("║ Total consumed:  {consumed}");
-    info!("║ Queue remaining: {q_depth}");
     info!("║ Gaps detected:   {gaps}");
     info!("║ Duplicates:      {dups}");
     info!(

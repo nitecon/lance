@@ -6,8 +6,10 @@
 //! - Continuous polling
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::client::LanceClient;
+use crate::connection::ReconnectingClient;
 use crate::error::{ClientError, Result};
 use crate::offset::OffsetStore;
 
@@ -85,24 +87,20 @@ impl PollResult {
     }
 }
 
-/// A consumer for reading records from a LANCE topic stream
+/// A consumer for reading records from a LANCE topic stream.
 ///
-/// The consumer tracks its current position and provides methods to:
-/// - Poll for new records
-/// - Seek to specific offsets (rewind/fast-forward)
-/// - Query current position
+/// The consumer automatically reconnects on transient failures (connection
+/// drops, timeouts, server errors) with exponential backoff and DNS
+/// re-resolution. The current offset is preserved across reconnections
+/// so no data is lost.
 ///
 /// # Example
 ///
 /// ```text
-/// let client = LanceClient::connect_to("127.0.0.1:1992").await?;
 /// let config = ConsumerConfig::new(topic_id);
-/// let mut consumer = Consumer::new(client, config);
+/// let mut consumer = Consumer::connect("lance.example.com:1992", config).await?;
 ///
-/// // Rewind to beginning
-/// consumer.seek(SeekPosition::Beginning).await?;
-///
-/// // Poll for records
+/// // Poll for records — auto-reconnects on failure
 /// while let Some(result) = consumer.poll().await? {
 ///     process_data(&result.data);
 ///     if result.end_of_stream {
@@ -111,7 +109,7 @@ impl PollResult {
 /// }
 /// ```
 pub struct Consumer {
-    client: LanceClient,
+    client: ReconnectingClient,
     config: ConsumerConfig,
     current_offset: u64,
     /// Cached end offset for SeekPosition::End
@@ -123,13 +121,44 @@ pub struct Consumer {
 }
 
 impl Consumer {
-    /// Create a new consumer with the given client and configuration
-    pub fn new(client: LanceClient, config: ConsumerConfig) -> Self {
-        Self::with_consumer_id(client, config, 0)
+    /// Connect to a LANCE server and create a consumer with auto-reconnect.
+    ///
+    /// The address can be either an IP:port or hostname:port. DNS is
+    /// re-resolved on each reconnect for load-balanced endpoints.
+    pub async fn connect(addr: &str, config: ConsumerConfig) -> Result<Self> {
+        let rc = ReconnectingClient::connect(addr)
+            .await?
+            .with_unlimited_retries()
+            .with_base_delay(Duration::from_millis(500))
+            .with_max_delay(Duration::from_secs(30));
+
+        Ok(Self::from_reconnecting_client(rc, config, 0))
+    }
+
+    /// Create a new consumer with the given client and configuration.
+    ///
+    /// The `addr` is stored for DNS re-resolution on reconnect.
+    pub fn new(client: LanceClient, addr: &str, config: ConsumerConfig) -> Self {
+        Self::with_consumer_id(client, addr, config, 0)
     }
 
     /// Create a new consumer with a specific consumer ID
-    pub fn with_consumer_id(client: LanceClient, config: ConsumerConfig, consumer_id: u64) -> Self {
+    pub fn with_consumer_id(
+        client: LanceClient,
+        addr: &str,
+        config: ConsumerConfig,
+        consumer_id: u64,
+    ) -> Self {
+        let rc = ReconnectingClient::from_existing(client, addr);
+        Self::from_reconnecting_client(rc, config, consumer_id)
+    }
+
+    /// Internal constructor from a ReconnectingClient
+    fn from_reconnecting_client(
+        client: ReconnectingClient,
+        config: ConsumerConfig,
+        consumer_id: u64,
+    ) -> Self {
         let initial_offset = match config.start_position {
             SeekPosition::Beginning => 0,
             SeekPosition::Offset(offset) => offset,
@@ -153,6 +182,7 @@ impl Consumer {
     ///
     /// # Arguments
     /// * `client` - The LANCE client connection
+    /// * `addr` - Server address for reconnection
     /// * `config` - Consumer configuration
     /// * `consumer_id` - Unique identifier for this consumer instance
     /// * `offset_store` - The offset store for persistence
@@ -160,10 +190,11 @@ impl Consumer {
     /// # Example
     /// ```ignore
     /// let store = Arc::new(LockFileOffsetStore::open(path, "my-consumer")?);
-    /// let consumer = Consumer::with_offset_store(client, config, 12345, store)?;
+    /// let consumer = Consumer::with_offset_store(client, "lance:1992", config, 12345, store)?;
     /// ```
     pub fn with_offset_store(
         client: LanceClient,
+        addr: &str,
         config: ConsumerConfig,
         consumer_id: u64,
         offset_store: Arc<dyn OffsetStore>,
@@ -183,8 +214,9 @@ impl Consumer {
             }
         };
 
+        let rc = ReconnectingClient::from_existing(client, addr);
         Ok(Self {
-            client,
+            client: rc,
             config,
             current_offset: initial_offset,
             cached_end_offset: None,
@@ -194,15 +226,15 @@ impl Consumer {
     }
 
     /// Create a consumer starting from the beginning of the stream
-    pub fn from_beginning(client: LanceClient, topic_id: u32) -> Self {
-        Self::new(client, ConsumerConfig::new(topic_id))
+    pub fn from_beginning(client: LanceClient, addr: &str, topic_id: u32) -> Self {
+        Self::new(client, addr, ConsumerConfig::new(topic_id))
     }
 
     /// Create a consumer starting from a specific offset
-    pub fn from_offset(client: LanceClient, topic_id: u32, offset: u64) -> Self {
+    pub fn from_offset(client: LanceClient, addr: &str, topic_id: u32, offset: u64) -> Self {
         let config =
             ConsumerConfig::new(topic_id).with_start_position(SeekPosition::Offset(offset));
-        Self::new(client, config)
+        Self::new(client, addr, config)
     }
 
     /// Get the current offset position
@@ -246,7 +278,6 @@ impl Consumer {
                 Ok(offset)
             },
             SeekPosition::End => {
-                // Fetch with offset u64::MAX to discover end
                 let end_offset = self.discover_end_offset().await?;
                 self.current_offset = end_offset;
                 Ok(end_offset)
@@ -282,7 +313,9 @@ impl Consumer {
     /// Returns `Ok(Some(result))` if data was fetched, or `Ok(None)` if
     /// there was no new data available (end of stream reached).
     ///
-    /// The consumer's offset is automatically advanced after each successful poll.
+    /// The consumer's offset is automatically advanced after each successful
+    /// poll. On transient errors, the consumer auto-reconnects and retries
+    /// from the same offset.
     pub async fn poll(&mut self) -> Result<Option<PollResult>> {
         // Handle SeekPosition::End that hasn't been resolved yet
         if self.current_offset == u64::MAX {
@@ -290,14 +323,7 @@ impl Consumer {
             self.current_offset = end_offset;
         }
 
-        let fetch_result = self
-            .client
-            .fetch(
-                self.config.topic_id,
-                self.current_offset,
-                self.config.max_fetch_bytes,
-            )
-            .await?;
+        let fetch_result = self.fetch_with_retry().await?;
 
         let end_of_stream =
             fetch_result.data.is_empty() || fetch_result.next_offset == self.current_offset;
@@ -331,14 +357,7 @@ impl Consumer {
             self.current_offset = end_offset;
         }
 
-        let fetch_result = self
-            .client
-            .fetch(
-                self.config.topic_id,
-                self.current_offset,
-                self.config.max_fetch_bytes,
-            )
-            .await?;
+        let fetch_result = self.fetch_with_retry().await?;
 
         let end_of_stream =
             fetch_result.data.is_empty() || fetch_result.next_offset == self.current_offset;
@@ -359,6 +378,40 @@ impl Consumer {
         Ok(result)
     }
 
+    /// Fetch with automatic retry on transient errors.
+    /// Reconnects and retries from the same offset, preserving position.
+    async fn fetch_with_retry(&mut self) -> Result<crate::client::FetchResult> {
+        const MAX_RETRIES: u32 = 30;
+        let mut attempt = 0u32;
+        let mut backoff = Duration::from_millis(500);
+        const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+        loop {
+            let result = match self.client.client().await {
+                Ok(c) => {
+                    c.fetch(
+                        self.config.topic_id,
+                        self.current_offset,
+                        self.config.max_fetch_bytes,
+                    )
+                    .await
+                },
+                Err(e) => Err(e),
+            };
+
+            match &result {
+                Ok(_) => return result,
+                Err(e) if e.is_retryable() && attempt < MAX_RETRIES => {
+                    attempt += 1;
+                    self.client.mark_failed();
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                },
+                _ => return result,
+            }
+        }
+    }
+
     /// Discover the current end offset by fetching from a very high offset
     async fn discover_end_offset(&mut self) -> Result<u64> {
         // Use cached value if available
@@ -367,8 +420,8 @@ impl Consumer {
         }
 
         // Fetch from offset 0 to discover stream state
-        let fetch_result = self
-            .client
+        let c = self.client.client().await?;
+        let fetch_result = c
             .fetch(
                 self.config.topic_id,
                 0,
@@ -411,19 +464,9 @@ impl Consumer {
         self.offset_store.is_some()
     }
 
-    /// Get access to the underlying client
-    pub fn client(&self) -> &LanceClient {
-        &self.client
-    }
-
-    /// Get mutable access to the underlying client
-    pub fn client_mut(&mut self) -> &mut LanceClient {
+    /// Get mutable access to the underlying reconnecting client
+    pub fn reconnecting_client(&mut self) -> &mut ReconnectingClient {
         &mut self.client
-    }
-
-    /// Consume this consumer and return the underlying client
-    pub fn into_client(self) -> LanceClient {
-        self.client
     }
 }
 

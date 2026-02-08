@@ -571,6 +571,26 @@ impl ReconnectingClient {
         })
     }
 
+    /// Wrap an existing LanceClient with auto-reconnect support.
+    ///
+    /// The `addr` is used for DNS re-resolution on reconnect (important for
+    /// load-balanced endpoints). By default, retries are unlimited.
+    pub fn from_existing(client: LanceClient, addr: &str) -> Self {
+        let config = client.config().clone();
+        Self {
+            addr: addr.to_string(),
+            config,
+            tls_config: None,
+            client: Some(client),
+            reconnect_attempts: 0,
+            max_attempts: 0, // unlimited by default
+            base_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(30),
+            leader_addr: None,
+            follow_leader: true,
+        }
+    }
+
     /// Create a new reconnecting client with TLS
     ///
     /// The address can be either an IP:port (e.g., "127.0.0.1:1992") or
@@ -593,9 +613,27 @@ impl ReconnectingClient {
         })
     }
 
-    /// Set maximum reconnection attempts
+    /// Set maximum reconnection attempts (0 = unlimited)
     pub fn with_max_attempts(mut self, attempts: u32) -> Self {
         self.max_attempts = attempts;
+        self
+    }
+
+    /// Configure for unlimited reconnection attempts (never give up)
+    pub fn with_unlimited_retries(mut self) -> Self {
+        self.max_attempts = 0;
+        self
+    }
+
+    /// Set base delay for exponential backoff
+    pub fn with_base_delay(mut self, delay: Duration) -> Self {
+        self.base_delay = delay;
+        self
+    }
+
+    /// Set maximum delay for exponential backoff
+    pub fn with_max_delay(mut self, delay: Duration) -> Self {
+        self.max_delay = delay;
         self
     }
 
@@ -637,17 +675,24 @@ impl ReconnectingClient {
         self.client.as_mut().ok_or(ClientError::ConnectionClosed)
     }
 
-    /// Attempt to reconnect with exponential backoff
-    async fn reconnect(&mut self) -> Result<()> {
+    /// Attempt to reconnect with exponential backoff and DNS re-resolution.
+    /// On success, resets the reconnect attempt counter.
+    pub async fn reconnect(&mut self) -> Result<()> {
         let mut attempts = 0;
 
         loop {
             attempts += 1;
             self.reconnect_attempts += 1;
 
+            // Re-resolve DNS by connecting with the original address.
+            // This is critical for LB environments where DNS round-robin
+            // may route us to a different (healthy) node.
+            let mut config = self.config.clone();
+            config.addr = self.addr.clone();
+
             let result = match &self.tls_config {
-                Some(tls) => LanceClient::connect_tls(self.config.clone(), tls.clone()).await,
-                None => LanceClient::connect(self.config.clone()).await,
+                Some(tls) => LanceClient::connect_tls(config, tls.clone()).await,
+                None => LanceClient::connect(config).await,
             };
 
             match result {
@@ -670,7 +715,9 @@ impl ReconnectingClient {
         }
     }
 
-    /// Execute an operation with automatic reconnection on failure
+    /// Execute an operation with automatic reconnection on failure.
+    /// Retries on all retryable errors (connection failures, FORWARD_FAILED,
+    /// timeouts, backpressure, NOT_LEADER) with exponential backoff.
     pub async fn execute<F, T>(&mut self, op: F) -> Result<T>
     where
         F: Fn(
@@ -678,14 +725,23 @@ impl ReconnectingClient {
         )
             -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + '_>>,
     {
+        let mut attempts = 0u32;
         loop {
             let client = self.client().await?;
 
             match op(client).await {
                 Ok(result) => return Ok(result),
-                Err(ClientError::ConnectionClosed) | Err(ClientError::ConnectionFailed(_)) => {
+                Err(e) if e.is_retryable() => {
+                    attempts += 1;
+                    if self.max_attempts > 0 && attempts >= self.max_attempts {
+                        return Err(e);
+                    }
+                    // Mark connection as failed so next client() call reconnects
                     self.client = None;
-                    // Will reconnect on next iteration
+                    // Backoff before retry
+                    let delay = self.base_delay * 2u32.saturating_pow(attempts.saturating_sub(1));
+                    let delay = delay.min(self.max_delay);
+                    tokio::time::sleep(delay).await;
                 },
                 Err(e) => return Err(e),
             }

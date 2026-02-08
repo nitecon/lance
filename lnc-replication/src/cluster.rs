@@ -42,6 +42,11 @@ pub enum ClusterEvent {
     QuorumLost,
     /// Topic operation received from leader (for followers to apply)
     TopicOperation(crate::codec::TopicOperation),
+    /// Data received from leader for local segment write (follower replication)
+    DataReceived {
+        topic_id: u32,
+        payload: bytes::Bytes,
+    },
 }
 
 /// Cluster coordinator state
@@ -505,6 +510,96 @@ impl ClusterCoordinator {
                 ))
             }
         }
+    }
+
+    /// Replicate ingested data to followers (leader only, L2 async fire-and-forget).
+    ///
+    /// Encodes topic_id + payload into a LogEntry with EntryType::Data and
+    /// broadcasts via AppendEntries to all connected peers. Does not block
+    /// on follower ACKs — followers write to their local segments asynchronously.
+    pub async fn replicate_data(
+        &self,
+        topic_id: u32,
+        payload: bytes::Bytes,
+    ) -> Result<(), std::io::Error> {
+        // Only leader replicates data
+        if !self.is_leader() {
+            return Ok(());
+        }
+
+        // Encode topic_id as 4-byte LE prefix followed by raw payload
+        let mut data = bytes::BytesMut::with_capacity(4 + payload.len());
+        data.extend_from_slice(&topic_id.to_le_bytes());
+        data.extend_from_slice(&payload);
+
+        let term = {
+            let raft = self.raft.read().await;
+            raft.current_term()
+        };
+
+        let entry = crate::codec::LogEntry {
+            term,
+            index: 0,
+            hlc: lnc_core::HlcTimestamp::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+                0,
+            ),
+            entry_type: crate::codec::EntryType::Data,
+            data: data.freeze(),
+        };
+
+        let request = crate::codec::AppendEntriesRequest {
+            term,
+            leader_id: self.config.node_id,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: 0,
+            leader_hlc: entry.hlc,
+            entries: vec![entry],
+        };
+
+        let msg = ReplicationMessage::AppendEntriesRequest(request);
+
+        // Fire-and-forget broadcast to all peers (L2 async)
+        let results = self.peers.broadcast(&msg).await;
+
+        let success_count = results.iter().filter(|(_, r)| r.is_ok()).count();
+        let fail_count = results.len() - success_count;
+
+        if fail_count > 0 {
+            debug!(
+                target: "lance::cluster",
+                topic_id,
+                payload_len = payload.len(),
+                success_count,
+                fail_count,
+                "Data replication broadcast (partial failure)"
+            );
+        }
+
+        // Update last sync time
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_sync_time
+            .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Decode a data replication payload into (topic_id, payload).
+    /// Wire format: [topic_id: 4 bytes LE][payload bytes]
+    pub fn decode_data_entry(data: &[u8]) -> Option<(u32, bytes::Bytes)> {
+        if data.len() < 4 {
+            return None;
+        }
+        let topic_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let payload = bytes::Bytes::copy_from_slice(&data[4..]);
+        Some((topic_id, payload))
     }
 
     /// Initialize the cluster - discover peers and establish connections
@@ -1040,19 +1135,37 @@ async fn handle_peer_connection(
         // Process message and generate response
         let response = match msg {
             ReplicationMessage::AppendEntriesRequest(req) => {
-                // Extract topic operations from entries before processing
+                // Extract topic operations and data entries before processing
                 for entry in &req.entries {
-                    if entry.entry_type == crate::codec::EntryType::TopicOp {
-                        if let Some(op) = crate::codec::TopicOperation::from_bytes(&entry.data) {
-                            debug!(
-                                target: "lance::cluster",
-                                node_id,
-                                ?op,
-                                "Received topic operation from leader"
-                            );
-                            // Emit event for server to apply
-                            let _ = event_tx.send(ClusterEvent::TopicOperation(op));
-                        }
+                    match entry.entry_type {
+                        crate::codec::EntryType::TopicOp => {
+                            if let Some(op) = crate::codec::TopicOperation::from_bytes(&entry.data)
+                            {
+                                debug!(
+                                    target: "lance::cluster",
+                                    node_id,
+                                    ?op,
+                                    "Received topic operation from leader"
+                                );
+                                let _ = event_tx.send(ClusterEvent::TopicOperation(op));
+                            }
+                        },
+                        crate::codec::EntryType::Data => {
+                            if let Some((topic_id, payload)) =
+                                ClusterCoordinator::decode_data_entry(&entry.data)
+                            {
+                                debug!(
+                                    target: "lance::cluster",
+                                    node_id,
+                                    topic_id,
+                                    payload_len = payload.len(),
+                                    "Received data replication from leader"
+                                );
+                                let _ =
+                                    event_tx.send(ClusterEvent::DataReceived { topic_id, payload });
+                            }
+                        },
+                        _ => {},
                     }
                 }
 

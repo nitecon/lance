@@ -84,6 +84,28 @@ pub fn parse_not_leader_error(msg: &str) -> Option<Option<SocketAddr>> {
     Some(None)
 }
 
+impl ClientError {
+    /// Returns true if this error is transient and the operation should be retried
+    /// after reconnecting. Used by Producer and Consumer for automatic retry logic.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            // Connection-level failures — reconnect and retry
+            Self::ConnectionClosed | Self::ConnectionFailed(_) | Self::IoError(_) => true,
+            // Timeouts are transient — server might be busy during election
+            Self::Timeout => true,
+            // Backpressure — server wants us to slow down, retry after delay
+            Self::ServerBackpressure => true,
+            // NOT_LEADER — need to reconnect to a different node
+            Self::NotLeader { .. } => true,
+            // Server errors containing FORWARD_FAILED — leader unknown/unreachable
+            // during election, retry after reconnect to potentially different node
+            Self::ServerError(msg) => msg.contains("FORWARD_FAILED"),
+            // Non-retryable: ProtocolError, InvalidResponse, CrcMismatch, TlsError
+            _ => false,
+        }
+    }
+}
+
 impl std::error::Error for ClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

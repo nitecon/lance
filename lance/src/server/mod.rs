@@ -13,7 +13,7 @@ pub mod retention;
 mod writer;
 
 pub use connection::handle_connection;
-pub use ingestion::{IngestionRequest, run_ingestion_actor};
+pub use ingestion::{DataReplicationRequest, IngestionRequest, run_ingestion_actor};
 pub use multi_actor::{IngestionSender, MultiActorIngestion};
 pub use recovery::perform_startup_recovery;
 pub use retention::{RetentionServiceConfig, run_retention_service};
@@ -78,6 +78,20 @@ pub async fn run(
         config.ingestion.batch_capacity,
     )?);
 
+    // Create data replication channel (used to send post-write data to the
+    // replication task which broadcasts to followers via ClusterCoordinator).
+    // Only allocated when running in cluster mode; standalone gets None.
+    // The receiver is consumed below after the cluster coordinator is created.
+    let (data_repl_tx, data_repl_rx): (
+        Option<tokio::sync::mpsc::Sender<DataReplicationRequest>>,
+        Option<tokio::sync::mpsc::Receiver<DataReplicationRequest>>,
+    ) = if config.replication_mode().is_replicated() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<DataReplicationRequest>(8192);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     // Create ingestion system - multi-actor when actor_count > 1, single-actor otherwise
     let (ingestion_sender, ingestion_rx, multi_actor_system) = if config.ingestion.actor_count > 1 {
         // Multi-actor mode with crossbeam ArrayQueue (per Architecture §5.2)
@@ -85,6 +99,7 @@ pub async fn run(
             config.clone(),
             Arc::clone(&topic_registry),
             config.ingestion.channel_capacity,
+            data_repl_tx.clone(),
         )?;
         let sender = IngestionSender::Multi(multi.sender());
         (sender, None, Some(multi))
@@ -138,13 +153,17 @@ pub async fn run(
             coord_clone.run(shutdown_for_cluster).await;
         });
 
-        // Start cluster event handler for topic replication and leader changes
+        // Start cluster event handler for topic replication, data replication, and leader changes
         let mut event_rx = coordinator.subscribe();
         let event_registry = Arc::clone(&topic_registry);
+        let event_config = config.clone();
         let event_coord = Arc::clone(&coordinator);
         tokio::spawn(async move {
             // Track last known leader for change detection
             let mut last_leader = event_coord.leader_addr();
+            // Topic writers for follower data replication (only used by followers)
+            let mut follower_writers: std::collections::HashMap<u32, writer::TopicWriter> =
+                std::collections::HashMap::new();
 
             loop {
                 // Check for leader changes periodically
@@ -157,7 +176,6 @@ pub async fn run(
                         "Leader change detected"
                     );
                     last_leader = current_leader;
-                    // Note: Leader pool is updated via forward module's on_leader_change
                 }
 
                 match event_rx.recv().await {
@@ -198,9 +216,31 @@ pub async fn run(
                                     "Failed to apply replicated topic deletion"
                                 );
                             }
+                            // Remove any cached writer for deleted topic
+                            follower_writers.remove(&topic_id);
                         },
                     },
-                    Ok(_) => {}, // Ignore other events
+                    Ok(ClusterEvent::DataReceived { topic_id, payload }) => {
+                        // Write replicated data to local segments (follower path)
+                        if let Err(e) = ingestion::write_replicated_data(
+                            &event_config,
+                            &event_registry,
+                            &mut follower_writers,
+                            topic_id,
+                            &payload,
+                        ) {
+                            warn!(
+                                target: "lance::server",
+                                topic_id,
+                                payload_len = payload.len(),
+                                error = %e,
+                                "Failed to write replicated data"
+                            );
+                            // Remove writer on error (may be corrupted)
+                            follower_writers.remove(&topic_id);
+                        }
+                    },
+                    Ok(_) => {}, // Ignore other events (BecameLeader, etc.)
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(
                             target: "lance::server",
@@ -215,6 +255,34 @@ pub async fn run(
                 }
             }
         });
+
+        // Start data replication forwarder task (leader sends data to followers).
+        // Consumes the receiver half of the data_repl channel created above.
+        // The ingestion actors send DataReplicationRequest after local write;
+        // this task forwards them via coordinator.replicate_data() to peers.
+        if let Some(mut repl_rx) = data_repl_rx {
+            let repl_coord = Arc::clone(&coordinator);
+            tokio::spawn(async move {
+                info!(
+                    target: "lance::server",
+                    "Data replication forwarder task started"
+                );
+                while let Some(req) = repl_rx.recv().await {
+                    if let Err(e) = repl_coord.replicate_data(req.topic_id, req.payload).await {
+                        debug!(
+                            target: "lance::server",
+                            topic_id = req.topic_id,
+                            error = %e,
+                            "Data replication broadcast error (non-fatal)"
+                        );
+                    }
+                }
+                info!(
+                    target: "lance::server",
+                    "Data replication forwarder task stopped"
+                );
+            });
+        }
 
         info!(
             target: "lance::server",
@@ -283,8 +351,16 @@ pub async fn run(
         let ingestion_config = config.clone();
         let ingestion_pool = Arc::clone(&batch_pool);
         let ingestion_registry = Arc::clone(&topic_registry);
+        let ingestion_repl_tx = data_repl_tx.clone();
         Some(tokio::spawn(async move {
-            run_ingestion_actor(ingestion_config, rx, ingestion_pool, ingestion_registry).await
+            run_ingestion_actor(
+                ingestion_config,
+                rx,
+                ingestion_pool,
+                ingestion_registry,
+                ingestion_repl_tx,
+            )
+            .await
         }))
     } else {
         info!(

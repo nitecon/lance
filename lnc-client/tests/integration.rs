@@ -803,9 +803,14 @@ async fn test_consumer_offset_store_persistence() {
         let client2 = LanceClient::connect(test_config()).await.unwrap();
         let offset_store = LockFileOffsetStore::open(offset_dir, consumer_name).unwrap();
         let config = ConsumerConfig::new(topic_id);
-        let mut consumer =
-            Consumer::with_offset_store(client2, config, consumer_id, Arc::new(offset_store))
-                .unwrap();
+        let mut consumer = Consumer::with_offset_store(
+            client2,
+            &get_test_addr(),
+            config,
+            consumer_id,
+            Arc::new(offset_store),
+        )
+        .unwrap();
 
         // Poll to ensure consumer is ready
         drop(consumer.poll());
@@ -835,6 +840,7 @@ async fn test_consumer_offset_store_persistence() {
         let config = ConsumerConfig::new(topic_id);
         let consumer = Consumer::with_offset_store(
             client3,
+            &get_test_addr(),
             config,
             consumer_id, // Same consumer ID to load saved offset
             Arc::new(offset_store),

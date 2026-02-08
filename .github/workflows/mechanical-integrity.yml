@@ -126,6 +126,26 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-features
 
+  version-sync:
+    name: Version Sync Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check workspace dependency versions match package version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "Workspace package version: $VERSION"
+          MISMATCHED=$(grep -E 'lnc-[a-z-]+ = \{ path = "[^"]*", version = "' Cargo.toml | grep -v "version = \"$VERSION\"" || true)
+          if [ -n "$MISMATCHED" ]; then
+            echo "❌ BLOCKED: Workspace dependency versions out of sync with package version ($VERSION):"
+            echo "$MISMATCHED"
+            echo ""
+            echo "Fix: update the version fields in [workspace.dependencies] to match [workspace.package].version"
+            exit 1
+          fi
+          echo "✅ All workspace dependency versions match package version ($VERSION)"
+
   deny-check:
     name: Dependency Audit
     runs-on: ubuntu-latest

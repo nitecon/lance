@@ -657,11 +657,11 @@ fn find_active_segment(topic_dir: &std::path::Path) -> Option<std::path::PathBuf
             if is_closed {
                 if latest_closed
                     .as_ref()
-                    .map_or(true, |(idx, _)| start_index > *idx)
+                    .is_none_or(|(idx, _)| start_index > *idx)
                 {
                     latest_closed = Some((start_index, path));
                 }
-            } else if active.as_ref().map_or(true, |(idx, _)| start_index > *idx) {
+            } else if active.as_ref().is_none_or(|(idx, _)| start_index > *idx) {
                 active = Some((start_index, path));
             }
         }

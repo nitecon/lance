@@ -47,15 +47,14 @@ pub fn in_flight_count() -> u64 {
 }
 
 #[cfg(unix)]
+#[allow(clippy::expect_used)] // Signal handlers are startup-critical; abort is correct on failure
 pub fn install_signal_handlers(
     shutdown_tx: broadcast::Sender<()>,
 ) -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let mut sigterm = signal(SignalKind::terminate())
-        .unwrap_or_else(|e| panic!("Failed to install SIGTERM handler: {}", e));
-    let mut sigint = signal(SignalKind::interrupt())
-        .unwrap_or_else(|e| panic!("Failed to install SIGINT handler: {}", e));
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
 
     async move {
         tokio::select! {

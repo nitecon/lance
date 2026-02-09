@@ -24,7 +24,7 @@ jobs:
     name: Cyclomatic Complexity Analysis
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install rust-code-analysis
         run: |
@@ -77,7 +77,7 @@ jobs:
     name: Function Length Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check for long functions
         run: |

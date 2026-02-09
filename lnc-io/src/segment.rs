@@ -33,7 +33,7 @@ pub enum SegmentState {
 /// dispatch via match arms instead of a vtable.
 pub enum DirectBackend {
     #[cfg(target_os = "linux")]
-    IoUring(IoUringBackend),
+    IoUring(Box<IoUringBackend>),
     Pwritev2(Pwritev2Backend),
 }
 
@@ -67,7 +67,7 @@ impl DirectBackend {
 ///   Best for local NVMe with io_uring.
 enum WriteBackend {
     Buffered(BufWriter<File>),
-    Direct(DirectBackend),
+    Direct(Box<DirectBackend>),
 }
 
 pub struct SegmentWriter {
@@ -126,7 +126,7 @@ impl SegmentWriter {
     /// appropriate), so we only need the path for metadata.
     pub fn create_with_backend(path: &Path, backend: DirectBackend) -> Result<Self> {
         Ok(Self {
-            backend: WriteBackend::Direct(backend),
+            backend: WriteBackend::Direct(Box::new(backend)),
             path: path.to_path_buf(),
             write_offset: 0,
             state: SegmentState::Open,

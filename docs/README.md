@@ -7,3 +7,4 @@
 - [Lance Wire Protocol (LWP) Specification](LWP-Specification.md)
 - [Monitoring and Observability](Monitoring.md)
 - [Recovery Procedures](Recoveryprocedures.md)
+- [LANCE vs Apache Kafka — Comparison](LanceVsKafkaComparison.md)

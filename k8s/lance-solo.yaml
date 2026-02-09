@@ -1,4 +1,6 @@
 # Lance Solo — single replica, no replication (l1)
+# Uses hostPath storage (local SSD) instead of Ceph RBD to validate
+# that sync_all durability works correctly on local disk.
 ---
 apiVersion: v1
 kind: Service
@@ -42,6 +44,15 @@ spec:
         fsGroup: 1000
         runAsUser: 1000
         runAsGroup: 1000
+      initContainers:
+      - name: fix-perms
+        image: busybox:1.36
+        command: ["sh", "-c", "chown -R 1000:1000 /var/lib/lance"]
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/lance
       containers:
       - name: lance
         image: nitecon/lance:latest
@@ -86,12 +97,8 @@ spec:
         volumeMounts:
         - name: data
           mountPath: /var/lib/lance
-  volumeClaimTemplates:
-  - metadata:
-      name: data
-    spec:
-      storageClassName: ceph-block
-      accessModes: ["ReadWriteOnce"]
-      resources:
-        requests:
-          storage: 1Gi
+      volumes:
+      - name: data
+        hostPath:
+          path: /var/lib/lance-solo
+          type: DirectoryOrCreate

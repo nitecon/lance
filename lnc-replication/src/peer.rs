@@ -240,6 +240,11 @@ impl PeerConnection {
         false
     }
 
+    /// Minimum message size to apply LZ4 compression (1KB).
+    const COMPRESSION_THRESHOLD: usize = 1024;
+    /// High bit of the length prefix signals LZ4 compression.
+    const COMPRESSED_FLAG: u32 = 0x8000_0000;
+
     pub async fn send(&mut self, msg: &ReplicationMessage) -> Result<(), std::io::Error> {
         let stream = self.stream.as_mut().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "Not connected")
@@ -250,11 +255,30 @@ impl PeerConnection {
             .encode(msg)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
-        // Write length prefix + message
-        let len = encoded.len() as u32;
-        let mut frame = Vec::with_capacity(4 + encoded.len());
-        frame.extend_from_slice(&len.to_le_bytes());
-        frame.extend_from_slice(&encoded);
+        // LZ4 compress large messages to reduce replication bandwidth
+        let (frame_len, payload) = if encoded.len() >= Self::COMPRESSION_THRESHOLD {
+            let compressor = lnc_network::Compressor::lz4();
+            match compressor.compress_raw(&encoded) {
+                Ok(compressed) if compressed.len() < encoded.len() => {
+                    // Compressed is smaller — use it. Prepend original length for decompression.
+                    let mut payload = Vec::with_capacity(4 + compressed.len());
+                    payload.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(&compressed);
+                    let frame_len = payload.len() as u32 | Self::COMPRESSED_FLAG;
+                    (frame_len, payload)
+                },
+                _ => {
+                    // Compression didn't help or failed — send uncompressed
+                    (encoded.len() as u32, encoded.to_vec())
+                },
+            }
+        } else {
+            (encoded.len() as u32, encoded.to_vec())
+        };
+
+        let mut frame = Vec::with_capacity(4 + payload.len());
+        frame.extend_from_slice(&frame_len.to_le_bytes());
+        frame.extend_from_slice(&payload);
 
         match tokio::time::timeout(self.config.write_timeout, stream.write_all(&frame)).await {
             Ok(Ok(())) => Ok(()),
@@ -277,7 +301,7 @@ impl PeerConnection {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "Not connected")
         })?;
 
-        // Read length prefix (4 bytes)
+        // Read length prefix (4 bytes). High bit = LZ4 compressed.
         let mut len_buf = [0u8; 4];
         match tokio::time::timeout(self.config.read_timeout, stream.read_exact(&mut len_buf)).await
         {
@@ -295,7 +319,9 @@ impl PeerConnection {
             },
         }
 
-        let length = u32::from_le_bytes(len_buf) as usize;
+        let raw_len = u32::from_le_bytes(len_buf);
+        let is_compressed = raw_len & Self::COMPRESSED_FLAG != 0;
+        let length = (raw_len & !Self::COMPRESSED_FLAG) as usize;
 
         // Read payload
         let mut payload = vec![0u8; length];
@@ -318,7 +344,29 @@ impl PeerConnection {
             }
         }
 
-        ReplicationCodec::decode(&payload)
+        // Decompress if the high bit was set
+        let decode_buf = if is_compressed && payload.len() >= 4 {
+            let original_len =
+                u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+            let compressor = lnc_network::Compressor::lz4();
+            let decompressed = compressor
+                .decompress_raw(
+                    lnc_network::CompressionAlgorithm::Lz4,
+                    &payload[4..],
+                    original_len,
+                )
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("LZ4 decompress failed: {e}"),
+                    )
+                })?;
+            decompressed.to_vec()
+        } else {
+            payload
+        };
+
+        ReplicationCodec::decode(&decode_buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
     }
 
@@ -614,6 +662,12 @@ impl PeerManager {
     pub async fn get_peer_addr(&self, peer_id: u16) -> Option<SocketAddr> {
         let peers = self.peers.read().await;
         peers.get(&peer_id).map(|c| c.addr)
+    }
+
+    /// Get all known peer IDs
+    pub async fn peer_ids(&self) -> Vec<u16> {
+        let peers = self.peers.read().await;
+        peers.keys().copied().collect()
     }
 }
 

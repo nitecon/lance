@@ -173,6 +173,16 @@ impl Frame {
         Self::new_control(ControlCommand::FetchResponse, Some(payload))
     }
 
+    /// Create a catching-up response frame indicating the server has not yet
+    /// replicated to the requested offset. Payload contains the current max
+    /// offset (8 bytes LE u64) so the client knows the server's progress.
+    pub fn new_catching_up(current_max_offset: u64) -> Self {
+        Self::new_control(
+            ControlCommand::CatchingUp,
+            Some(Bytes::copy_from_slice(&current_max_offset.to_le_bytes())),
+        )
+    }
+
     /// Create a get cluster status request frame
     pub fn new_get_cluster_status() -> Self {
         Self::new_control(ControlCommand::GetClusterStatus, None)
@@ -325,6 +335,14 @@ pub fn parse_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>> {
     };
 
     Ok(Some((frame, total_len)))
+}
+
+/// Encode an ACK frame directly into a stack-allocated buffer.
+/// Avoids the `Vec<u8>` allocation that `encode_frame` requires.
+#[inline]
+pub fn encode_ack_bytes(batch_id: u64) -> [u8; crate::LWP_HEADER_SIZE] {
+    let frame = Frame::new_ack(batch_id);
+    frame.header.encode()
 }
 
 pub fn encode_frame(frame: &Frame) -> Vec<u8> {

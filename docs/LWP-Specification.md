@@ -25,6 +25,7 @@
 15. [Consumer Client API](#15-consumer-client-api)
 16. [Client Consumption Modes](#16-client-consumption-modes)
 17. [SDK Generation Guidelines](#17-sdk-generation-guidelines)
+18. [Replication Wire Format](#18-replication-wire-format)
 - [Appendix A: Test Vectors](#appendix-a-test-vectors)
 - [Revision History](#revision-history)
 
@@ -1537,6 +1538,7 @@ Where XX = computed CRC values.
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.3 | 2026-02-05 | Added Replication Wire Format (§18); removed L2 async replication mode; L3 quorum now uses filesystem-consistent replication with global offset |
 | 1.2 | 2026-02-04 | Added SetRetention (§5.10), CreateTopicWithRetention (§5.11), Subscribe (§5.12), Unsubscribe (§5.13), CommitOffset (§5.14) commands |
 | 1.1 | 2026-02-02 | Added Fetch (§5.8) and FetchResponse (§5.9) commands |
 | 1.0 | 2026-02-02 | Initial specification |
@@ -2227,6 +2229,140 @@ Each SDK MUST provide:
 - Configuration options table
 - Error handling best practices
 - Performance tuning guide
+---
+
+## 18. Replication Wire Format
+
+This section defines the inter-node replication protocol used in L3 (Quorum) mode. This is **not** a client-facing protocol — it is used exclusively for leader-to-follower data replication on the replication port (default: 1993).
+
+### 18.1 Design Goals
+
+| Goal | Mechanism |
+|------|-----------|
+| Filesystem consistency | Leader dictates segment names, write offsets, and rotation |
+| Global offset validation | Followers verify cumulative offset matches leader's global offset |
+| Quorum durability | Leader waits for M/2+1 follower ACKs before confirming writes |
+| Byte-identical segments | All nodes have identical `.lnc` files for any given topic |
+
+### 18.2 Replication Data Message (Leader → Followers)
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Topic ID (4 bytes)                     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                     Global Offset (8 bytes)                   +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|        Segment Name Length    |     Segment Name (variable)   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+|                          ... (padded to alignment)            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                    Write Offset (8 bytes)                     +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Flags     |                  Reserved                     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Payload Length (4 bytes)                 |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Payload CRC32C (4 bytes)                |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Payload (N bytes)                      |
++                            ...                                +
+```
+
+### 18.3 Field Descriptions
+
+| Field | Size | Description |
+|-------|------|-------------|
+| Topic ID | 4 bytes | Target topic identifier (little-endian) |
+| Global Offset | 8 bytes | Leader's monotonic byte counter for this topic after this write (little-endian) |
+| Segment Name Length | 2 bytes | Length of segment filename (little-endian) |
+| Segment Name | variable | Exact segment filename (e.g., `0_1706918400000000000.lnc`) |
+| Write Offset | 8 bytes | Byte offset within the segment where payload must be written (little-endian) |
+| Flags | 1 byte | Bitfield (see §18.4) |
+| Reserved | 3 bytes | Must be `0x00 0x00 0x00` |
+| Payload Length | 4 bytes | Size of payload in bytes (little-endian) |
+| Payload CRC32C | 4 bytes | CRC32C of payload bytes (little-endian) |
+| Payload | N bytes | Raw data to write at `write_offset` in the named segment |
+
+### 18.4 Flags
+
+| Bit | Value | Name | Description |
+|-----|-------|------|-------------|
+| 0 | 0x01 | ROTATE_AFTER | Follower must seal this segment after writing and open the next |
+| 1 | 0x02 | NEW_SEGMENT | Follower must create this segment file before writing |
+| 2-7 | — | Reserved | Must be 0 |
+
+### 18.5 Replication ACK (Follower → Leader)
+
+```
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Topic ID (4 bytes)                     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                  Confirmed Offset (8 bytes)                   +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Status    |                  Node ID (2 bytes)            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+| Field | Size | Description |
+|-------|------|-------------|
+| Topic ID | 4 bytes | Topic this ACK applies to |
+| Confirmed Offset | 8 bytes | The global offset the follower has durably written up to |
+| Status | 1 byte | `0x00` = OK, `0x01` = Error, `0x02` = Resync needed |
+| Node ID | 2 bytes | Follower's node identifier |
+
+### 18.6 Replication Invariants
+
+1. **Byte-identical segments**: After a successful replication write, `sha256sum` of any closed segment MUST be identical across all cluster nodes.
+2. **Offset monotonicity**: `global_offset` MUST be strictly monotonically increasing per topic.
+3. **Segment naming**: Followers MUST use the exact segment filename provided by the leader. Followers MUST NOT independently create or name segments.
+4. **Write offset validation**: Before writing, followers MUST verify that `write_offset` matches their current segment position. A mismatch indicates desynchronization and triggers a resync.
+5. **Quorum completion**: The leader MUST NOT ACK the originating client until `floor(M/2) + 1` followers (including the leader) have confirmed the write.
+
+### 18.7 Segment Lifecycle (L3 Mode)
+
+```
+Leader                          Follower A              Follower B
+  |                                |                       |
+  |-- NEW_SEGMENT(seg_0.lnc) ---->|                       |
+  |-- NEW_SEGMENT(seg_0.lnc) ---------------------------->|
+  |                                |                       |
+  |-- DATA(seg_0, off=0, goff=N)->|                       |
+  |-- DATA(seg_0, off=0, goff=N)------------------------->|
+  |<---- ACK(goff=N) -------------|                       |
+  |<---- ACK(goff=N) ------------------------------------|  ← quorum reached
+  |                                |                       |
+  |   ... more writes ...         |                       |
+  |                                |                       |
+  |-- DATA(seg_0, ROTATE_AFTER)->|                        |
+  |-- DATA(seg_0, ROTATE_AFTER)-------------------------->|
+  |<---- ACK ------------------- |                        |
+  |<---- ACK --------------------------------------------|
+  |                                |                       |
+  |-- NEW_SEGMENT(seg_1.lnc) ---->|                       |
+  |-- NEW_SEGMENT(seg_1.lnc) ---------------------------->|
+```
+
+### 18.8 Follower Resync Protocol
+
+When a follower detects an offset mismatch or rejoins after downtime:
+
+1. Follower sends `Status = 0x02` (Resync needed) with its last confirmed global offset
+2. Leader identifies the divergence point
+3. For closed segments behind the follower's offset: follower already has them (byte-identical), skip
+4. For the active segment: leader sends the full segment data from byte 0
+5. Follower replaces its active segment, confirms new offset
+6. Normal replication resumes
+
+This enables efficient resync — only the active segment needs retransmission. All closed segments are immutable and already identical.
+
 ---
 
 [↑ Back to Top](#lance-wire-protocol-lwp-specification) | [← Back to Docs Index](./README.md)

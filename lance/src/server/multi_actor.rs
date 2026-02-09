@@ -3,10 +3,11 @@
 //! Implements N ingestion actors with client hash partitioning per Architecture §5.2.
 //! Uses crossbeam::ArrayQueue for lock-free MPMC communication per CodingGuidelines §3.3.
 
-use super::ingestion::{DataReplicationRequest, IngestionRequest};
+use super::ingestion::{DataReplicationRequest, IngestionRequest, WriteMetadata};
 use super::writer::{TopicWriter, create_topic_writer, rotate_topic_segment};
 use crate::config::Config;
 use crate::topic::TopicRegistry;
+use bytes::Bytes;
 use crossbeam::queue::ArrayQueue;
 use lnc_core::{LanceError, Result, SortKey, pin_thread_to_cpu};
 use std::collections::HashMap;
@@ -194,50 +195,178 @@ fn run_ingestion_actor_sync(
 ) {
     let mut topic_writers: HashMap<u32, TopicWriter> = HashMap::new();
 
+    // ── Optional WAL (per-actor) ───────────────────────────────────
+    // Each actor gets its own WAL segment directory to avoid
+    // contention. WAL dir = <wal_dir>/actor-<N>/
+    let mut wal: Option<lnc_io::Wal> = if config.wal.enabled {
+        let mut wal_cfg = config.wal_config();
+        wal_cfg.dir = wal_cfg.dir.join(format!("actor-{}", actor_id));
+        wal_cfg.path = wal_cfg.dir.join("current.wal");
+        match lnc_io::Wal::open(wal_cfg) {
+            Ok(w) => {
+                info!(
+                    target: "lance::ingestion",
+                    actor_id,
+                    "WAL enabled for actor"
+                );
+                Some(w)
+            },
+            Err(e) => {
+                tracing::error!(
+                    target: "lance::ingestion",
+                    actor_id,
+                    error = %e,
+                    "Failed to open WAL — continuing without WAL"
+                );
+                None
+            },
+        }
+    } else {
+        None
+    };
+
     info!(
         target: "lance::ingestion",
         actor_id,
         "Ingestion actor started"
     );
 
+    // ── Buffered-write constants ───────────────────────────────────────
+    const MAX_BATCH: usize = 256;
+    const FLUSH_THRESHOLD: usize = 4 * 1024 * 1024; // 4 MiB
+    const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5);
+
+    let mut pending_signals: Vec<BatchSuccess> = Vec::new();
+    let mut dirty_topics: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut dirty_bytes: usize = 0;
+    let mut last_write = std::time::Instant::now();
+
     // Spin-wait loop (per CodingGuidelines §3.1 - ingestion actors never park)
     loop {
         match queue.pop() {
-            Some(request) => {
-                let topic_id = request.topic_id;
-                let payload = request.payload.clone();
+            Some(first) => {
+                // ── Phase 1: Collect a batch ──────────────────────────
+                let mut batch: Vec<IngestionRequest> = Vec::with_capacity(MAX_BATCH);
+                batch.push(first);
+                while batch.len() < MAX_BATCH {
+                    match queue.pop() {
+                        Some(r) => batch.push(r),
+                        None => break,
+                    }
+                }
 
-                match process_request_sync(&config, &topic_registry, &mut topic_writers, request) {
-                    Ok(()) => {
-                        // After successful local write, queue for replication
-                        if let Some(ref tx) = replication_tx {
-                            let _ = tx.try_send(DataReplicationRequest { topic_id, payload });
+                // ── Phase 2: Write all (buffered, no sync) ───────────
+                for mut request in batch {
+                    let topic_id = request.topic_id;
+                    let payload = std::mem::take(&mut request.payload);
+                    let payload_len = payload.len();
+                    let write_id = request.write_id;
+                    let write_done_tx = request.write_done_tx.take();
+
+                    // WAL-first append
+                    if let Some(ref mut w) = wal {
+                        if let Err(e) = w.append(&payload) {
+                            tracing::error!(
+                                target: "lance::ingestion",
+                                actor_id,
+                                topic_id,
+                                error = %e,
+                                "WAL append failed — dropping request"
+                            );
+                            drop(write_done_tx);
+                            continue;
                         }
-                    },
-                    Err(e) => {
-                        warn!(
-                            target: "lance::ingestion",
-                            actor_id,
-                            topic_id,
-                            error = %e,
-                            "Failed to process ingestion request"
-                        );
-                        topic_writers.remove(&topic_id);
-                    },
+                    }
+
+                    match process_request_sync(
+                        &config,
+                        &topic_registry,
+                        &mut topic_writers,
+                        request,
+                    ) {
+                        Ok(meta) => {
+                            dirty_topics.insert(topic_id);
+                            dirty_bytes += payload_len;
+                            pending_signals.push(BatchSuccess {
+                                write_done_tx,
+                                topic_id,
+                                payload,
+                                payload_len,
+                                write_id,
+                                meta,
+                            });
+                        },
+                        Err(e) => {
+                            warn!(
+                                target: "lance::ingestion",
+                                actor_id,
+                                topic_id,
+                                error = %e,
+                                "Failed to process ingestion request"
+                            );
+                            drop(write_done_tx);
+                            topic_writers.remove(&topic_id);
+                        },
+                    }
+                }
+                last_write = std::time::Instant::now();
+
+                // ── Phase 3: Flush if threshold crossed ──────────────
+                if dirty_bytes >= FLUSH_THRESHOLD {
+                    flush_and_signal_sync(
+                        &mut topic_writers,
+                        &mut dirty_topics,
+                        &mut pending_signals,
+                        &replication_tx,
+                        &mut wal,
+                    );
+                    if let Some(ref mut w) = wal {
+                        let _ = w.reset();
+                    }
+                    dirty_bytes = 0;
                 }
             },
             None => {
-                // Check if queue is dropped (shutdown signal)
+                // No work — check shutdown
                 if Arc::strong_count(&queue) == 1 {
                     break;
                 }
-                // Brief spin before retrying
+
+                // Flush on timeout if we have pending data
+                if !pending_signals.is_empty() && last_write.elapsed() >= FLUSH_TIMEOUT {
+                    flush_and_signal_sync(
+                        &mut topic_writers,
+                        &mut dirty_topics,
+                        &mut pending_signals,
+                        &replication_tx,
+                        &mut wal,
+                    );
+                    if let Some(ref mut w) = wal {
+                        let _ = w.reset();
+                    }
+                    dirty_bytes = 0;
+                }
+
                 std::hint::spin_loop();
             },
         }
     }
 
-    // Flush all topic writers on shutdown
+    // ── Shutdown: flush remaining buffered data ───────────────────────
+    if !pending_signals.is_empty() {
+        flush_and_signal_sync(
+            &mut topic_writers,
+            &mut dirty_topics,
+            &mut pending_signals,
+            &replication_tx,
+            &mut wal,
+        );
+        if let Some(ref mut w) = wal {
+            let _ = w.reset();
+        }
+    }
+
+    // Close all topic writers on shutdown (fsync + rename to closed segment format)
     for (topic_id, mut tw) in topic_writers {
         if let Err(e) = tw.writer.fsync() {
             warn!(
@@ -247,13 +376,32 @@ fn run_ingestion_actor_sync(
                 error = %e,
                 "Failed to flush topic writer"
             );
-        } else {
-            debug!(
-                target: "lance::ingestion",
-                actor_id,
-                topic_id,
-                "Flushed topic writer"
-            );
+            continue;
+        }
+        let end_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        match tw.writer.close(end_timestamp) {
+            Ok(closed_path) => {
+                let _ = tw.index_builder.write_indexes(&closed_path);
+                debug!(
+                    target: "lance::ingestion",
+                    actor_id,
+                    topic_id,
+                    segment = %closed_path.display(),
+                    "Closed topic writer on shutdown"
+                );
+            },
+            Err(e) => {
+                debug!(
+                    target: "lance::ingestion",
+                    actor_id,
+                    topic_id,
+                    error = %e,
+                    "Failed to close segment on shutdown (fsynced)"
+                );
+            },
         }
     }
 
@@ -264,16 +412,81 @@ fn run_ingestion_actor_sync(
     );
 }
 
-/// Process a single ingestion request (synchronous)
+/// Holds the state for a single successful write within a batch.
+struct BatchSuccess {
+    write_done_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    topic_id: u32,
+    payload: Bytes,
+    payload_len: usize,
+    write_id: Option<u64>,
+    meta: WriteMetadata,
+}
+
+/// Synchronous flush helper for the multi-actor path.
+/// Same semantics as `flush_and_signal` in ingestion.rs but callable
+/// from a plain thread (no async runtime).
+fn flush_and_signal_sync(
+    topic_writers: &mut HashMap<u32, TopicWriter>,
+    dirty_topics: &mut std::collections::HashSet<u32>,
+    pending_signals: &mut Vec<BatchSuccess>,
+    replication_tx: &Option<tokio::sync::mpsc::Sender<DataReplicationRequest>>,
+    wal: &mut Option<lnc_io::Wal>,
+) {
+    // Sync WAL before segment fsyncs (batched, not per-append)
+    if let Some(w) = wal {
+        if let Err(e) = w.sync() {
+            tracing::error!(
+                target: "lance::ingestion",
+                error = %e,
+                "WAL batch sync failed"
+            );
+        }
+    }
+    for topic_id in dirty_topics.iter() {
+        if let Some(tw) = topic_writers.get_mut(topic_id) {
+            if let Err(e) = tw.writer.fsync() {
+                tracing::error!(
+                    target: "lance::ingestion",
+                    topic_id,
+                    error = %e,
+                    "Batch fsync failed"
+                );
+            }
+        }
+    }
+    dirty_topics.clear();
+
+    for s in pending_signals.drain(..) {
+        if let Some(tx) = s.write_done_tx {
+            let _ = tx.send(());
+        }
+
+        if let Some(tx) = replication_tx {
+            let _ = tx.try_send(DataReplicationRequest {
+                topic_id: s.topic_id,
+                payload: s.payload,
+                segment_name: s.meta.segment_name,
+                write_offset: s.meta.write_offset,
+                global_offset: s.meta.write_offset + s.payload_len as u64,
+                is_new_segment: s.meta.is_new_segment,
+                rotated_after: s.meta.rotated_after,
+                write_id: s.write_id,
+            });
+        }
+    }
+}
+
+/// Process a single ingestion request (synchronous), returning write metadata for replication
 fn process_request_sync(
     config: &Config,
     topic_registry: &TopicRegistry,
     topic_writers: &mut HashMap<u32, TopicWriter>,
     request: IngestionRequest,
-) -> Result<()> {
+) -> Result<WriteMetadata> {
     let topic_id = request.topic_id;
 
     // Get or create writer for this topic
+    let is_new_segment = !topic_writers.contains_key(&topic_id);
     let topic_writer = match topic_writers.get_mut(&topic_id) {
         Some(tw) => tw,
         None => {
@@ -284,6 +497,12 @@ fn process_request_sync(
                 .ok_or_else(|| LanceError::Protocol("Failed to get topic writer".into()))?
         },
     };
+
+    let segment_name = topic_writer
+        .writer
+        .filename()
+        .unwrap_or_default()
+        .to_string();
 
     let seq = SEQUENCE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let sort_key = SortKey::from_timestamp_ns(request.timestamp_ns, seq as u32);
@@ -297,11 +516,19 @@ fn process_request_sync(
     lnc_metrics::increment_records_ingested(request.record_count as u64);
     lnc_metrics::increment_bytes_ingested(request.payload.len() as u64);
 
-    if topic_writer.writer.current_offset() >= config.io.segment_max_size {
+    let rotated_after = if topic_writer.writer.current_offset() >= config.io.segment_max_size {
         rotate_topic_segment(config, topic_registry, topic_id, topic_writer)?;
-    }
+        true
+    } else {
+        false
+    };
 
-    Ok(())
+    Ok(WriteMetadata {
+        write_offset: offset,
+        segment_name,
+        is_new_segment,
+        rotated_after,
+    })
 }
 
 #[cfg(test)]

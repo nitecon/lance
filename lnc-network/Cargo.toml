@@ -17,6 +17,7 @@ lnc-core = { workspace = true }
 lnc-metrics = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
+zerocopy = { workspace = true }
 
 # TLS support (optional feature)
 tokio-rustls = { version = "0.26", optional = true }

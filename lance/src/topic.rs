@@ -358,8 +358,8 @@ impl TopicRegistry {
         }
 
         // Collect .lnc segments with parsed metadata
-        // (start_index, size_bytes, is_closed, path)
-        let mut segments: Vec<(u64, u64, bool, std::path::PathBuf)> = Vec::new();
+        // (start_index, start_timestamp, size_bytes, is_closed, path)
+        let mut segments: Vec<(u64, u64, u64, bool, std::path::PathBuf)> = Vec::new();
         for entry in std::fs::read_dir(&topic_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -376,15 +376,19 @@ impl TopicRegistry {
                     (filename.as_str(), false)
                 };
 
-                // Parse start_index from "{start_index}_{timestamp}" prefix
-                let start_index = start_part
-                    .split('_')
+                // Parse start_index and start_timestamp from "{start_index}_{timestamp}" prefix
+                let mut parts = start_part.split('_');
+                let start_index = parts
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let start_timestamp = parts
                     .next()
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0);
 
                 let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                segments.push((start_index, size_bytes, is_closed, path));
+                segments.push((start_index, start_timestamp, size_bytes, is_closed, path));
             }
         }
 
@@ -392,9 +396,13 @@ impl TopicRegistry {
             return Ok(bytes::Bytes::new());
         }
 
-        // Sort by start_index; closed segments come before active at the
-        // same index (closed was sealed before the active one was created).
-        segments.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2).reverse()));
+        // Sort by start_index, then by timestamp (older first), then closed before active
+        // at the same index (closed was sealed before the active one was created).
+        segments.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.1.cmp(&b.1))
+                .then(a.3.cmp(&b.3).reverse())
+        });
 
         // Walk segments to find the one(s) containing start_offset and read
         use std::io::{Read, Seek, SeekFrom};
@@ -402,7 +410,7 @@ impl TopicRegistry {
         let mut buffer = Vec::with_capacity(max_bytes as usize);
         let mut remaining = max_bytes as usize;
 
-        for (_idx, size_bytes, _is_closed, seg_path) in &segments {
+        for (_idx, _ts, size_bytes, _is_closed, seg_path) in &segments {
             let seg_end = cumulative + size_bytes;
 
             // Skip segments entirely before the requested offset
@@ -432,6 +440,28 @@ impl TopicRegistry {
         }
 
         Ok(bytes::Bytes::from(buffer))
+    }
+
+    /// Return the total byte size of all `.lnc` segment files for a topic.
+    ///
+    /// Used by the Fetch handler to distinguish "at tail, no new data" from
+    /// "server hasn't replicated to this offset yet" (CATCHING_UP).
+    pub fn total_data_size(&self, topic_id: u32) -> u64 {
+        let topic_dir = self.get_topic_dir(topic_id);
+        if !topic_dir.exists() {
+            return 0;
+        }
+
+        let mut total: u64 = 0;
+        if let Ok(entries) = std::fs::read_dir(&topic_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "lnc") {
+                    total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        total
     }
 
     /// Set retention policy for an existing topic

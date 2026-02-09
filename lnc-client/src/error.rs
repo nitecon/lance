@@ -28,6 +28,11 @@ pub enum ClientError {
     ServerBackpressure,
     /// Server returned an error message
     ServerError(String),
+    /// Server has not yet replicated to the requested offset — backoff and retry
+    ServerCatchingUp {
+        /// The server's current maximum offset
+        server_offset: u64,
+    },
     /// Server is not the leader, redirect to the specified address
     NotLeader {
         /// Address of the current leader, if known
@@ -55,6 +60,9 @@ impl fmt::Display for ClientError {
             },
             Self::ServerBackpressure => write!(f, "Server signaled backpressure"),
             Self::ServerError(msg) => write!(f, "Server error: {}", msg),
+            Self::ServerCatchingUp { server_offset } => {
+                write!(f, "Server catching up (at offset {})", server_offset)
+            },
             Self::NotLeader { leader_addr } => match leader_addr {
                 Some(addr) => write!(f, "Not leader, redirect to {}", addr),
                 None => write!(f, "Not leader, leader unknown"),
@@ -97,6 +105,8 @@ impl ClientError {
             Self::ServerBackpressure => true,
             // NOT_LEADER — need to reconnect to a different node
             Self::NotLeader { .. } => true,
+            // CATCHING_UP — server behind, backoff and retry
+            Self::ServerCatchingUp { .. } => true,
             // Server errors containing FORWARD_FAILED — leader unknown/unreachable
             // during election, retry after reconnect to potentially different node
             Self::ServerError(msg) => msg.contains("FORWARD_FAILED"),

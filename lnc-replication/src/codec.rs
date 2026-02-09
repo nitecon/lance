@@ -138,6 +138,290 @@ impl TopicOperation {
     }
 }
 
+/// Flags for data replication messages (leader → follower).
+///
+/// Per Architecture.md §4.1.1 and LWP-Specification.md §18.4:
+/// These flags control segment lifecycle operations on followers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReplicationFlags(u8);
+
+impl ReplicationFlags {
+    /// Follower must seal this segment after writing and open the next.
+    pub const ROTATE_AFTER: u8 = 0x01;
+    /// Follower must create this segment file before writing.
+    pub const NEW_SEGMENT: u8 = 0x02;
+
+    /// Create empty flags (no special operations).
+    #[inline]
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Create flags from raw u8 value.
+    #[inline]
+    #[must_use]
+    pub const fn from_raw(value: u8) -> Self {
+        Self(value)
+    }
+
+    /// Get raw u8 value.
+    #[inline]
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self.0
+    }
+
+    /// Check if ROTATE_AFTER flag is set.
+    #[inline]
+    #[must_use]
+    pub const fn rotate_after(self) -> bool {
+        self.0 & Self::ROTATE_AFTER != 0
+    }
+
+    /// Check if NEW_SEGMENT flag is set.
+    #[inline]
+    #[must_use]
+    pub const fn new_segment(self) -> bool {
+        self.0 & Self::NEW_SEGMENT != 0
+    }
+
+    /// Set the ROTATE_AFTER flag.
+    #[inline]
+    #[must_use]
+    pub const fn with_rotate_after(self) -> Self {
+        Self(self.0 | Self::ROTATE_AFTER)
+    }
+
+    /// Set the NEW_SEGMENT flag.
+    #[inline]
+    #[must_use]
+    pub const fn with_new_segment(self) -> Self {
+        Self(self.0 | Self::NEW_SEGMENT)
+    }
+}
+
+impl std::fmt::Display for ReplicationFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = Vec::new();
+        if self.new_segment() {
+            parts.push("NEW_SEGMENT");
+        }
+        if self.rotate_after() {
+            parts.push("ROTATE_AFTER");
+        }
+        if parts.is_empty() {
+            write!(f, "(none)")
+        } else {
+            write!(f, "{}", parts.join("|"))
+        }
+    }
+}
+
+/// Enriched data replication entry for filesystem-consistent replication (L3).
+///
+/// Per Architecture.md §4.1.1 and LWP-Specification.md §18.2:
+/// Leader sends this to followers so they can write byte-identical segment files.
+///
+/// Wire format:
+/// ```text
+/// [topic_id: 4 bytes LE]
+/// [global_offset: 8 bytes LE]
+/// [segment_name_len: 2 bytes LE][segment_name: N bytes]
+/// [write_offset: 8 bytes LE]
+/// [flags: 1 byte]
+/// [reserved: 3 bytes (0x00)]
+/// [payload_len: 4 bytes LE]
+/// [payload_crc: 4 bytes LE]
+/// [payload: payload_len bytes]
+/// ```
+#[derive(Debug, Clone)]
+pub struct DataReplicationEntry {
+    /// Target topic identifier.
+    pub topic_id: u32,
+    /// Leader's monotonic byte counter for this topic after this write.
+    pub global_offset: u64,
+    /// Exact segment filename (e.g., `0_1706918400000000000.lnc`).
+    pub segment_name: String,
+    /// Byte offset within the segment where payload must be written.
+    pub write_offset: u64,
+    /// Replication flags (ROTATE_AFTER, NEW_SEGMENT).
+    pub flags: ReplicationFlags,
+    /// CRC32C of payload bytes.
+    pub payload_crc: u32,
+    /// Raw data to write at `write_offset` in the named segment.
+    pub payload: Bytes,
+}
+
+impl DataReplicationEntry {
+    /// Encode this entry into bytes for wire transmission.
+    ///
+    /// Returns the encoded bytes suitable for use as `LogEntry.data`
+    /// with `EntryType::Data`.
+    pub fn encode(&self) -> Bytes {
+        let seg_name_bytes = self.segment_name.as_bytes();
+        let total_size = 4 + 8 + 2 + seg_name_bytes.len() + 8 + 1 + 3 + 4 + 4 + self.payload.len();
+        let mut buf = BytesMut::with_capacity(total_size);
+
+        buf.extend_from_slice(&self.topic_id.to_le_bytes());
+        buf.extend_from_slice(&self.global_offset.to_le_bytes());
+        buf.extend_from_slice(&(seg_name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(seg_name_bytes);
+        buf.extend_from_slice(&self.write_offset.to_le_bytes());
+        buf.extend_from_slice(&[self.flags.as_u8()]);
+        buf.extend_from_slice(&[0u8; 3]); // reserved
+        buf.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.payload_crc.to_le_bytes());
+        buf.extend_from_slice(&self.payload);
+
+        buf.freeze()
+    }
+
+    /// Decode an enriched data replication entry from bytes.
+    ///
+    /// Returns `None` if the data is too short or malformed.
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        // Minimum: topic_id(4) + global_offset(8) + seg_name_len(2) + write_offset(8)
+        //          + flags(1) + reserved(3) + payload_len(4) + payload_crc(4) = 34
+        if data.len() < 34 {
+            return None;
+        }
+
+        let mut pos = 0;
+
+        let topic_id = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+
+        let global_offset = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
+        pos += 8;
+
+        let seg_name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+
+        if pos + seg_name_len + 20 > data.len() {
+            return None;
+        }
+
+        let segment_name = std::str::from_utf8(&data[pos..pos + seg_name_len])
+            .ok()?
+            .to_string();
+        pos += seg_name_len;
+
+        let write_offset = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
+        pos += 8;
+
+        let flags = ReplicationFlags::from_raw(data[pos]);
+        pos += 1;
+
+        // Skip 3 reserved bytes
+        pos += 3;
+
+        let payload_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4;
+
+        let payload_crc = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?);
+        pos += 4;
+
+        if pos + payload_len > data.len() {
+            return None;
+        }
+
+        let payload = Bytes::copy_from_slice(&data[pos..pos + payload_len]);
+
+        Some(Self {
+            topic_id,
+            global_offset,
+            segment_name,
+            write_offset,
+            flags,
+            payload_crc,
+            payload,
+        })
+    }
+
+    /// Check if this is a legacy (pre-enriched) data entry.
+    ///
+    /// Legacy format: `[topic_id: 4 bytes][raw payload]`
+    /// Enriched format: `[topic_id: 4 bytes][global_offset: 8 bytes][...]`
+    ///
+    /// We distinguish by checking if the data is shorter than the minimum enriched size.
+    #[inline]
+    #[must_use]
+    pub fn is_legacy_format(data: &[u8]) -> bool {
+        data.len() < 34
+    }
+}
+
+/// Replication ACK from follower to leader.
+///
+/// Per LWP-Specification.md §18.5:
+/// Followers send this after durably writing replicated data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationAck {
+    /// Topic this ACK applies to.
+    pub topic_id: u32,
+    /// The global offset the follower has durably written up to.
+    pub confirmed_offset: u64,
+    /// Status: 0x00 = OK, 0x01 = Error, 0x02 = Resync needed.
+    pub status: ReplicationAckStatus,
+    /// Follower's node identifier.
+    pub node_id: u16,
+}
+
+/// Status codes for replication ACKs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ReplicationAckStatus {
+    /// Write completed successfully.
+    Ok = 0x00,
+    /// Error occurred during write.
+    Error = 0x01,
+    /// Follower is out of sync and needs resync.
+    ResyncNeeded = 0x02,
+}
+
+impl ReplicationAckStatus {
+    /// Convert from u8 value.
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            0x00 => Self::Ok,
+            0x01 => Self::Error,
+            0x02 => Self::ResyncNeeded,
+            _ => Self::Error,
+        }
+    }
+}
+
+impl ReplicationAck {
+    /// Encode this ACK into bytes (15 bytes fixed).
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(15);
+        buf.extend_from_slice(&self.topic_id.to_le_bytes());
+        buf.extend_from_slice(&self.confirmed_offset.to_le_bytes());
+        buf.extend_from_slice(&[self.status as u8]);
+        buf.extend_from_slice(&self.node_id.to_le_bytes());
+        buf.freeze()
+    }
+
+    /// Decode an ACK from bytes.
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        if data.len() < 15 {
+            return None;
+        }
+        let topic_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let confirmed_offset = u64::from_le_bytes(data[4..12].try_into().ok()?);
+        let status = ReplicationAckStatus::from_u8(data[12]);
+        let node_id = u16::from_le_bytes([data[13], data[14]]);
+        Some(Self {
+            topic_id,
+            confirmed_offset,
+            status,
+            node_id,
+        })
+    }
+}
+
 /// A single entry in the Raft log.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
@@ -1429,5 +1713,174 @@ mod tests {
 
         // Delete with truncated data
         assert!(TopicOperation::from_bytes(&[1, 1]).is_none());
+    }
+
+    // =========================================================================
+    // DataReplicationEntry tests
+    // =========================================================================
+
+    #[test]
+    fn test_data_replication_entry_roundtrip() {
+        let entry = DataReplicationEntry {
+            topic_id: 42,
+            global_offset: 1_000_000,
+            segment_name: "0_1706918400000000000.lnc".to_string(),
+            write_offset: 65536,
+            flags: ReplicationFlags::empty(),
+            payload_crc: 0xDEADBEEF,
+            payload: Bytes::from_static(b"hello world"),
+        };
+
+        let encoded = entry.encode();
+        let decoded = DataReplicationEntry::decode(&encoded).expect("decode failed");
+
+        assert_eq!(decoded.topic_id, 42);
+        assert_eq!(decoded.global_offset, 1_000_000);
+        assert_eq!(decoded.segment_name, "0_1706918400000000000.lnc");
+        assert_eq!(decoded.write_offset, 65536);
+        assert_eq!(decoded.flags, ReplicationFlags::empty());
+        assert_eq!(decoded.payload_crc, 0xDEADBEEF);
+        assert_eq!(decoded.payload, Bytes::from_static(b"hello world"));
+    }
+
+    #[test]
+    fn test_data_replication_entry_with_flags() {
+        let entry = DataReplicationEntry {
+            topic_id: 1,
+            global_offset: 500,
+            segment_name: "seg.lnc".to_string(),
+            write_offset: 0,
+            flags: ReplicationFlags::empty()
+                .with_new_segment()
+                .with_rotate_after(),
+            payload_crc: 0,
+            payload: Bytes::new(),
+        };
+
+        let encoded = entry.encode();
+        let decoded = DataReplicationEntry::decode(&encoded).expect("decode failed");
+
+        assert!(decoded.flags.new_segment());
+        assert!(decoded.flags.rotate_after());
+        assert_eq!(decoded.flags.as_u8(), 0x03);
+    }
+
+    #[test]
+    fn test_data_replication_entry_empty_payload() {
+        let entry = DataReplicationEntry {
+            topic_id: 0,
+            global_offset: 0,
+            segment_name: "a.lnc".to_string(),
+            write_offset: 0,
+            flags: ReplicationFlags::empty(),
+            payload_crc: 0,
+            payload: Bytes::new(),
+        };
+
+        let encoded = entry.encode();
+        let decoded = DataReplicationEntry::decode(&encoded).expect("decode failed");
+        assert!(decoded.payload.is_empty());
+    }
+
+    #[test]
+    fn test_data_replication_entry_decode_too_short() {
+        assert!(DataReplicationEntry::decode(&[0u8; 33]).is_none());
+        assert!(DataReplicationEntry::decode(&[]).is_none());
+    }
+
+    #[test]
+    fn test_data_replication_entry_is_legacy_format() {
+        assert!(DataReplicationEntry::is_legacy_format(&[0u8; 10]));
+        assert!(DataReplicationEntry::is_legacy_format(&[0u8; 33]));
+        assert!(!DataReplicationEntry::is_legacy_format(&[0u8; 34]));
+    }
+
+    // =========================================================================
+    // ReplicationFlags tests
+    // =========================================================================
+
+    #[test]
+    fn test_replication_flags_empty() {
+        let flags = ReplicationFlags::empty();
+        assert!(!flags.rotate_after());
+        assert!(!flags.new_segment());
+        assert_eq!(flags.as_u8(), 0);
+    }
+
+    #[test]
+    fn test_replication_flags_set() {
+        let flags = ReplicationFlags::empty().with_rotate_after();
+        assert!(flags.rotate_after());
+        assert!(!flags.new_segment());
+
+        let flags = ReplicationFlags::empty().with_new_segment();
+        assert!(!flags.rotate_after());
+        assert!(flags.new_segment());
+    }
+
+    #[test]
+    fn test_replication_flags_display() {
+        assert_eq!(format!("{}", ReplicationFlags::empty()), "(none)");
+        assert_eq!(
+            format!("{}", ReplicationFlags::empty().with_new_segment()),
+            "NEW_SEGMENT"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                ReplicationFlags::empty()
+                    .with_new_segment()
+                    .with_rotate_after()
+            ),
+            "NEW_SEGMENT|ROTATE_AFTER"
+        );
+    }
+
+    // =========================================================================
+    // ReplicationAck tests
+    // =========================================================================
+
+    #[test]
+    fn test_replication_ack_roundtrip() {
+        let ack = ReplicationAck {
+            topic_id: 5,
+            confirmed_offset: 999_999,
+            status: ReplicationAckStatus::Ok,
+            node_id: 2,
+        };
+
+        let encoded = ack.encode();
+        assert_eq!(encoded.len(), 15);
+
+        let decoded = ReplicationAck::decode(&encoded).expect("decode failed");
+        assert_eq!(decoded.topic_id, 5);
+        assert_eq!(decoded.confirmed_offset, 999_999);
+        assert_eq!(decoded.status, ReplicationAckStatus::Ok);
+        assert_eq!(decoded.node_id, 2);
+    }
+
+    #[test]
+    fn test_replication_ack_status_variants() {
+        assert_eq!(
+            ReplicationAckStatus::from_u8(0x00),
+            ReplicationAckStatus::Ok
+        );
+        assert_eq!(
+            ReplicationAckStatus::from_u8(0x01),
+            ReplicationAckStatus::Error
+        );
+        assert_eq!(
+            ReplicationAckStatus::from_u8(0x02),
+            ReplicationAckStatus::ResyncNeeded
+        );
+        assert_eq!(
+            ReplicationAckStatus::from_u8(0xFF),
+            ReplicationAckStatus::Error
+        );
+    }
+
+    #[test]
+    fn test_replication_ack_decode_too_short() {
+        assert!(ReplicationAck::decode(&[0u8; 14]).is_none());
     }
 }

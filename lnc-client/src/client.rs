@@ -934,6 +934,15 @@ impl LanceClient {
 
     fn parse_fetch_response(&self, frame: Frame) -> Result<FetchResult> {
         match frame.frame_type {
+            FrameType::Control(ControlCommand::CatchingUp) => {
+                let server_offset = frame
+                    .payload
+                    .as_ref()
+                    .filter(|p| p.len() >= 8)
+                    .map(|p| u64::from_le_bytes([p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]]))
+                    .unwrap_or(0);
+                Err(ClientError::ServerCatchingUp { server_offset })
+            },
             FrameType::Control(ControlCommand::FetchResponse) => {
                 let payload = frame.payload.ok_or_else(|| {
                     ClientError::InvalidResponse("Empty fetch response".to_string())

@@ -127,8 +127,15 @@ impl Wal {
         Ok(())
     }
 
+    /// Append a framed entry to the WAL.
+    ///
+    /// Wire format: `[len: u32 LE][data: len bytes]`
+    ///
+    /// This framing allows [`replay`] to iterate entries without external
+    /// metadata.  Returns `(segment_id, byte_offset)` of the entry.
     pub fn append(&mut self, data: &[u8]) -> Result<(u64, u64)> {
-        if self.write_offset + data.len() as u64 > self.config.max_segment_size {
+        let frame_len = 4 + data.len() as u64;
+        if self.write_offset + frame_len > self.config.max_segment_size {
             self.rotate_segment()?;
         }
 
@@ -136,13 +143,15 @@ impl Wal {
         let offset = self.write_offset;
 
         if let Some(ref mut file) = self.current_segment {
+            let len_bytes = (data.len() as u32).to_le_bytes();
+            file.write_all(&len_bytes)?;
             file.write_all(data)?;
 
             if self.config.sync_on_write {
                 file.sync_all()?;
             }
 
-            self.write_offset += data.len() as u64;
+            self.write_offset += frame_len;
         }
 
         Ok((segment_id, offset))
@@ -255,15 +264,18 @@ mod tests {
         let config = WalConfig::new(&dir).with_sync_on_write(false);
         let mut wal = Wal::open(config).unwrap();
 
+        // Each append writes: [len:4 bytes LE][data:N bytes]
         let (seg1, off1) = wal.append(b"record1").unwrap();
         let (seg2, off2) = wal.append(b"record2").unwrap();
 
         assert_eq!(seg1, seg2);
         assert_eq!(off1, 0);
-        assert_eq!(off2, 7);
+        // Second entry starts at 4 (len) + 7 (data) = 11
+        assert_eq!(off2, 11);
 
+        // read_at reads raw bytes — skip the 4-byte length header
         let mut buf = [0u8; 7];
-        wal.read_at(seg1, off1, &mut buf).unwrap();
+        wal.read_at(seg1, off1 + 4, &mut buf).unwrap();
         assert_eq!(&buf, b"record1");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -274,8 +286,10 @@ mod tests {
         let dir = std::env::temp_dir().join("test_wal_rotation");
         let _ = std::fs::remove_dir_all(&dir);
 
+        // Each 10-byte payload = 14 bytes framed (4 + 10).
+        // max_segment_size=30 fits 2 entries (28 bytes), third rotates.
         let config = WalConfig::new(&dir)
-            .with_max_segment_size(20)
+            .with_max_segment_size(30)
             .with_sync_on_write(false);
 
         let mut wal = Wal::open(config).unwrap();
@@ -287,6 +301,36 @@ mod tests {
         assert_eq!(seg1, 0);
         assert_eq!(seg2, 0);
         assert_eq!(seg3, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_wal_replay_roundtrip() {
+        let dir = std::env::temp_dir().join("test_wal_replay_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let config = WalConfig::new(&dir).with_sync_on_write(false);
+        let mut wal = Wal::open(config.clone()).unwrap();
+
+        wal.append(b"alpha").unwrap();
+        wal.append(b"beta").unwrap();
+        wal.append(b"gamma").unwrap();
+        drop(wal);
+
+        // Re-open and replay
+        let mut wal2 = Wal::open(config).unwrap();
+        let mut replayed: Vec<Vec<u8>> = Vec::new();
+        wal2.replay(|data, _offset| {
+            replayed.push(data.to_vec());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed[0], b"alpha");
+        assert_eq!(replayed[1], b"beta");
+        assert_eq!(replayed[2], b"gamma");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -25,6 +25,9 @@
 - [19. Client-Side Offset Management](#19-client-side-offset-management)
 - [20. Consumer Client Modes](#20-consumer-client-modes)
 - [21. Write Forwarding (Cluster Mode)](#21-write-forwarding-cluster-mode)
+- [22. Write Buffering & Deferred Sync Architecture](#22-write-buffering-deferred-sync-architecture)
+- [23. CATCHING_UP Protocol](#23-catching_up-protocol)
+- [24. Recursive Segment Recovery](#24-recursive-segment-recovery)
 
 ---
 
@@ -230,23 +233,73 @@ To bypass the overhead of standard syscalls and Go-style context switching:
 
 ## 4. Replication & State Machine
 
-### 4.1 Hybrid Consistency Model
+### 4.1 Consistency Model
 
-LANCE supports three distinct replication modes to balance throughput vs. durability:
+LANCE supports two replication modes:
 
-- **Log-Based (L1)**: Single-writer, multi-reader. Optimized for high-speed consumers. No quorum required.
-- **Async Replication (L2)**: Asynchronous replication to followers. Fire-and-forget durability without blocking writes.
-- **Sync Quorum (L3)**: Send + ACK. Requires M/2+1 nodes to confirm the write before the index is incremented. Highest durability guarantee.
+- **Standalone (L1)**: Single-node, no replication. Optimized for maximum throughput with local durability only. Ideal for development, testing, or workloads where replication is handled externally.
+- **Quorum (L3)**: Filesystem-consistent replication with quorum-based durability. Requires M/2+1 nodes to confirm the write before the producer is ACKed. All nodes maintain **byte-identical** segment files on disk.
 
 **Implementation**: See `lnc-replication/src/mode.rs` for the `ReplicationMode` enum and `lnc-replication/src/quorum.rs` for quorum management.
 
-#### ⚠️ The "Slow Follower" Poison (L2 Tail Latency Trap)
+#### 4.1.1 Filesystem-Consistent Replication (L3)
 
-**The Problem**: In L2 mode with M/2+1 quorum, if one follower is experiencing a "Stop the World" event (disk failure, kernel panic, GC pause) and another is slightly laggy, your ingestion latency spikes to the timeout limit of the slowest required member.
+In L3 mode, all cluster nodes maintain **byte-identical** `.lnc` segment files. The leader dictates all segment operations (creation, writing, rotation), and followers mirror the leader's exact file layout.
+
+**Design goals**:
+- Files can be `rsync`'d between nodes for bootstrapping or migration (solo → cluster)
+- "Hot copy" of closed segments to pre-seed new cluster nodes (only catch up on active segment)
+- Troubleshooting via `diff` across nodes — files must be identical
+- Consumer byte offsets are globally consistent because all nodes share the same segment layout
+
+**Enriched replication wire format**:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    DATA REPLICATION MESSAGE (Leader → Followers)              │
+├──────────┬──────────────┬──────────────┬───────────────┬─────────┬──────────┤
+│ topic_id │ global_offset│ segment_name │ write_offset  │  flags  │ payload  │
+│ (4 bytes)│   (8 bytes)  │ (2B len+name)│   (8 bytes)   │ (1 byte)│ (N bytes)│
+└──────────┴──────────────┴──────────────┴───────────────┴─────────┴──────────┘
+
+Flags byte:
+  Bit 0: ROTATE_AFTER  — follower must rotate segment after this write
+  Bit 1: NEW_SEGMENT   — follower must create this exact segment file
+```
+
+**Replication invariant**: After every write, followers validate:
+`local_cumulative_offset == leader_global_offset`
+
+Any mismatch is a fatal inconsistency that triggers an immediate alert and follower resync.
+
+#### 4.1.2 Global Offset
+
+The **global offset** is a monotonically-increasing byte counter per topic, maintained by the leader. Because all nodes have byte-identical segment files, the cumulative byte position IS the global offset — it's the same on every node.
+
+Making the offset explicit (rather than just an emergent property of identical files) provides:
+- **Validation**: Followers verify their local byte position matches the leader's claimed global offset
+- **Protocol clarity**: Consumers fetch by "global offset", not "node-local byte position"
+- **Safety net**: If anything ever breaks filesystem consistency, the offset layer catches it immediately
+- **Future flexibility**: Offset-based retention/compaction without breaking consumers
+
+#### 4.1.3 Leader-Dictated Segment Management
+
+In L3 mode, followers **never** independently create or rotate segments. All segment lifecycle is driven by the leader:
+
+1. **Leader creates segment** → sends `NEW_SEGMENT` flag with exact filename to followers
+2. **Leader writes data** → sends payload with `(segment_name, write_offset, global_offset)` to followers
+3. **Leader rotates segment** → sends `ROTATE_AFTER` flag; followers seal and rotate to the leader-specified new segment
+4. **Followers validate** → after each write, assert `local_cumulative_offset == global_offset`
+
+This ensures all nodes have identical segment files at all times.
+
+#### ⚠️ The "Slow Follower" Poison (L3 Tail Latency Trap)
+
+**The Problem**: In L3 mode with M/2+1 quorum, if one follower is experiencing a "Stop the World" event (disk failure, kernel panic, GC pause) and another is slightly laggy, your ingestion latency spikes to the timeout limit of the slowest required member.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    L2 QUORUM WITH SLOW FOLLOWER                              │
+│                    L3 QUORUM WITH SLOW FOLLOWER                              │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
 │   Leader (writes locally)                                                    │
@@ -436,7 +489,7 @@ impl ReplicationActor {
 }
 ```
 
-#### L2 Replication Metrics
+#### L3 Replication Metrics
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -445,6 +498,8 @@ impl ReplicationActor {
 | `lance_follower_recoveries` | Counter | Followers rejoining quorum |
 | `lance_quorum_size` | Gauge | Current required ACKs |
 | `lance_healthy_followers` | Gauge | Followers in healthy state |
+| `lance_global_offset` | Gauge | Current global offset per topic |
+| `lance_replication_offset_mismatch` | Counter | Follower offset validation failures |
 
 ### 4.2 Distributed Tie-Breaking
 
@@ -650,35 +705,24 @@ LANCE's replication modes have specific cluster size requirements.
 
 | Replication Mode | Minimum Nodes | Quorum Formula | Notes |
 |------------------|---------------|----------------|-------|
-| **L1 (Log-Based)** | 1 | N/A (no quorum) | Single-writer; replicas are read-only followers |
-| **L2 (Async Replication)** | 2 | N/A (no quorum) | Asynchronous follower replication |
-| **L3 (Sync Quorum)** | 3 | `floor(M/2) + 1` | Tolerates 1 node failure; highest durability |
+| **L1 (Standalone)** | 1 | N/A (no quorum) | Single-node, no replication |
+| **L3 (Quorum)** | 3 | `floor(M/2) + 1` | Filesystem-consistent replication; tolerates 1 node failure |
 
 #### Two-Node Deployments
 
-A 2-node L2 cluster is **not recommended** because:
+A 2-node L3 cluster is **not recommended** because:
 
 - Quorum = `floor(2/2) + 1 = 2` → Both nodes must ACK every write
 - A single node failure halts all writes
 
-If 2-node HA is required, use **L1 replication with synchronous follower promotion**:
-
-```
-Config:
-  replication_mode = "L1"
-  follower_sync = true  # Follower applies writes before ACK
-```
-
-This provides durability across 2 nodes without consensus overhead, but does not tolerate split-brain (requires fencing via external coordinator).
+For 2-node HA, use external replication (e.g., `rsync` of closed segments from an L1 node to a standby) with manual failover.
 
 #### Recommended Topologies
 
 | Use Case | Nodes | Mode | Fault Tolerance |
 |----------|-------|------|-----------------|
 | Dev/Test | 1 | L1 | None |
-| Production (speed) | 3 | L1 | 2 nodes (reads), 0 nodes (writes) |
-| Production (async durability) | 3 | L2 | Best-effort replication |
-| Production (sync durability) | 3 | L3 | 1 node |
+| Production (durability) | 3 | L3 | 1 node |
 | Mission-critical | 5 | L3 | 2 nodes |
 
 ## 5. Concurrency Model
@@ -692,7 +736,7 @@ LANCE adopts an **Actor-per-Resource** concurrency model to avoid shared mutable
 | **Network Acceptor** | Accepts TCP connections, spawns per-client handlers | `tokio` async runtime | `tokio` |
 | **Ingestion Actor(s)** | Owns partition of write buffer; TLV encode + SortKey | Bounded MPSC channel | `flume` |
 | **io_uring Poller(s)** | Pinned OS thread; submits SQEs, harvests CQEs | Lock-free queue | `crossbeam` or `ringbuf` |
-| **Replication Actor** | Manages L1/L2 replication state machine | `tokio` async runtime | `tokio` |
+| **Replication Actor** | Manages L3 quorum replication state machine | `tokio` async runtime | `tokio` |
 
 #### ⚠️ Scaling Consideration: Single vs Multi-Core Ingestion
 
@@ -791,7 +835,7 @@ LANCE implements a **multi-stage backpressure** system to prevent unbounded memo
 
 Producers receive backpressure via two mechanisms:
 
-1. **Synchronous (L2 mode)**: The ACK is delayed until the write is durably committed. Slow ACKs naturally throttle the producer.
+1. **Synchronous (L3 mode)**: The ACK is delayed until the write is durably committed to a quorum. Slow ACKs naturally throttle the producer.
 
 2. **Asynchronous (L1 mode)**: A dedicated `Backpressure` frame is sent to the client when `Queue Depth` or `Heap Critical` thresholds are breached. Clients should implement exponential backoff upon receiving this signal.
 
@@ -846,7 +890,6 @@ LANCE provides **segment-level durability** with explicit trade-offs for the act
 |---------------|------------|-------------------|
 | **Closed Segment** | Fully durable | Immutable; verified via trailing checksum |
 | **Active Segment (L3)** | Durable after quorum ACK | Recoverable up to last ACKed write |
-| **Active Segment (L2)** | Best-effort async | Data replicated asynchronously |
 | **Active Segment (L1)** | Best-effort | Data between last `fsync` and crash is lost |
 
 ### 7.2 Active Segment Recovery
@@ -1024,9 +1067,8 @@ When a node leaves the cluster:
 
 | Replication Mode | Behavior |
 |------------------|----------|
-| **L1 (Log-Based)** | Followers detect leader absence via heartbeat timeout; promote next node |
-| **L2 (Async Replication)** | Followers continue; no immediate impact on writes |
-| **L3 (Sync Quorum)** | Quorum recalculates; if below M/2+1, writes block until node returns or is replaced |
+| **L1 (Standalone)** | Single-node; no cluster impact |
+| **L3 (Quorum)** | Quorum recalculates; if below M/2+1, writes block until node returns or is replaced |
 
 The "leaving" broadcast (Step 5) allows peers to immediately update their view rather than waiting for heartbeat timeout (faster failover).
 ## 10. Container Deployment & Ephemeral Integrity
@@ -1395,7 +1437,7 @@ The architecture explicitly defines:
 | **io_uring Poller** | Thread panic | Liveness probe timeout | Pod restart + recovery | WAL replay recovers |
 | **Active Segment** | Disk full | Write returns -ENOSPC | Block writes, alert | None (no silent drop) |
 | **Sparse Index** | Corruption detected | CRC mismatch on load | Rebuild from segment | None (index is derived) |
-| **Replication** | Leader unreachable | Heartbeat timeout (5s) | Follower promotion | None (L2), possible gap (L1) |
+| **Replication** | Leader unreachable | Heartbeat timeout (5s) | Follower promotion | None (L3 quorum-ACK'd); possible gap (L1 standalone) |
 | **Replication** | Split-brain | Quorum check on write | Reject writes from minority | None (writes fail-safe) |
 | **WAL** | Corruption on replay | CRC mismatch | Truncate to last valid | Batch loss (logged) |
 | **Node** | OOM killed | Kubernetes event | Pod restart + recovery | WAL replay recovers |
@@ -1426,11 +1468,11 @@ kubectl delete pod lance-0 --grace-period=0 --force
 kubectl exec lance-0 -- iptables -A INPUT -s lance-1.lance-headless -j DROP
 kubectl exec lance-0 -- iptables -A INPUT -s lance-2.lance-headless -j DROP
 
-# Expected (L2 mode):
+# Expected (L3 mode):
 # - lance-0 cannot achieve quorum, rejects writes
 # - lance-1/lance-2 form new quorum, continue serving
 # - lance-0 logs: "Quorum lost, entering read-only mode"
-# - After partition heals: lance-0 syncs from peers
+# - After partition heals: lance-0 syncs from peers (filesystem-consistent resync)
 ```
 
 #### 11.3.3 Disk Latency Injection
@@ -1746,13 +1788,13 @@ LANCE propagates trace context through the system:
 │ ├─ Span: ingestion.batch          (50μs)  ◀─ Batching window            │
 │ ├─ Span: iouring.submit           (1μs)                                 │
 │ ├─ Span: iouring.complete         (200μs) ◀─ Disk I/O                   │
-│ └─ Span: replication.ack (L2)     (5ms)   ◀─ Network to peers           │
+│ └─ Span: replication.ack (L3)     (5ms)   ◀─ Network to peers           │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 #### Trace Context Propagation
 
-For L2 replication, trace context is embedded in the replication protocol:
+For L3 replication, trace context is embedded in the replication protocol:
 
 ```rust
 #[derive(Serialize, Deserialize)]
@@ -1864,9 +1906,9 @@ This section provides a detailed view of the write path, showing where each comp
 │                  │ 15. Submit SQE to kernel                                             │
 │                  │ 16. Poll CQE (completion)                                            │
 │                  │ 17. On success: update High Water Mark                               │
-│                  │ 18. Notify Replication Actor (if L2 mode)                            │
+│                  │ 18. Notify Replication Actor (if L3 mode)                            │
 ├──────────────────┼──────────────────────────────────────────────────────────────────────┤
-│ REPLICATION      │ 19. (L2 only) Wait for M/2+1 peer ACKs                               │
+│ REPLICATION      │ 19. (L3 only) Wait for M/2+1 peer ACKs                               │
 │ (Async/Tokio)    │ 20. Send ACK to original client                                      │
 └──────────────────┴──────────────────────────────────────────────────────────────────────┘
 ```
@@ -1882,8 +1924,8 @@ This section provides a detailed view of the write path, showing where each comp
 | io_uring Submit | < 2μs | Single syscall batched |
 | Disk Write (NVMe) | 50-200μs | Hardware-dependent |
 | **Total (L1)** | **< 300μs P99** | Without replication wait |
-| Replication ACK (L2) | 1-10ms | Network RTT dependent |
-| **Total (L2)** | **< 15ms P99** | With quorum ACK |
+| Replication ACK (L3) | 1-10ms | Network RTT dependent |
+| **Total (L3)** | **< 15ms P99** | With quorum ACK |
 
 ### Critical Design Decisions
 
@@ -4692,9 +4734,9 @@ impl SpliceForwarder {
 - **Feature detection**: `probe_splice()` checks kernel support at startup
 - **Graceful fallback**: Falls back to direct buffer copy on unsupported kernels
 
-### 21.9 Zero-Copy Tee for L2 Quorum (Phase 3 - Implemented)
+### 21.9 Zero-Copy Tee for L3 Quorum (Phase 3 - Implemented)
 
-For L2 sync quorum scenarios where writes need both forwarding AND local processing, LANCE uses `IORING_OP_TEE` for in-kernel data duplication:
+For L3 quorum scenarios where writes need both forwarding AND local processing, LANCE uses `IORING_OP_TEE` for in-kernel data duplication:
 
 ```
 Data flow with TEE:
@@ -4703,7 +4745,7 @@ Data flow with TEE:
 ```
 
 **Use cases**:
-- **L2 sync quorum**: Forward to leader while locally acknowledging for quorum
+- **L3 quorum**: Forward to leader while locally acknowledging for quorum
 - **Audit logging**: Copy writes to audit trail without performance impact
 - **Real-time analytics**: Stream writes to analytics pipeline
 
@@ -4711,13 +4753,13 @@ Data flow with TEE:
 // lnc-io exports TEE primitives
 pub use uring::{probe_tee, TeeForwarder, TeeSupport};
 
-// lnc-replication exports L2 quorum configuration
+// lnc-replication exports L3 quorum configuration
 pub use forward::{
     check_tee_support, ForwardConfig, TeeForwardingStatus,
     LocalWriteProcessor, AuditConfig, AuditLogWriter,
 };
 
-/// Tee forwarder for L2 quorum zero-copy forwarding
+/// Tee forwarder for L3 quorum zero-copy forwarding
 pub struct TeeForwarder {
     ring: IoUring,
     tee_supported: bool,
@@ -4753,6 +4795,777 @@ This architecture aligns with established patterns:
 - **Kafka KIP-392**: Allows consumers to fetch from closest replica
 - **Amazon Aurora**: Separate writer and reader endpoints with internal forwarding
 - **CockroachDB**: Follower reads with write forwarding to leaseholder
+
+---
+
+## 22. Write Buffering & Deferred Sync Architecture
+
+LANCE's current I/O backend uses **buffered file writes** with **deferred `fsync`** to amortize expensive storage-layer sync calls. This is the production-ready write path that replaces per-write `sync_data` calls with batch-oriented durability, dramatically improving throughput on network-attached storage (e.g., Ceph RBD).
+
+> **Relationship to §3/§8**: The io_uring backend described in Sections 3 and 8 is the target architecture for bare-metal NVMe deployments. The write buffering architecture described here is the **current production implementation** that works on all Linux filesystems and storage backends without kernel feature dependencies.
+
+**Implementation**:
+- `lnc-io/src/segment.rs` — `SegmentWriter` with `BufWriter<File>`
+- `lance/src/server/ingestion.rs` — Single-actor deferred flush loop
+- `lance/src/server/multi_actor.rs` — Multi-actor deferred flush loop
+- `lance/src/server/connection.rs` — ACK-after-durability via `oneshot` channel
+
+### 22.1 Design Motivation
+
+On network-attached storage (Ceph RBD, EBS, etc.), each `fdatasync()` / `sync_all()` call incurs a full round-trip to the storage backend — typically 5–50ms depending on network conditions and OSD load. With per-write sync, this limits throughput to ~20–200 writes/second regardless of payload size.
+
+**Solution**: Accumulate writes in a userspace buffer and defer `fsync` until either a **size threshold** or **time deadline** is reached, then sync once for the entire batch.
+
+### 22.2 SegmentWriter: BufWriter Integration
+
+`SegmentWriter` wraps its `File` in a `BufWriter` with a 4 MiB capacity:
+
+```rust
+const DEFAULT_WRITE_BUFFER_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+
+pub struct SegmentWriter {
+    file: BufWriter<File>,
+    path: PathBuf,
+    write_offset: u64,
+    state: SegmentState,
+    start_index: u64,
+    record_count: u64,
+}
+```
+
+All constructors (`create`, `create_with_index`, `open`) use `BufWriter::with_capacity(DEFAULT_WRITE_BUFFER_SIZE, file)`.
+
+#### Write Methods
+
+| Method | Behavior | Use Case |
+|--------|----------|----------|
+| `append(data)` | Write to buffer only, no sync | Hot-path ingestion (deferred flush) |
+| `write_batch(data)` | `append` + increment `record_count` | Hot-path ingestion |
+| `save(data)` | `append` + `flush()` + `sync_data()` | Per-write durability (fallback) |
+| `save_at_offset(offset, data)` | `write_at_offset` + `flush()` + `sync_data()` | L3 follower path |
+| `flush_buffer()` | `BufWriter::flush()` only (no sync) | Pre-sync buffer drain |
+| `sync()` / `fsync()` | `flush()` + `sync_all()` | Durability checkpoint |
+
+**Critical invariant**: Every method that calls `sync_data()` or `sync_all()` **must** call `BufWriter::flush()` first, otherwise buffered data would not reach the kernel before sync.
+
+### 22.3 Deferred Flush in Ingestion Actors
+
+The ingestion actor loops (both single-actor and multi-actor paths) implement a **dual-threshold deferred flush** strategy:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     DEFERRED FLUSH STRATEGY                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Writes arrive on ingestion channel                                        │
+│       │                                                                     │
+│       ▼                                                                     │
+│   ┌─────────────────────┐                                                   │
+│   │  Collect batch       │  (up to MAX_BATCH=256 messages per iteration)    │
+│   │  from channel        │                                                  │
+│   └──────────┬──────────┘                                                   │
+│              │                                                              │
+│              ▼                                                              │
+│   ┌─────────────────────┐                                                   │
+│   │  write_batch()       │  Writes to BufWriter (no syscall if buffered)    │
+│   │  (buffered, no sync) │                                                  │
+│   └──────────┬──────────┘                                                   │
+│              │                                                              │
+│              ▼                                                              │
+│   ┌─────────────────────────────────────────────┐                           │
+│   │  dirty_bytes >= 4 MiB?  OR  5ms timeout?    │                           │
+│   └──────────┬──────────────────────┬───────────┘                           │
+│         YES  │                      │  NO                                   │
+│              ▼                      ▼                                       │
+│   ┌─────────────────────┐   ┌─────────────────┐                             │
+│   │  flush_and_signal()  │   │  Continue loop   │                            │
+│   │  • fsync all dirty   │   │  (wait for more  │                            │
+│   │    topic writers     │   │   messages)      │                            │
+│   │  • signal write_done │   └─────────────────┘                             │
+│   │  • queue replication │                                                   │
+│   └─────────────────────┘                                                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Constants
+
+| Constant | Value | Rationale |
+|----------|-------|-----------|
+| `MAX_BATCH` | 256 | Messages collected per channel drain iteration |
+| `FLUSH_THRESHOLD` | 4 MiB | Matches `BufWriter` capacity; triggers size-based flush |
+| `FLUSH_TIMEOUT` | 5 ms | Bounds tail latency for single-producer workloads |
+
+#### Deferred State
+
+Across batch iterations, the actor maintains:
+
+```rust
+struct BatchSuccess {
+    write_done_tx: Option<oneshot::Sender<()>>,  // ACK signal
+    topic_id: u32,
+    payload: Bytes,
+    payload_len: usize,
+    write_id: u64,
+    meta: WriteMeta,
+}
+
+let mut pending_signals: Vec<BatchSuccess> = Vec::new();
+let mut dirty_topics: HashSet<u32> = HashSet::new();
+let mut dirty_bytes: usize = 0;
+```
+
+### 22.4 flush_and_signal: The Durability Gate
+
+`flush_and_signal` is the **single point** where data becomes durable and clients are notified:
+
+```rust
+fn flush_and_signal(
+    topic_writers: &mut HashMap<u32, TopicWriter>,
+    dirty_topics: &mut HashSet<u32>,
+    pending_signals: &mut Vec<BatchSuccess>,
+    replication_tx: &Option<mpsc::Sender<DataReplicationRequest>>,
+) {
+    // 1. fsync every dirty topic writer
+    for &topic_id in dirty_topics.iter() {
+        if let Some(tw) = topic_writers.get_mut(&topic_id) {
+            tw.writer.fsync();  // flush BufWriter + sync_all
+        }
+    }
+    dirty_topics.clear();
+
+    // 2. Signal all pending write completions (ACK gate)
+    // 3. Queue replication entries
+    for success in pending_signals.drain(..) {
+        if let Some(tx) = success.write_done_tx {
+            let _ = tx.send(());  // Connection handler sends ACK to client
+        }
+        if let Some(rep_tx) = replication_tx {
+            let _ = rep_tx.try_send(/* replication entry */);
+        }
+    }
+}
+```
+
+**Ordering guarantee**: The `write_done_tx` signal is sent **after** `fsync` completes, ensuring the client ACK reflects actual storage durability.
+
+### 22.5 ACK-After-Durability (Connection Handler)
+
+The connection handler creates a `oneshot` channel per write request and embeds the sender in the `IngestionRequest`:
+
+```
+Client                  Connection Handler             Ingestion Actor
+  │                            │                              │
+  │── Ingest(payload) ────────▶│                              │
+  │                            │── IngestionRequest ─────────▶│
+  │                            │   { write_done_tx: Some(tx) }│
+  │                            │                              │
+  │                            │   (writes accumulate...)     │
+  │                            │                              │
+  │                            │                 fsync() ─────│
+  │                            │◀──── write_done_rx ──────────│
+  │                            │                              │
+  │◀──── ACK ─────────────────│                              │
+  │                            │                              │
+```
+
+**Key property**: The ACK to the client is delayed until the ingestion actor has fsynced the data to stable storage. This provides the same durability guarantee as per-write sync, but with amortized I/O cost.
+
+### 22.6 Multi-Actor Path
+
+The multi-actor ingestion path (`run_ingestion_actor_sync`) uses the same dual-threshold strategy but with `std::time::Instant` for timing (since it runs on a plain OS thread, not tokio):
+
+```rust
+let mut last_write = std::time::Instant::now();
+
+// In the spin-wait loop:
+if last_write.elapsed() >= FLUSH_TIMEOUT && !pending_signals.is_empty() {
+    flush_and_signal_sync(...);
+    dirty_bytes = 0;
+    last_write = std::time::Instant::now();
+}
+```
+
+### 22.7 Shutdown Flush
+
+On graceful shutdown (SIGTERM/SIGINT), the ingestion actor loop exits and flushes any remaining buffered data:
+
+```rust
+// After loop exits:
+if !pending_signals.is_empty() {
+    flush_and_signal(&mut topic_writers, &mut dirty_topics, &mut pending_signals, &replication_tx);
+}
+
+// Close all topic writers (fsync + seal + rename)
+for (_, mut tw) in topic_writers.drain() {
+    tw.writer.fsync();
+}
+```
+
+This ensures zero data loss for acknowledged writes during rolling restarts.
+
+### 22.8 Performance Characteristics
+
+| Metric | Per-Write Sync | Write Buffering (5ms) | Improvement |
+|--------|---------------|----------------------|-------------|
+| **fsync calls/sec** | ~200 (1 per write) | ~5–10 (batched) | **20–40×** |
+| **L1 throughput** | ~8 msg/s | ~34 msg/s | **4.25×** |
+| **L3 throughput** | ~32 msg/s | ~35 msg/s | ~1× (network-bound) |
+| **Tail latency (P99)** | ~50ms (Ceph sync) | ~55ms (+5ms batch) | Negligible |
+
+> **Note**: L3 throughput is dominated by quorum replication latency, not local I/O, so write buffering has minimal impact on L3. The primary beneficiary is L1 (standalone) mode on network-attached storage.
+
+### 22.9 Durability Trade-offs
+
+| Scenario | Behavior | Data Impact |
+|----------|----------|-------------|
+| **Graceful shutdown** | Buffer flushed + fsynced | Zero loss |
+| **SIGKILL / OOM** | Up to 5ms of un-fsynced writes lost | Bounded by `FLUSH_TIMEOUT` |
+| **Ceph RBD pod kill** | `sync_all` may not persist (storage-layer issue) | Requires O_DIRECT or L3 |
+| **Power loss** | Same as SIGKILL | Bounded by `FLUSH_TIMEOUT` |
+
+**Important**: The 5ms `FLUSH_TIMEOUT` bounds the worst-case data loss window. Unlike the aspirational io_uring + O_DIRECT path (§3/§8), the current `BufWriter` path relies on the kernel page cache and `sync_all()`, which may not guarantee persistence on all storage backends (notably Ceph RBD under pod kill).
+
+### 22.10 Future: Migration to io_uring
+
+The write buffering architecture is designed to be replaced by the io_uring backend (§3/§8) without changing the ingestion actor interface:
+
+1. Replace `BufWriter<File>` with `IoUringWriter` in `SegmentWriter`
+2. Replace `flush_buffer()` + `sync_all()` with `IORING_OP_FSYNC` submission
+3. Replace `write_all()` with `IORING_OP_WRITE` with pre-registered buffers
+4. Add `O_DIRECT` for cache-bypass durability
+
+The `flush_and_signal` / ACK-after-durability pattern remains unchanged — only the underlying I/O submission mechanism changes.
+
+---
+
+## 23. CATCHING_UP Protocol
+
+When a consumer requests data at an offset beyond what a server node currently holds, LANCE returns a dedicated **CATCHING_UP** frame rather than an empty fetch response or an error. This allows the consumer to distinguish "no new data yet" from "this node is behind on replication" and apply an appropriate backoff strategy.
+
+**Implementation**:
+- `lnc-network/src/protocol.rs` — `ControlCommand::CatchingUp` (`0x12`)
+- `lnc-network/src/frame.rs` — `Frame::new_catching_up(current_max_offset)`
+- `lance/src/server/command_handlers.rs` — Server-side detection and response
+- `lnc-client/src/client.rs` — `parse_fetch_response` maps `0x12` to `ClientError::ServerCatchingUp`
+- `lnc-client/src/consumer.rs` — `fetch_with_retry` backoff and stale-offset reset
+- `lnc-client/src/error.rs` — `ClientError::ServerCatchingUp { server_offset }`
+
+### 23.1 Wire Format
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                  CATCHING_UP Frame (0x12)                       │
+├────────────────────────┬───────────────────────────────────────┤
+│  Control Command 0x12  │  Payload: current_max_offset (8B LE)  │
+└────────────────────────┴───────────────────────────────────────┘
+```
+
+The 8-byte little-endian payload carries the server's current maximum data offset for the requested topic, enabling the client to track replication progress.
+
+### 23.2 Server-Side Detection
+
+In `handle_fetch_request`, the server checks whether the consumer's requested offset exceeds the topic's total data size:
+
+```rust
+if data.is_empty() && req.start_offset > 0 {
+    let total = topic_registry.total_data_size(req.topic_id);
+    if req.start_offset > total {
+        return Frame::new_catching_up(total);
+    }
+}
+```
+
+This fires when:
+- A follower has not yet replicated to the consumer's position
+- The consumer was previously connected to a more-current node
+- Crash recovery truncated data that the consumer had already read
+
+### 23.3 Client-Side Handling
+
+The consumer's `fetch_with_retry` handles `ServerCatchingUp` with a **fixed 5-second backoff** (not exponential) because the server is healthy — it's just behind on replication:
+
+```
+Consumer                          Server (Follower)
+  │                                    │
+  │── Fetch(offset=5000) ─────────────▶│
+  │                                    │  total_data = 3000
+  │◀── CATCHING_UP(3000) ─────────────│
+  │                                    │
+  │    (sleep 5s, no reconnect)        │
+  │                                    │
+  │── Fetch(offset=5000) ─────────────▶│
+  │                                    │  total_data = 5500 (caught up)
+  │◀── FetchResponse(data) ───────────│
+  │                                    │
+```
+
+### 23.4 Stale Offset Reset
+
+If the server's `current_max_offset` does not advance after **3 consecutive** CATCHING_UP responses, the consumer concludes the gap is permanent (crash-recovery truncation) and resets its offset to the server's position:
+
+```rust
+if stale_count >= STALE_RESET_THRESHOLD {
+    tracing::warn!(
+        old_offset = self.current_offset,
+        new_offset = *server_offset,
+        lost_bytes = self.current_offset.saturating_sub(*server_offset),
+        "Data permanently unreachable — resetting consumer offset"
+    );
+    self.current_offset = *server_offset;
+}
+```
+
+This prevents the consumer from blocking indefinitely on data that was lost during an unclean shutdown.
+
+### 23.5 Interaction with Replication Modes
+
+| Mode | When CATCHING_UP Fires | Expected Resolution |
+|------|----------------------|---------------------|
+| **L1** | After crash recovery truncates active segment | Stale reset after 3 attempts |
+| **L3** | Consumer hits follower before replication catches up | Server catches up within seconds |
+| **L3 (leader failover)** | New leader may be slightly behind old leader | Resolves after leader election |
+
+---
+
+## 24. Recursive Segment Recovery
+
+LANCE stores segments in a topic-partitioned directory layout (`segments/0/`, `segments/1/`, …). Both startup recovery and segment closing must **recursively traverse** these subdirectories to find all segments requiring attention.
+
+**Implementation**:
+- `lnc-io/src/segment.rs` — `close_unclosed_segments(segments_dir)` (recursive)
+- `lnc-recovery/src/segment_recovery.rs` — `find_segments_needing_recovery(data_dir)` (recursive)
+- `lance/src/server/recovery.rs` — `perform_startup_recovery` orchestrator
+
+### 24.1 Directory Layout
+
+```
+/var/lib/lance/
+├── segments/
+│   ├── 0/                              ← default/system topic
+│   │   ├── 0_1706000000.lnc            ← active segment (needs recovery)
+│   │   └── 0_1705000000-1705999999.lnc ← closed segment (safe)
+│   ├── 42/                             ← user topic ID 42
+│   │   ├── 100_1706100000.lnc          ← active segment
+│   │   └── 0_1706000000-1706099999.lnc ← closed segment
+│   └── 99/                             ← user topic ID 99
+│       └── 0_1706200000.lnc            ← active segment
+└── wal/                                ← future WAL directory
+```
+
+### 24.2 Segment Naming Convention
+
+| Format | State | Example |
+|--------|-------|---------|
+| `{start_index}_{start_ts}.lnc` | **Active** (open for writes) | `0_1706000000.lnc` |
+| `{start_index}_{start_ts}-{end_ts}.lnc` | **Closed** (immutable) | `0_1706000000-1706099999.lnc` |
+
+The presence of a `-` in the filename stem distinguishes closed from active segments.
+
+### 24.3 Recovery Sequence
+
+`perform_startup_recovery` runs at server start before accepting connections:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    STARTUP RECOVERY SEQUENCE                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. cleanup_empty_segments(data_dir)                             │
+│     └── Remove 0-byte .lnc files from aborted creates           │
+│                                                                  │
+│  2. find_segments_needing_recovery(data_dir)   [RECURSIVE]      │
+│     └── Walk all topic subdirectories                            │
+│     └── Collect active segments (no '-' in name)                 │
+│     └── Collect segments with .dirty marker files                │
+│                                                                  │
+│  3. For each segment needing recovery:                           │
+│     a. SegmentRecovery::truncate_to_valid()                      │
+│        └── Parse TLV records from byte 0                         │
+│        └── Truncate at last valid record boundary                │
+│     b. IndexRebuilder::rebuild()                                 │
+│        └── Regenerate sparse index sidecar                       │
+│     c. recovery.clear_dirty_marker()                             │
+│                                                                  │
+│  4. close_unclosed_segments(segments_dir)       [RECURSIVE]     │
+│     └── Walk all topic subdirectories                            │
+│     └── Rename active segments to closed format                  │
+│     └── end_timestamp = current time                             │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Critical ordering**: Truncation (step 3) runs **before** closing (step 4). This ensures corrupt trailing bytes are removed before the segment is marked as closed and becomes immutable.
+
+### 24.4 Recursive Traversal
+
+Both `close_unclosed_segments` and `find_segments_needing_recovery` use the same recursive pattern:
+
+```rust
+pub fn close_unclosed_segments(segments_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut closed = Vec::new();
+    if !segments_dir.exists() { return Ok(closed); }
+
+    for entry in std::fs::read_dir(segments_dir)? {
+        let path = entry?.path();
+
+        // Recurse into topic subdirectories
+        if path.is_dir() {
+            closed.extend(close_unclosed_segments(&path)?);
+            continue;
+        }
+
+        if path.extension().is_some_and(|ext| ext == "lnc") {
+            if let Some(filename) = path.file_stem().and_then(|s| s.to_str()) {
+                if !filename.contains('-') {  // Active segment
+                    let new_path = rename_to_closed_segment(&path, now_ns())?;
+                    closed.push(new_path);
+                }
+            }
+        }
+    }
+    Ok(closed)
+}
+```
+
+### 24.5 Dirty Markers
+
+When a segment is being written to, an optional `.dirty` marker file can be created alongside it (e.g., `0_1706000000.dirty`). This provides an additional signal during recovery:
+
+| Marker Present | Segment State | Recovery Action |
+|---------------|---------------|----------------|
+| No `.dirty` + active name | Normal active segment | Truncate + close |
+| `.dirty` + active name | Write was in progress | Truncate + close + remove marker |
+| `.dirty` + closed name | Close was interrupted | Re-validate + remove marker |
+
+---
+
+## 25. Segment Compaction
+
+Over time, LANCE accumulates many small closed segments — especially under low-throughput workloads or frequent rolling restarts. The **Segment Compactor** merges contiguous small segments into fewer, larger segments to reduce file descriptor pressure and improve sequential read performance.
+
+**Implementation**: `lnc-io/src/segment.rs` — `SegmentCompactor`, `CompactionConfig`, `CompactionResult`, `SegmentMetadata`.
+
+### 25.1 Compaction Strategy
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     COMPACTION DECISION FLOW                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   find_candidates(segments_dir)                                             │
+│       │                                                                     │
+│       ▼                                                                     │
+│   ┌─────────────────────┐                                                   │
+│   │ should_compact()?    │  ← min_segments small files below min_segment_size│
+│   └──────────┬──────────┘                                                   │
+│         YES  │                                                              │
+│              ▼                                                              │
+│   ┌─────────────────────┐                                                   │
+│   │ select_segments()    │  ← contiguous, ≤ max_segment_size, ≤ 16 segments │
+│   └──────────┬──────────┘                                                   │
+│              ▼                                                              │
+│   ┌─────────────────────┐                                                   │
+│   │ compact()            │  ← sequential copy in 64 KB chunks               │
+│   │  • create output     │     seal output                                  │
+│   │  • delete sources    │     (if delete_sources=true)                     │
+│   └─────────────────────┘                                                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 25.2 Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `min_segments` | 4 | Minimum small segments before triggering compaction |
+| `max_segment_size` | 1 GiB | Upper bound on compacted output size |
+| `min_segment_size` | 1 MiB | Segments below this size are compaction candidates |
+| `delete_sources` | `true` | Remove source segments after successful merge |
+
+### 25.3 Compaction Process
+
+1. **Candidate discovery**: Scan `segments_dir` for `.lnc` files smaller than `max_segment_size`, sorted by `start_index`.
+2. **Trigger check**: At least `min_segments` files must be below `min_segment_size`.
+3. **Selection**: Choose up to 16 contiguous segments whose combined size ≤ `max_segment_size`.
+4. **Merge**: Create a new closed segment (`{start_index}_{start_ts}-{end_ts}.lnc`), copy data in 64 KB chunks via `SegmentReader` → `SegmentWriter::append`.
+5. **Cleanup**: Delete source segments and their associated `.sparse.idx` / `.secondary.idx` sidecar files.
+6. **Invocation**: `maybe_compact(segments_dir)` combines all steps — returns `None` if compaction is unnecessary.
+
+### 25.4 Safety Invariants
+
+- **Only closed segments** are compacted — active segments are never touched.
+- **Sequential copy** preserves TLV record ordering.
+- **Source deletion** happens only after the output is sealed, ensuring crash-safety.
+- The compacted segment is named with the first source's `start_index` and `created_at`, maintaining sort ordering.
+
+---
+
+## 26. Circuit Breaker
+
+LANCE implements the **Circuit Breaker** pattern to prevent cascade failures when a downstream dependency (e.g., replication peer, storage backend) becomes unhealthy. The implementation is fully lock-free using atomic operations.
+
+**Implementation**: `lance/src/server/circuit_breaker.rs` — `CircuitBreaker`, `CircuitBreakerConfig`, `CircuitState`.
+
+### 26.1 State Machine
+
+```
+┌──────────┐    failure_threshold     ┌──────────┐
+│          │ ─────────────────────► │          │
+│  CLOSED  │                         │   OPEN   │
+│          │ ◄─────────────────────  │          │
+└──────────┘   success_threshold     └────┬─────┘
+     ▲          (from HalfOpen)           │
+     │                                    │ reset_timeout elapsed
+     │                                    ▼
+     │                              ┌──────────┐
+     └────── success_threshold ────│ HALF-OPEN│
+              successes             │          │
+                                    └──────────┘
+                                          │
+                    any failure ───────────┘ (reopens)
+```
+
+### 26.2 Configuration Presets
+
+| Preset | `failure_threshold` | `success_threshold` | `reset_timeout` | `failure_window` |
+|--------|--------------------:|--------------------:|----------------:|-----------------:|
+| **Default** | 5 | 3 | 30 s | 60 s |
+| **Aggressive** | 3 | 2 | 10 s | 30 s |
+| **Tolerant** | 10 | 5 | 60 s | 120 s |
+
+### 26.3 Lock-Free Implementation
+
+All state is tracked via atomics:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `state` | `AtomicU32` | 0=Closed, 1=Open, 2=HalfOpen |
+| `failure_count` | `AtomicU32` | Consecutive failures in current window |
+| `success_count` | `AtomicU32` | Successes in half-open state |
+| `opened_at` | `AtomicU64` | Timestamp (ms) when circuit tripped |
+| `last_failure_at` | `AtomicU64` | Window tracking for failure rate |
+
+State transitions use `compare_exchange` with `Ordering::AcqRel` to prevent lost updates under concurrency.
+
+### 26.4 Key Behaviours
+
+- **Failure window**: Failures outside `failure_window` reset the counter (prevents old failures from tripping the circuit).
+- **Half-open probing**: After `reset_timeout`, a limited number of requests are allowed through. Any failure immediately reopens the circuit.
+- **Manual control**: `trip()` and `reset()` allow operator intervention via admin commands.
+- **Success reset**: A single success in Closed state resets the failure counter to zero.
+
+---
+
+## 27. Retention Service
+
+LANCE enforces per-topic data retention policies via a background service that periodically scans and deletes expired segments. The service supports both **TTL-based** (time) and **size-based** (bytes) retention.
+
+**Implementation**: `lance/src/server/retention.rs` — `run_retention_service`, `RetentionServiceConfig`, `enforce_topic_retention`.
+
+### 27.1 Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     RETENTION SERVICE                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   tokio::interval(cleanup_interval)                                         │
+│       │                                                                     │
+│       ▼                                                                     │
+│   run_retention_cycle()                                                     │
+│       │                                                                     │
+│       ├── for each topic with retention config:                             │
+│       │   │                                                                 │
+│       │   ├── Phase 1: Mark TTL-expired closed segments                     │
+│       │   ├── Phase 2: Mark size-exceeded segments (oldest first)           │
+│       │   └── Phase 3: Delete marked segments + sidecar indexes             │
+│       │                                                                     │
+│       └── Log summary: segments_deleted, bytes_freed                        │
+│                                                                              │
+│   shutdown_rx ──► graceful exit                                             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 27.2 Retention Policies
+
+| Policy | Configuration | Behaviour |
+|--------|---------------|-----------|
+| **TTL** | `max_age_secs` | Delete closed segments whose end timestamp is older than `now - max_age` |
+| **Size** | `max_bytes` | Delete oldest closed segments until total topic size ≤ `max_bytes` |
+
+Both policies can be combined — TTL is applied first, then size-based cleanup removes additional segments if needed.
+
+### 27.3 Safety Rules
+
+- **Active segments are never deleted** — only closed (immutable) segments are candidates.
+- **Index sidecar cleanup** — `.sparse.idx` and `.secondary.idx` files are deleted alongside the segment.
+- **Dry-run mode** — set `dry_run: true` for testing; logs what *would* be deleted without touching files.
+- **Configurable interval** — default 60-second cycle, configurable via `retention_cleanup_interval` in `Config`.
+
+### 27.4 Metrics
+
+| Event | Log Target | Level |
+|-------|------------|-------|
+| Segment deleted | `lance::retention` | `info` |
+| Delete failed | `lance::retention` | `warn` |
+| No segments expired | `lance::retention` | `debug` |
+| Cycle summary | `lance::retention` | `info` |
+
+---
+
+## 28. Token Authentication
+
+LANCE supports optional **bearer-token authentication** for securing client connections. Authentication can be applied to all operations or limited to write-only enforcement (reads remain open).
+
+**Implementation**: `lance/src/auth.rs` — `TokenValidator`, `AuthResult`, `AuthError`, `AuthSettings`.
+
+### 28.1 Configuration
+
+Authentication is configured via the `[auth]` section in `lance.toml`:
+
+```toml
+[auth]
+enabled = true
+write_only = false          # true = only writes require auth
+tokens = ["token1", "token2"]
+token_file = "/etc/lance/tokens"  # one token per line
+```
+
+### 28.2 Authentication Flow
+
+```
+Client                   Connection Handler              TokenValidator
+  │                            │                              │
+  │── Frame(AUTH token) ──────▶│                              │
+  │                            │── validate_for_operation() ─▶│
+  │                            │                              │
+  │                            │◀── AuthResult ───────────────│
+  │                            │                              │
+  │◀── ACK/REJECT ────────────│                              │
+  │                            │                              │
+```
+
+### 28.3 AuthResult Variants
+
+| Result | Meaning |
+|--------|---------|
+| `Allowed` | Token valid, operation permitted |
+| `Denied` | Token invalid or missing |
+| `NotRequired` | Auth disabled or operation exempt (read in write-only mode) |
+
+### 28.4 Key Properties
+
+- **Token storage**: Tokens are loaded at startup from config or file, stored in a `HashSet` for O(1) lookup.
+- **Write-only mode**: When `write_only = true`, read operations (`Fetch`, `ListTopics`, `Subscribe`) bypass authentication. Write operations (`Ingest`, `CreateTopic`, `DeleteTopic`) always require a valid token.
+- **Disabled by default**: When `enabled = false`, all operations are permitted without authentication.
+- **Connection-level validation**: Authentication is checked per-frame in the connection handler, before the frame is dispatched to ingestion or command handlers.
+
+---
+
+## 29. Hybrid Logical Clock (HLC)
+
+LANCE uses a **Hybrid Logical Clock** for causally consistent timestamps across distributed nodes. The HLC combines physical wall-clock time with a logical counter, ensuring monotonicity even when clocks drift or events arrive out of order.
+
+**Implementation**: `lnc-core/src/hlc.rs` — `HlcTimestamp`, `HybridLogicalClock`, `ClockHealth`.
+
+### 29.1 Timestamp Layout
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    HLC Timestamp (64 bits)                  │
+├────────────────────────────────────┬───────────────────────┤
+│        physical_ms (44 bits)        │   logical (20 bits)   │
+│  milliseconds since Unix epoch     │  counter (0–1,048,575) │
+└────────────────────────────────────┴───────────────────────┘
+```
+
+| Component | Bits | Range | Notes |
+|-----------|------|-------|-------|
+| `physical_ms` | 44 | ~557 years (until 2527) | Wall-clock milliseconds |
+| `logical` | 20 | 0–1,048,575 | Events per millisecond per node |
+
+### 29.2 Algorithm
+
+**Local event** (`now()`):
+1. Read wall clock → `wall_ms`
+2. If `wall_ms > last.physical`: use `wall_ms`, reset logical to 0
+3. Else: keep physical, increment logical
+4. CAS (`compare_exchange_weak`) to ensure monotonicity under concurrency
+
+**Remote receive** (`receive(remote_ts)`):
+1. Read wall clock → `wall_ms`
+2. If `wall_ms > max(local, remote)`: use wall clock, reset logical
+3. If `local > remote`: increment local logical
+4. If `remote > local`: adopt remote physical, increment remote logical
+5. If equal physical: increment `max(local_logical, remote_logical)`
+6. CAS to commit
+
+### 29.3 Clock Health Monitoring
+
+| Health | Drift | Action |
+|--------|-------|--------|
+| `Healthy` | < 100 ms | Normal operation |
+| `Degraded` | 100 ms – 1 s | Warning logged, check NTP |
+| `Critical` | > 1 s | Alert, potential partition or NTP failure |
+
+### 29.4 Thread Safety
+
+The HLC uses `AtomicU64` with `compare_exchange_weak` (AcqRel/Acquire ordering). The CAS loop naturally handles contention — failed CAS retries with the updated value. The only spin case is logical counter exhaustion (>1M events/ms), which is practically unreachable.
+
+### 29.5 Usage in LANCE
+
+The HLC is used by the replication layer to establish causal ordering of writes across nodes. The `receive()` method is called when processing `AppendEntries` from the leader, ensuring that follower timestamps respect the happened-before relationship with leader events.
+
+---
+
+## 30. Subscription Management
+
+LANCE tracks active consumer subscriptions and committed offsets server-side to support `Subscribe`/`Unsubscribe`/`CommitOffset` control commands. This enables server-assisted resume-from-committed-offset semantics.
+
+**Implementation**: `lance/src/subscription.rs` — `SubscriptionManager`.
+
+### 30.1 Data Model
+
+```
+SubscriptionManager
+├── subscriptions: HashMap<(topic_id, consumer_id), SubscriptionInfo>
+│   ├── current_offset: u64
+│   └── last_activity: u64  (millis since epoch)
+│
+└── committed_offsets: HashMap<(topic_id, consumer_id), CommittedOffset>
+    └── offset: u64
+```
+
+### 30.2 Operations
+
+| Operation | Behaviour |
+|-----------|-----------|
+| `subscribe(consumer_id, topic_id, offset, batch_size)` | Creates subscription; resumes from committed offset if `offset=0` and a prior commit exists |
+| `unsubscribe(consumer_id, topic_id)` | Removes subscription; committed offsets **persist** |
+| `commit_offset(consumer_id, topic_id, offset)` | Saves durable offset; updates subscription position if active |
+| `get_committed_offset(topic_id, consumer_id)` | Returns last committed offset (survives unsubscribe) |
+
+### 30.3 Offset Resume Logic
+
+When a consumer subscribes with `offset=0` (SeekPosition::Beginning):
+1. Check for a previously committed offset for `(topic_id, consumer_id)`
+2. If found, resume from the committed offset (not from the beginning)
+3. If not found, start from offset 0
+
+Explicit offsets always override committed offsets.
+
+### 30.4 Interaction with Client-Side Offsets (§19)
+
+The `SubscriptionManager` provides **server-assisted** offset tracking that complements the client-side `OffsetStore` (§19). The server tracks committed offsets in memory for the duration of the process; the client-side store provides durable, cross-restart persistence. In typical deployments:
+
+- **Client `OffsetStore`** is authoritative for long-term offset persistence
+- **Server `SubscriptionManager`** provides within-session resume and activity tracking
+
+### 30.5 Concurrency
+
+The `SubscriptionManager` uses `RwLock<HashMap<...>>` for both maps. This is acceptable because subscription operations are infrequent control-plane events (not hot-path data-plane). The `RwLock` allows concurrent reads (e.g., multiple `get_committed_offset` calls) while serialising writes.
 
 ---
 

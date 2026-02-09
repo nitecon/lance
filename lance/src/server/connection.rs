@@ -14,14 +14,14 @@ use crate::topic::TopicRegistry;
 use bytes::Bytes;
 use lnc_core::{BatchPool, LanceError, Result};
 use lnc_network::{ControlCommand, FrameType, LWP_HEADER_SIZE, parse_frame};
-use lnc_replication::{ClusterCoordinator, LeaderConnectionPool};
+use lnc_replication::{AsyncQuorumManager, ClusterCoordinator, LeaderConnectionPool, QuorumResult};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 // 4 Golden Signals - sampled latency tracking (hot-path safe)
 use lnc_metrics::time_ingest_sampled;
 
-const INITIAL_BUFFER_SIZE: usize = 64 * 1024;
+const INITIAL_BUFFER_SIZE: usize = 256 * 1024;
 
 /// Connection context holding shared state for frame processing
 struct ConnectionContext<'a, S> {
@@ -35,16 +35,30 @@ struct ConnectionContext<'a, S> {
     token_validator: &'a TokenValidator,
     /// Whether this connection has been authenticated
     authenticated: &'a mut bool,
+    /// Quorum manager for L3 mode (None in L1 standalone mode)
+    quorum_manager: &'a Option<Arc<AsyncQuorumManager>>,
+    /// This node's ID (for recording leader's own quorum ACK)
+    node_id: u16,
 }
 
 /// Result of frame processing
 enum FrameAction {
     /// Continue processing next frame
     Continue,
+    /// Ingest submitted — ACK deferred until batch completion
+    Pending(PendingIngest),
     /// Frame was forwarded, buffer already adjusted
     Forwarded,
     /// Fatal error, close connection
     Error(LanceError),
+}
+
+/// Deferred ingest state: holds the channels needed to complete an ingest
+/// after all frames in a read batch have been submitted.
+struct PendingIngest {
+    batch_id: u64,
+    write_done_rx: tokio::sync::oneshot::Receiver<()>,
+    quorum_rx: Option<(u64, tokio::sync::oneshot::Receiver<QuorumResult>)>,
 }
 
 /// Handle a single client connection
@@ -60,13 +74,14 @@ pub async fn handle_connection<S>(
     ingestion_tx: IngestionSender,
     _batch_pool: Arc<BatchPool>,
     topic_registry: Arc<TopicRegistry>,
-    _node_id: u16,
+    node_id: u16,
     max_payload_size: usize,
     rate_limiter: Arc<ConsumerRateLimiter>,
     subscription_manager: Arc<SubscriptionManager>,
     cluster: Option<Arc<ClusterCoordinator>>,
     leader_pool: Option<Arc<LeaderConnectionPool>>,
     token_validator: Arc<TokenValidator>,
+    quorum_manager: Option<Arc<AsyncQuorumManager>>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -106,6 +121,8 @@ where
             leader_pool: &leader_pool,
             token_validator: &token_validator,
             authenticated: &mut authenticated,
+            quorum_manager: &quorum_manager,
+            node_id,
         };
 
         read_offset = process_frames(ctx, &mut buffer, read_offset).await?;
@@ -173,6 +190,11 @@ async fn process_frames<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // Collect deferred ingest ACKs so all frames from one read() are
+    // submitted to the ingestion actor together.  The actor batches them
+    // into a single fsync, and we send all ACKs in one write.
+    let mut pending: Vec<PendingIngest> = Vec::new();
+
     while read_offset >= LWP_HEADER_SIZE {
         match parse_frame(&buffer[..read_offset])? {
             Some((frame, consumed)) => {
@@ -180,6 +202,12 @@ where
 
                 match action {
                     FrameAction::Continue => {
+                        buffer.copy_within(consumed..read_offset, 0);
+                        read_offset -= consumed;
+                        maybe_shrink_buffer(buffer, read_offset);
+                    },
+                    FrameAction::Pending(p) => {
+                        pending.push(p);
                         buffer.copy_within(consumed..read_offset, 0);
                         read_offset -= consumed;
                         maybe_shrink_buffer(buffer, read_offset);
@@ -194,6 +222,64 @@ where
             None => break,
         }
     }
+
+    // ── Batch-complete all deferred ingests ─────────────────────────────
+    if !pending.is_empty() {
+        let count = pending.len();
+        let mut ack_buf = Vec::with_capacity(count * LWP_HEADER_SIZE);
+
+        for p in pending {
+            // Await write completion (all fire together after one fsync)
+            if p.write_done_rx.await.is_err() {
+                return Err(LanceError::Io(std::io::Error::other(
+                    "Ingestion write failed",
+                )));
+            }
+
+            // Await quorum for L3 writes
+            if let Some((write_id, rx)) = p.quorum_rx {
+                if let Some(qm) = ctx.quorum_manager {
+                    let result = qm.wait_for_quorum(write_id, rx).await;
+                    match result {
+                        QuorumResult::Success => {},
+                        QuorumResult::Timeout => {
+                            warn!(
+                                target: "lance::server",
+                                batch_id = p.batch_id,
+                                write_id,
+                                "Quorum timeout — ACKing client anyway (data is locally durable)"
+                            );
+                        },
+                        QuorumResult::Failed | QuorumResult::Partial { .. } => {
+                            warn!(
+                                target: "lance::server",
+                                batch_id = p.batch_id,
+                                write_id,
+                                result = ?result,
+                                "Quorum failed — ACKing client anyway (data is locally durable)"
+                            );
+                        },
+                    }
+                }
+            }
+
+            ack_buf.extend_from_slice(&lnc_network::encode_ack_bytes(p.batch_id));
+        }
+
+        // Batch-write all ACKs in one syscall
+        if ctx.stream.write_all(&ack_buf).await.is_err() {
+            return Err(LanceError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Failed to send batch ack",
+            )));
+        }
+
+        // Each pending ingest had begin_operation() called; balance them.
+        for _ in 0..count {
+            end_operation();
+        }
+    }
+
     Ok(read_offset)
 }
 
@@ -284,11 +370,29 @@ where
     }
 
     if let Some(ref payload) = frame.payload {
+        // In L3 mode, register the write BEFORE sending to ingestion so the
+        // write_id flows through the ingestion → forwarder → quorum ACK chain.
+        let quorum_rx = if let Some(qm) = ctx.quorum_manager {
+            let (write_id, rx) = qm.register_write().await;
+            // Record the leader's own local write as an ACK immediately.
+            // In a 3-node cluster with required_acks=2, this means only 1
+            // follower ACK is needed (true majority quorum).
+            qm.record_ack(write_id, ctx.node_id).await;
+            Some((write_id, rx))
+        } else {
+            None
+        };
+
+        // Create a oneshot channel so the ingestion actor can signal write completion.
+        let (write_done_tx, write_done_rx) = tokio::sync::oneshot::channel();
+
         let request = IngestionRequest {
             topic_id,
             timestamp_ns,
             record_count,
             payload: payload.clone(),
+            write_id: quorum_rx.as_ref().map(|(id, _)| *id),
+            write_done_tx: Some(write_done_tx),
         };
 
         if let Err(e) = ctx.ingestion_tx.send(request).await {
@@ -296,15 +400,13 @@ where
             return FrameAction::Error(e);
         }
 
-        let ack = lnc_network::Frame::new_ack(batch_id);
-        let ack_bytes = lnc_network::encode_frame(&ack);
-        if ctx.stream.write_all(&ack_bytes).await.is_err() {
-            end_operation();
-            return FrameAction::Error(LanceError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "Failed to send ack",
-            )));
-        }
+        // Defer the write_done await and ACK to process_frames so all
+        // frames from a single read() are batched together.
+        return FrameAction::Pending(PendingIngest {
+            batch_id,
+            write_done_rx,
+            quorum_rx,
+        });
     }
 
     end_operation();

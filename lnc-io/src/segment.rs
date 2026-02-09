@@ -1,9 +1,17 @@
+use crate::backend::IoBackend;
 use bytes::Bytes;
 use lnc_core::{LanceError, Result};
 use lnc_metrics::time_io_sampled;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+/// Default write-buffer capacity (4 MiB).
+///
+/// Writes are accumulated in this buffer before being flushed to the
+/// underlying file, dramatically reducing the number of `write(2)` syscalls
+/// on network-attached storage such as Ceph RBD.
+const DEFAULT_WRITE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
@@ -15,8 +23,21 @@ pub enum SegmentState {
     Archived,
 }
 
+/// I/O backend for `SegmentWriter`.
+///
+/// - **Buffered** (default): `BufWriter<File>` — cross-platform, sequential
+///   writes with a 4 MiB user-space buffer.  Best for Ceph RBD and general
+///   use.
+/// - **Direct**: Any `IoBackend` implementation (`IoUringBackend` with
+///   `O_DIRECT`, or `Pwritev2Backend`).  Uses positional writes and bypasses
+///   the page cache.  Best for local NVMe with io_uring.
+enum WriteBackend {
+    Buffered(BufWriter<File>),
+    Direct(Box<dyn IoBackend>),
+}
+
 pub struct SegmentWriter {
-    file: File,
+    backend: WriteBackend,
     path: PathBuf,
     write_offset: u64,
     state: SegmentState,
@@ -33,7 +54,10 @@ impl SegmentWriter {
             .open(path)?;
 
         Ok(Self {
-            file,
+            backend: WriteBackend::Buffered(BufWriter::with_capacity(
+                DEFAULT_WRITE_BUFFER_SIZE,
+                file,
+            )),
             path: path.to_path_buf(),
             write_offset: 0,
             state: SegmentState::Open,
@@ -50,11 +74,29 @@ impl SegmentWriter {
             .open(path)?;
 
         Ok(Self {
-            file,
+            backend: WriteBackend::Buffered(BufWriter::with_capacity(
+                DEFAULT_WRITE_BUFFER_SIZE,
+                file,
+            )),
             path: path.to_path_buf(),
             write_offset: 0,
             state: SegmentState::Open,
             start_index,
+            record_count: 0,
+        })
+    }
+
+    /// Create a segment writer backed by an `IoBackend` (io_uring or pwritev2).
+    ///
+    /// The backend handles its own file opening (with `O_DIRECT` if
+    /// appropriate), so we only need the path for metadata.
+    pub fn create_with_backend(path: &Path, backend: Box<dyn IoBackend>) -> Result<Self> {
+        Ok(Self {
+            backend: WriteBackend::Direct(backend),
+            path: path.to_path_buf(),
+            write_offset: 0,
+            state: SegmentState::Open,
+            start_index: 0,
             record_count: 0,
         })
     }
@@ -65,7 +107,10 @@ impl SegmentWriter {
         let write_offset = file.seek(SeekFrom::End(0))?;
 
         Ok(Self {
-            file,
+            backend: WriteBackend::Buffered(BufWriter::with_capacity(
+                DEFAULT_WRITE_BUFFER_SIZE,
+                file,
+            )),
             path: path.to_path_buf(),
             write_offset,
             state: SegmentState::Open,
@@ -82,7 +127,14 @@ impl SegmentWriter {
         }
 
         let offset = self.write_offset;
-        self.file.write_all(data)?;
+        match &mut self.backend {
+            WriteBackend::Buffered(bw) => {
+                bw.write_all(data)?;
+            },
+            WriteBackend::Direct(backend) => {
+                backend.write(data, offset)?;
+            },
+        }
         self.write_offset += data.len() as u64;
         Ok(offset)
     }
@@ -96,12 +148,57 @@ impl SegmentWriter {
         Ok(offset)
     }
 
+    /// Durable save: write data and flush to stable storage.
+    ///
+    /// This is the canonical write function that **must** be used by both L1
+    /// and L3 ingestion paths.  Unlike `write_batch` (which only calls
+    /// `write_all`), `save` follows the write with `sync_data` so the data
+    /// is guaranteed to survive a process crash or pod kill.
+    ///
+    /// Returns the byte offset at which the batch was written.
+    pub fn save(&mut self, data: &[u8]) -> Result<u64> {
+        let _latency_timer = time_io_sampled();
+
+        let offset = self.append(data)?;
+        self.record_count += 1;
+        match &mut self.backend {
+            WriteBackend::Buffered(bw) => {
+                bw.flush()?;
+                bw.get_mut().sync_data()?;
+            },
+            WriteBackend::Direct(backend) => {
+                backend.fsync()?;
+            },
+        }
+        Ok(offset)
+    }
+
     pub fn fsync(&mut self) -> Result<()> {
         self.sync()
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        self.file.sync_all()?;
+        match &mut self.backend {
+            WriteBackend::Buffered(bw) => {
+                bw.flush()?;
+                bw.get_mut().sync_all()?;
+            },
+            WriteBackend::Direct(backend) => {
+                backend.fsync()?;
+            },
+        }
+        Ok(())
+    }
+
+    /// Flush the internal write buffer to the OS page cache without
+    /// syncing to stable storage.  Useful when the caller will batch
+    /// multiple flushes before a single `fsync`.
+    ///
+    /// For `Direct` backends this is a no-op (writes go straight to disk).
+    pub fn flush_buffer(&mut self) -> Result<()> {
+        if let WriteBackend::Buffered(bw) = &mut self.backend {
+            bw.flush()?;
+        }
         Ok(())
     }
 
@@ -155,6 +252,81 @@ impl SegmentWriter {
     #[must_use]
     pub fn record_count(&self) -> u64 {
         self.record_count
+    }
+
+    /// Create a segment with a specific filename (leader-dictated).
+    ///
+    /// Used by followers in L3 mode to create segments with the exact name
+    /// dictated by the leader, ensuring byte-identical segment layouts.
+    pub fn create_named(dir: &Path, segment_name: &str) -> Result<Self> {
+        let path = dir.join(segment_name);
+        Self::create(&path)
+    }
+
+    /// Write data at a specific offset within the segment.
+    ///
+    /// Used by followers in L3 mode to write at the exact offset dictated
+    /// by the leader. Validates that the offset matches the current write
+    /// position to detect desynchronization.
+    ///
+    /// Returns `Ok(offset)` on success, or an error if the offset doesn't
+    /// match the current write position or the segment is not open.
+    pub fn write_at_offset(&mut self, offset: u64, data: &[u8]) -> Result<u64> {
+        if self.state != SegmentState::Open {
+            return Err(LanceError::Io(std::io::Error::other(
+                "Segment is not open for writing",
+            )));
+        }
+
+        if offset != self.write_offset {
+            return Err(LanceError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Write offset mismatch: expected {}, got {} (segment: {})",
+                    self.write_offset,
+                    offset,
+                    self.path.display()
+                ),
+            )));
+        }
+
+        match &mut self.backend {
+            WriteBackend::Buffered(bw) => {
+                bw.write_all(data)?;
+            },
+            WriteBackend::Direct(backend) => {
+                backend.write(data, offset)?;
+            },
+        }
+        self.write_offset += data.len() as u64;
+        self.record_count += 1;
+        Ok(offset)
+    }
+
+    /// Durable save at a specific offset: write + sync_data.
+    ///
+    /// Follower counterpart of [`save`].  Same durability guarantee —
+    /// data survives process crash — but validates the offset matches
+    /// the leader-dictated position first.
+    pub fn save_at_offset(&mut self, offset: u64, data: &[u8]) -> Result<u64> {
+        let result = self.write_at_offset(offset, data)?;
+        match &mut self.backend {
+            WriteBackend::Buffered(bw) => {
+                bw.flush()?;
+                bw.get_mut().sync_data()?;
+            },
+            WriteBackend::Direct(backend) => {
+                backend.fsync()?;
+            },
+        }
+        Ok(result)
+    }
+
+    /// Get the segment filename (without directory path).
+    #[inline]
+    #[must_use]
+    pub fn filename(&self) -> Option<&str> {
+        self.path.file_name().and_then(|f| f.to_str())
     }
 }
 
@@ -791,8 +963,10 @@ fn rename_to_closed_segment(path: &Path, end_timestamp: u64) -> Result<PathBuf> 
     Ok(new_path)
 }
 
-/// Close any unclosed segments found during startup
-/// This handles crash recovery where segments weren't properly closed
+/// Close any unclosed segments found during startup.
+///
+/// Recurses into subdirectories so that topic-partitioned layouts
+/// (`segments/0/`, `segments/1/`, …) are handled correctly.
 pub fn close_unclosed_segments(segments_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut closed = Vec::new();
 
@@ -803,6 +977,12 @@ pub fn close_unclosed_segments(segments_dir: &Path) -> Result<Vec<PathBuf>> {
     for entry in std::fs::read_dir(segments_dir)? {
         let entry = entry?;
         let path = entry.path();
+
+        // Recurse into topic subdirectories
+        if path.is_dir() {
+            closed.extend(close_unclosed_segments(&path)?);
+            continue;
+        }
 
         if path.extension().is_some_and(|ext| ext == "lnc") {
             if let Some(filename) = path.file_stem().and_then(|s| s.to_str()) {

@@ -198,8 +198,8 @@ impl Compressor {
         self.decompress_raw(algorithm, compressed_data, original_size)
     }
 
-    /// Raw compression without header (internal use)
-    fn compress_raw(&self, data: &[u8]) -> CompressionResult<Vec<u8>> {
+    /// Raw compression without header.
+    pub fn compress_raw(&self, data: &[u8]) -> CompressionResult<Vec<u8>> {
         match self.algorithm {
             CompressionAlgorithm::None => Ok(data.to_vec()),
             CompressionAlgorithm::Lz4 => self.compress_lz4(data),
@@ -228,8 +228,8 @@ impl Compressor {
         Err(CompressionError::UnsupportedAlgorithm(self.algorithm as u8))
     }
 
-    /// Raw decompression without header (internal use)
-    fn decompress_raw(
+    /// Raw decompression without header.
+    pub fn decompress_raw(
         &self,
         algorithm: CompressionAlgorithm,
         data: &[u8],

@@ -88,6 +88,7 @@ impl<'a> ControlCommandDispatcher<'a> {
             ControlCommand::SubscribeAck
             | ControlCommand::CommitAck
             | ControlCommand::FetchResponse
+            | ControlCommand::CatchingUp
             | ControlCommand::TopicResponse
             | ControlCommand::ClusterStatusResponse
             | ControlCommand::ErrorResponse => handle_invalid_client_command(),
@@ -125,6 +126,23 @@ impl<'a> ControlCommandDispatcher<'a> {
             req.max_bytes,
         ) {
             Ok(data) => {
+                // If no data returned and the requested offset is beyond what we have,
+                // this server hasn't replicated to the consumer's position yet.
+                // Signal CATCHING_UP so the client backs off and retries.
+                if data.is_empty() && req.start_offset > 0 {
+                    let total = self.ctx.topic_registry.total_data_size(req.topic_id);
+                    if req.start_offset > total {
+                        debug!(
+                            target: "lance::server",
+                            topic_id = req.topic_id,
+                            requested_offset = req.start_offset,
+                            available = total,
+                            "Fetch: server behind consumer offset, returning CATCHING_UP"
+                        );
+                        return Frame::new_catching_up(total);
+                    }
+                }
+
                 let data_len = data.len() as u64;
                 let next_offset = req.start_offset + data_len;
                 let record_count: u32 = if data.is_empty() { 0 } else { 1 };

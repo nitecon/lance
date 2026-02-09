@@ -215,6 +215,26 @@ impl RaftNode {
         self.hlc.now()
     }
 
+    /// Get the last log index.
+    #[inline]
+    #[must_use]
+    pub const fn last_log_index(&self) -> u64 {
+        self.last_log_index
+    }
+
+    /// Advance the Raft log index after a successful write or replication.
+    ///
+    /// Called by:
+    /// - **Leader**: after each local write, before replicating to followers
+    /// - **Follower**: after processing AppendEntries with data entries
+    ///
+    /// This ensures `last_log_index` reflects actual replication progress,
+    /// so elections (§5.4.1) pick the candidate with the most up-to-date log.
+    pub fn advance_log(&mut self, entry_count: u64) {
+        self.last_log_index += entry_count;
+        self.last_log_term = self.current_term;
+    }
+
     // =========================================================================
     // Pre-Vote Protocol (Raft §9.6)
     // =========================================================================
@@ -472,8 +492,18 @@ impl RaftNode {
             self.state = RaftState::Follower;
         }
 
-        // Log consistency check would go here
-        // For now, assume success
+        // Advance log index for data entries received from leader.
+        // This tracks replication progress so elections (§5.4.1) pick
+        // the follower with the most up-to-date log.
+        let data_entries = req
+            .entries
+            .iter()
+            .filter(|e| e.entry_type == crate::codec::EntryType::Data)
+            .count() as u64;
+        if data_entries > 0 {
+            self.advance_log(data_entries);
+        }
+
         let success = true;
 
         // Update commit index

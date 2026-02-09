@@ -1,11 +1,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReplicationMode {
-    /// L1: Single node, no replication
+    /// L1: Single node, no replication (standalone)
     #[default]
     L1,
-    /// L2: Async replication to followers
-    L2,
-    /// L3: Sync replication with quorum
+    /// L3: Filesystem-consistent quorum replication
     L3,
 }
 
@@ -13,7 +11,7 @@ impl ReplicationMode {
     #[inline]
     #[must_use]
     pub const fn requires_quorum(&self) -> bool {
-        matches!(self, Self::L2 | Self::L3)
+        matches!(self, Self::L3)
     }
 
     #[inline]
@@ -32,9 +30,8 @@ impl ReplicationMode {
     #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
-            Self::L1 => "L1 (Log-Based)",
-            Self::L2 => "L2 (Async Replication)",
-            Self::L3 => "L3 (Sync Quorum)",
+            Self::L1 => "L1 (Standalone)",
+            Self::L3 => "L3 (Quorum)",
         }
     }
 }
@@ -51,9 +48,11 @@ impl std::str::FromStr for ReplicationMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "l1" | "log" | "log-based" | "standalone" => Ok(Self::L1),
-            "l2" | "async" | "async-replication" => Ok(Self::L2),
             "l3" | "sync" | "quorum" | "sync-quorum" => Ok(Self::L3),
-            _ => Err(format!("Unknown replication mode: {}", s)),
+            _ => Err(format!(
+                "Unknown replication mode: '{}'. Valid modes: l1, l3",
+                s
+            )),
         }
     }
 }
@@ -72,28 +71,25 @@ mod tests {
     #[test]
     fn test_replication_mode_requires_quorum() {
         assert!(!ReplicationMode::L1.requires_quorum());
-        assert!(ReplicationMode::L2.requires_quorum());
+        assert!(ReplicationMode::L3.requires_quorum());
     }
 
     #[test]
     fn test_replication_mode_is_synchronous() {
         assert!(!ReplicationMode::L1.is_synchronous());
-        assert!(!ReplicationMode::L2.is_synchronous());
         assert!(ReplicationMode::L3.is_synchronous());
     }
 
     #[test]
     fn test_replication_mode_name() {
-        assert_eq!(ReplicationMode::L1.name(), "L1 (Log-Based)");
-        assert_eq!(ReplicationMode::L2.name(), "L2 (Async Replication)");
-        assert_eq!(ReplicationMode::L3.name(), "L3 (Sync Quorum)");
+        assert_eq!(ReplicationMode::L1.name(), "L1 (Standalone)");
+        assert_eq!(ReplicationMode::L3.name(), "L3 (Quorum)");
     }
 
     #[test]
     fn test_replication_mode_display() {
-        assert_eq!(format!("{}", ReplicationMode::L1), "L1 (Log-Based)");
-        assert_eq!(format!("{}", ReplicationMode::L2), "L2 (Async Replication)");
-        assert_eq!(format!("{}", ReplicationMode::L3), "L3 (Sync Quorum)");
+        assert_eq!(format!("{}", ReplicationMode::L1), "L1 (Standalone)");
+        assert_eq!(format!("{}", ReplicationMode::L3), "L3 (Quorum)");
     }
 
     #[test]
@@ -118,24 +114,6 @@ mod tests {
         assert_eq!(
             "standalone".parse::<ReplicationMode>().unwrap(),
             ReplicationMode::L1
-        );
-
-        // L2 variants
-        assert_eq!(
-            "l2".parse::<ReplicationMode>().unwrap(),
-            ReplicationMode::L2
-        );
-        assert_eq!(
-            "L2".parse::<ReplicationMode>().unwrap(),
-            ReplicationMode::L2
-        );
-        assert_eq!(
-            "async".parse::<ReplicationMode>().unwrap(),
-            ReplicationMode::L2
-        );
-        assert_eq!(
-            "async-replication".parse::<ReplicationMode>().unwrap(),
-            ReplicationMode::L2
         );
 
         // L3 variants
@@ -171,13 +149,13 @@ mod tests {
     #[test]
     fn test_replication_mode_equality() {
         assert_eq!(ReplicationMode::L1, ReplicationMode::L1);
-        assert_eq!(ReplicationMode::L2, ReplicationMode::L2);
-        assert_ne!(ReplicationMode::L1, ReplicationMode::L2);
+        assert_eq!(ReplicationMode::L3, ReplicationMode::L3);
+        assert_ne!(ReplicationMode::L1, ReplicationMode::L3);
     }
 
     #[test]
     fn test_replication_mode_clone() {
-        let original = ReplicationMode::L2;
+        let original = ReplicationMode::L3;
         let cloned = original;
         assert_eq!(original, cloned);
     }

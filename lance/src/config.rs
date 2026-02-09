@@ -30,6 +30,9 @@ pub struct Config {
     /// TLS settings for secure connections
     #[serde(default)]
     pub tls: TlsSettings,
+    /// Quorum timeout in milliseconds for L3 replication (default: 100ms)
+    #[serde(default)]
+    pub replication_quorum_timeout_ms: Option<u64>,
 }
 
 /// Authentication configuration for the server
@@ -142,6 +145,7 @@ impl Default for Config {
             retention_cleanup_interval_secs: default_retention_cleanup_interval(),
             auth: AuthSettings::default(),
             tls: TlsSettings::default(),
+            replication_quorum_timeout_ms: None,
         }
     }
 }
@@ -242,7 +246,7 @@ impl Config {
             path: wal_dir.join("current.wal"),
             dir: wal_dir,
             max_segment_size: self.wal.size,
-            sync_on_write: true,
+            sync_on_write: false,
         }
     }
 
@@ -474,7 +478,7 @@ replication_addr = "127.0.0.1:1992"
 metrics_addr = "127.0.0.1:9091"
 health_addr = "127.0.0.1:8081"
 data_dir = "/tmp/lance-test"
-replication_mode = "l2"
+replication_mode = "l3"
 peers = ["127.0.0.1:1994", "127.0.0.1:1995"]
 
 [wal]
@@ -498,7 +502,7 @@ segment_max_size = 2147483648
         let config = Config::from_file(&config_path).unwrap();
         assert_eq!(config.node_id, 1);
         assert_eq!(config.listen_addr.port(), 1993);
-        assert_eq!(config.replication_mode, "l2");
+        assert_eq!(config.replication_mode, "l3");
         assert_eq!(config.peers.len(), 2);
         assert!(config.wal.enabled);
         assert_eq!(config.ingestion.batch_pool_size, 128);
@@ -551,7 +555,7 @@ segment_max_size = 2147483648
         let wal_config = config.wal_config();
         assert!(wal_config.enabled);
         assert_eq!(wal_config.size, 128 * 1024 * 1024);
-        assert!(wal_config.sync_on_write);
+        assert!(!wal_config.sync_on_write);
     }
 
     #[test]
@@ -563,9 +567,6 @@ segment_max_size = 2147483648
 
         config.replication_mode = "L1".into();
         assert_eq!(config.replication_mode(), ReplicationMode::L1);
-
-        config.replication_mode = "l2".into();
-        assert_eq!(config.replication_mode(), ReplicationMode::L2);
 
         config.replication_mode = "invalid".into();
         assert_eq!(config.replication_mode(), ReplicationMode::L1); // fallback

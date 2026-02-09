@@ -126,7 +126,7 @@ At 100Gbps, crossing the QPI/UPI link between CPU sockets adds 30-50ns per acces
 | **Network Actor** | LWP protocol parsing, CRC validation | `tokio` async |
 | **Ingestion Actor** | TLV encoding, SortKey assignment, batch sorting | Dedicated, pinned |
 | **io_uring Poller** | Kernel I/O submission/completion | Dedicated, pinned, never parks |
-| **Replication Actor** | L1/L2 replication, quorum management | `tokio` async |
+| **Replication Actor** | L1/L3 replication, quorum management | `tokio` async |
 
 ---
 
@@ -173,9 +173,9 @@ Deterministic ordering across distributed nodes:
 | Mode | Consistency | Latency | Use Case |
 |------|-------------|---------|----------|
 | **L1** | Eventual | Lowest | High-throughput analytics |
-| **L2** | Strong (M/2+1 quorum) | Higher | Financial transactions |
+| **L3** | Strong (M/2+1 quorum) | Higher | Financial transactions |
 
-L2 mode includes **Adaptive Eviction**: slow followers are automatically removed from quorum to prevent tail latency poisoning.
+L3 mode includes **Adaptive Eviction**: slow followers are automatically removed from quorum to prevent tail latency poisoning.
 
 ---
 
@@ -294,7 +294,7 @@ TEE pending ops: 0
 
 --- Performance Summary ---
 TEE forwarding duplicates data in-kernel without userspace copies.
-For L2 sync quorum: forward to leader + local ACK = 2 destinations, 0 copies.
+For L3 sync quorum: forward to leader + local ACK = 2 destinations, 0 copies.
 Standard forwarding would require: read() + write() + write() = 2 copies.
 
 Payload       Std (2 copies)    TEE (0 copy)      Savings
@@ -341,6 +341,55 @@ Benchmark Summary
 Completed at: Wed Feb  4 09:18:47 PM EST 2026
 ```
 
+
+---
+
+## Throughput Benchmark (`lnc-bench`)
+
+Real-world throughput and latency measured with `lnc-bench` — a pipelined benchmark tool that pushes sustained load through the full write path (network → ingestion → WAL → segment → ACK).
+
+**Test parameters:** 1 KB messages, 8 connections, 256 pipeline depth, 128 KB batches.
+
+| Deployment | Msg/s | Throughput | p50 Latency | p95 Latency | p99 Latency | p999 Latency |
+|------------|------:|------------|-------------|-------------|-------------|--------------|
+| **L1 Solo** (1 node) | 8,640 | 8.4 MB/s | 237 ms | — | — | — |
+| **L3 Cluster** (3 nodes) | 32,360 | 31.6 MB/s | 59 ms | — | — | — |
+
+> **Note:** These numbers reflect end-to-end latency including network RTT to the test cluster. L3 cluster outperforms solo because quorum replication parallelises I/O across nodes while solo serialises WAL + segment sync on a single Ceph RBD volume.
+
+Run your own benchmark:
+
+```bash
+cargo run --release -p lnc-bench -- \
+  --endpoint <host>:1992 \
+  --topic-name bench-test \
+  --connections 8 \
+  --pipeline 256 \
+  --msg-size 1024 \
+  --duration 30
+```
+
+---
+
+## Chaos Test Results
+
+Data integrity verified with `lnc-chaos` — rolling-restart chaos testing that produces messages during Kubernetes StatefulSet restarts and validates zero gaps / zero duplicates on consumption.
+
+| Deployment | Messages Produced | Gaps | Duplicates | Result |
+|------------|------------------:|-----:|-----------:|--------|
+| **L3 Cluster** (3-node quorum) | 2,963+ | 0 | 0 | **PASS** |
+| **L1 Solo** (single node) | 1,504+ | 0 | 0 | **PASS** |
+
+> **Key insight:** L1 solo achieves zero-gap results when the *server* is restarted (graceful drain preserves all acknowledged writes). Gaps only occur if the *client* process dies mid-send or if the underlying storage layer (e.g., Ceph RBD) doesn't honour `fsync` semantics on pod kill.
+
+Run chaos tests:
+
+```bash
+cargo run --release -p lnc-chaos -- \
+  --endpoint <host>:1992 \
+  --clean \
+  --duration 120
+```
 
 ---
 
@@ -393,7 +442,7 @@ nic_node = 0
 nvme_node = 0
 
 [replication]
-mode = "L1"  # or "L2"
+mode = "L1"  # or "L3"
 peers = ["lance-2:9000", "lance-3:9000"]
 ```
 
@@ -441,7 +490,7 @@ data:
     data_dir = "/var/lib/lance"
     
     [replication]
-    mode = "L2"
+    mode = "L3"
     peers = ["lance-0.lance-headless:1993", "lance-1.lance-headless:1993", "lance-2.lance-headless:1993"]
 ```
 
@@ -508,6 +557,8 @@ cargo add lnc-client
 | [LWP Specification](docs/LWP-Specification.md)    | Lance Wire Protocol (LWP) Specification |
 | [Monitoring](docs/Monitoring.md)                  | Monitoring and Observability            |
 | [Recovery](docs/Recoveryprocedures.md)            | Recovery Procedures                     |
+| [lnc-bench](lnc-bench/)                          | Throughput & latency benchmark tool     |
+| [lnc-chaos](lnc-chaos/)                          | Rolling-restart chaos testing tool      |
 
 ---
 

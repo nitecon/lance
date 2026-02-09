@@ -157,9 +157,19 @@ impl SegmentRecovery {
 pub fn find_segments_needing_recovery(data_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
     let mut segments = Vec::new();
 
+    if !data_dir.exists() {
+        return Ok(segments);
+    }
+
     for entry in std::fs::read_dir(data_dir)? {
         let entry = entry?;
         let path = entry.path();
+
+        // Recurse into subdirectories (topic dirs, segments/0/, etc.)
+        if path.is_dir() {
+            segments.extend(find_segments_needing_recovery(&path)?);
+            continue;
+        }
 
         if path.extension().is_some_and(|ext| ext == "lnc") {
             let filename = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");

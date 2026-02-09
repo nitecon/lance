@@ -856,7 +856,7 @@ mod tests {
     ///
     /// Measures the overhead of TEE operations compared to standard splice forwarding.
     /// TEE allows duplicating pipe data without copying to userspace - critical for
-    /// L2 sync quorum where we forward to leader AND process locally.
+    /// L3 quorum where we forward to leader AND process locally.
     #[test]
     fn benchmark_tee_vs_splice_performance() {
         use std::time::Instant;
@@ -936,7 +936,7 @@ mod tests {
 
         println!("\n--- Performance Summary ---");
         println!("TEE forwarding duplicates data in-kernel without userspace copies.");
-        println!("For L2 sync quorum: forward to leader + local ACK = 2 destinations, 0 copies.");
+        println!("For L3 quorum: forward to leader + local ACK = 2 destinations, 0 copies.");
         println!("Standard forwarding would require: read() + write() + write() = 2 copies.\n");
 
         // Calculate theoretical savings
@@ -1447,7 +1447,7 @@ impl SpliceForwarder {
 // Zero-Copy Tee Forwarding (IORING_OP_TEE) - Phase 3
 // ============================================================================
 // Per Architecture.md Section 21.9: Use IORING_OP_TEE for in-kernel data
-// duplication in L2 sync quorum scenarios.
+// duplication in L3 quorum scenarios.
 // Data flow: client_socket → pipe1 → leader_socket (forwarding)
 //                                 ↘ pipe2 → local_processor (teeing)
 
@@ -1488,10 +1488,10 @@ pub fn probe_tee() -> TeeSupport {
     }
 }
 
-/// Zero-copy tee forwarder using io_uring for L2 quorum
+/// Zero-copy tee forwarder using io_uring for L3 quorum
 ///
 /// Enables forwarding writes to leader while simultaneously processing locally
-/// for L2 sync quorum acknowledgment, audit logging, or real-time analytics.
+/// for L3 quorum acknowledgment, audit logging, or real-time analytics.
 /// All data duplication happens in-kernel with zero userspace copies.
 pub struct TeeForwarder {
     ring: IoUring,
@@ -1576,7 +1576,7 @@ impl TeeForwarder {
         Ok(())
     }
 
-    /// Submit a forward-with-tee operation for L2 quorum
+    /// Submit a forward-with-tee operation for L3 quorum
     ///
     /// This submits four linked operations:
     /// 1. Splice from source_fd to pipe1 (read from client)
@@ -1585,7 +1585,7 @@ impl TeeForwarder {
     /// 4. Splice from pipe2 to local_fd (send to local processor)
     ///
     /// All operations are linked, executing in sequence.
-    /// This is the core of zero-copy L2 quorum forwarding.
+    /// This is the core of zero-copy L3 quorum forwarding.
     ///
     /// # Arguments
     /// * `source_fd` - Client socket to read from

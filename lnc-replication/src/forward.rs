@@ -52,11 +52,11 @@ pub struct ForwardConfig {
     pub connect_timeout: Duration,
     /// Timeout for forwarding operations
     pub forward_timeout: Duration,
-    /// Enable TEE-based forwarding for L2 quorum (Linux only)
+    /// Enable TEE-based forwarding for L3 quorum (Linux only)
     /// When enabled and supported, uses IORING_OP_TEE to duplicate writes
     /// for local processing while forwarding to leader
     pub enable_tee_forwarding: bool,
-    /// Enable local acknowledgment in L2 mode (requires tee_forwarding)
+    /// Enable local acknowledgment in L3 mode (requires tee_forwarding)
     /// Sends ACK after local write, before leader response
     pub enable_local_ack: bool,
 }
@@ -74,13 +74,13 @@ impl Default for ForwardConfig {
 }
 
 impl ForwardConfig {
-    /// Create config with TEE forwarding enabled for L2 quorum
+    /// Create config with TEE forwarding enabled for L3 quorum
     pub fn with_tee_forwarding(mut self) -> Self {
         self.enable_tee_forwarding = true;
         self
     }
 
-    /// Enable local acknowledgment (L2 mode optimization)
+    /// Enable local acknowledgment (L3 mode optimization)
     pub fn with_local_ack(mut self) -> Self {
         self.enable_local_ack = true;
         self
@@ -110,7 +110,7 @@ pub fn check_tee_support(config: &ForwardConfig) -> TeeForwardingStatus {
         if lnc_io::probe_tee() == lnc_io::TeeSupport::Supported {
             tracing::info!(
                 target: "lance::replication",
-                "TEE forwarding enabled for L2 quorum"
+                "TEE forwarding enabled for L3 quorum"
             );
             return TeeForwardingStatus::Enabled;
         }
@@ -365,10 +365,10 @@ pub fn create_leader_pool(config: ForwardConfig) -> Arc<LeaderConnectionPool> {
 }
 
 // ============================================================================
-// Local Write Processor for TEE'd Data (L2 Quorum)
+// Local Write Processor for TEE'd Data (L3 Quorum)
 // ============================================================================
 // Per Architecture.md Section 21.9: Process TEE'd write data locally
-// for L2 quorum acknowledgment while forwarding to leader.
+// for L3 quorum acknowledgment while forwarding to leader.
 
 /// Callback for processing locally TEE'd write data
 ///

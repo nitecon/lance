@@ -405,7 +405,7 @@ lance/
 ├── lnc-core/           # TLV, SortKey, Bit-packing, LoanableBatch, Bytes integration
 ├── lnc-io/             # io_uring, NUMA pinning, pwritev2 fallback, O_DIRECT
 ├── lnc-network/        # LWP Protocol, ConnectionBuffer, Zero-Copy Send, IRQ affinity
-├── lnc-replication/    # L1/L2 modes, Adaptive Eviction, Quorum management
+├── lnc-replication/    # L1/L3 modes, Adaptive Eviction, Quorum management, Filesystem-consistent replication
 ├── lnc-index/          # Sparse Index, Secondary Index, Jitter Window queries
 ├── lnc-metrics/        # Non-blocking OTEL, Atomic counters, Prometheus export
 ├── lnc-recovery/       # WAL replay, Segment recovery, Index rebuild

@@ -42,11 +42,13 @@ pub enum ClusterEvent {
     QuorumLost,
     /// Topic operation received from leader (for followers to apply)
     TopicOperation(crate::codec::TopicOperation),
-    /// Data received from leader for local segment write (follower replication)
+    /// Data received from leader for local segment write (follower replication, legacy format)
     DataReceived {
         topic_id: u32,
         payload: bytes::Bytes,
     },
+    /// Enriched data received from leader with segment metadata (L3 filesystem-consistent mode)
+    DataReceivedEnriched(crate::codec::DataReplicationEntry),
 }
 
 /// Cluster coordinator state
@@ -330,7 +332,7 @@ impl ClusterCoordinator {
     }
 
     /// Replicate a topic operation to followers (leader only)
-    /// Uses async (L2) replication - returns after broadcast without waiting for ACKs
+    /// Uses L3 quorum replication - waits for quorum ACKs before returning
     pub async fn replicate_topic_op(
         &self,
         op: crate::codec::TopicOperation,
@@ -475,7 +477,7 @@ impl ClusterCoordinator {
                 },
             }
         } else {
-            // Async mode (L2) - just check broadcast success
+            // Quorum mode (L3) - check broadcast success
             let quorum = (total_peers / 2) + 1;
 
             if success_count >= quorum || total_peers == 0 {
@@ -512,34 +514,41 @@ impl ClusterCoordinator {
         }
     }
 
-    /// Replicate ingested data to followers (leader only, L2 async fire-and-forget).
+    /// Replicate ingested data to followers using the enriched wire format (L3 quorum).
     ///
-    /// Encodes topic_id + payload into a LogEntry with EntryType::Data and
-    /// broadcasts via AppendEntries to all connected peers. Does not block
-    /// on follower ACKs — followers write to their local segments asynchronously.
-    pub async fn replicate_data(
+    /// Per Architecture.md §4.1.1 and LWP-Specification.md §18.2:
+    /// Encodes a `DataReplicationEntry` into a `LogEntry` with `EntryType::Data` and
+    /// broadcasts via AppendEntries to all connected peers.
+    pub async fn replicate_data_enriched(
         &self,
-        topic_id: u32,
-        payload: bytes::Bytes,
-    ) -> Result<(), std::io::Error> {
+        entry: crate::codec::DataReplicationEntry,
+    ) -> Result<Vec<u16>, std::io::Error> {
         // Only leader replicates data
         if !self.is_leader() {
-            return Ok(());
+            return Ok(vec![]);
         }
 
-        // Encode topic_id as 4-byte LE prefix followed by raw payload
-        let mut data = bytes::BytesMut::with_capacity(4 + payload.len());
-        data.extend_from_slice(&topic_id.to_le_bytes());
-        data.extend_from_slice(&payload);
+        let encoded = entry.encode();
 
-        let term = {
-            let raft = self.raft.read().await;
-            raft.current_term()
+        // Advance leader's log index BEFORE replicating so the AppendEntries
+        // carries the correct prev_log_index. This ensures elections (§5.4.1)
+        // pick the candidate with the most up-to-date log.
+        let (term, prev_log_index, prev_log_term, new_log_index) = {
+            let mut raft = self.raft.write().await;
+            let prev_idx = raft.last_log_index();
+            let prev_term = raft.current_term();
+            raft.advance_log(1);
+            (
+                raft.current_term(),
+                prev_idx,
+                prev_term,
+                raft.last_log_index(),
+            )
         };
 
-        let entry = crate::codec::LogEntry {
+        let log_entry = crate::codec::LogEntry {
             term,
-            index: 0,
+            index: new_log_index,
             hlc: lnc_core::HlcTimestamp::new(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -548,37 +557,68 @@ impl ClusterCoordinator {
                 0,
             ),
             entry_type: crate::codec::EntryType::Data,
-            data: data.freeze(),
+            data: encoded,
         };
 
         let request = crate::codec::AppendEntriesRequest {
             term,
             leader_id: self.config.node_id,
-            prev_log_index: 0,
-            prev_log_term: 0,
+            prev_log_index,
+            prev_log_term,
             leader_commit: 0,
-            leader_hlc: entry.hlc,
-            entries: vec![entry],
+            leader_hlc: log_entry.hlc,
+            entries: vec![log_entry],
         };
 
-        let msg = ReplicationMessage::AppendEntriesRequest(request);
+        // Send to all peers CONCURRENTLY and wait for responses (true sync replication).
+        // Each peer gets its own spawned task so network RTTs overlap instead of adding.
+        let peer_ids = self.peers.peer_ids().await;
+        let start = std::time::Instant::now();
+        let mut join_set = tokio::task::JoinSet::new();
 
-        // Fire-and-forget broadcast to all peers (L2 async)
-        let results = self.peers.broadcast(&msg).await;
+        for peer_id in peer_ids {
+            let peers = Arc::clone(&self.peers);
+            let req = request.clone();
+            join_set.spawn(async move {
+                let peer_start = std::time::Instant::now();
+                let result = peers.send_append_entries(peer_id, req).await;
+                (peer_id, result, peer_start.elapsed())
+            });
+        }
 
-        let success_count = results.iter().filter(|(_, r)| r.is_ok()).count();
-        let fail_count = results.len() - success_count;
+        let mut successful_peers: Vec<u16> = Vec::new();
+        let mut fail_count: usize = 0;
+
+        while let Some(join_result) = join_set.join_next().await {
+            if let Ok((peer_id, result, peer_elapsed)) = join_result {
+                lnc_metrics::record_peer_replication_latency(peer_id, peer_elapsed);
+                match result {
+                    Ok(resp) if resp.success => {
+                        successful_peers.push(peer_id);
+                    },
+                    Ok(_) | Err(_) => {
+                        fail_count += 1;
+                    },
+                }
+            } else {
+                fail_count += 1;
+            }
+        }
 
         if fail_count > 0 {
             debug!(
                 target: "lance::cluster",
-                topic_id,
-                payload_len = payload.len(),
-                success_count,
+                topic_id = entry.topic_id,
+                global_offset = entry.global_offset,
+                segment = %entry.segment_name,
+                success_count = successful_peers.len(),
                 fail_count,
-                "Data replication broadcast (partial failure)"
+                "Enriched data replication (partial failure)"
             );
         }
+
+        // Record aggregate replication latency
+        lnc_metrics::record_replication_latency(start.elapsed());
 
         // Update last sync time
         let now_ms = std::time::SystemTime::now()
@@ -588,18 +628,38 @@ impl ClusterCoordinator {
         self.last_sync_time
             .store(now_ms, std::sync::atomic::Ordering::Relaxed);
 
-        Ok(())
+        Ok(successful_peers)
     }
 
-    /// Decode a data replication payload into (topic_id, payload).
-    /// Wire format: [topic_id: 4 bytes LE][payload bytes]
+    /// Decode a data replication payload.
+    ///
+    /// Handles both enriched and legacy wire formats:
+    /// - **Enriched** (≥34 bytes): Returns full `DataReplicationEntry`
+    /// - **Legacy** (<34 bytes): `[topic_id: 4 bytes LE][payload bytes]`
+    ///
+    /// Returns `(topic_id, payload)` for backward compatibility.
+    /// Use `decode_data_entry_enriched()` to get the full enriched entry.
     pub fn decode_data_entry(data: &[u8]) -> Option<(u32, bytes::Bytes)> {
         if data.len() < 4 {
             return None;
         }
+
+        // Try enriched format first
+        if let Some(entry) = crate::codec::DataReplicationEntry::decode(data) {
+            return Some((entry.topic_id, entry.payload));
+        }
+
+        // Fall back to legacy format
         let topic_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let payload = bytes::Bytes::copy_from_slice(&data[4..]);
         Some((topic_id, payload))
+    }
+
+    /// Decode a data replication payload as a full enriched entry.
+    ///
+    /// Returns `None` if the data is in legacy format or malformed.
+    pub fn decode_data_entry_enriched(data: &[u8]) -> Option<crate::codec::DataReplicationEntry> {
+        crate::codec::DataReplicationEntry::decode(data)
     }
 
     /// Initialize the cluster - discover peers and establish connections
@@ -913,16 +973,26 @@ impl ClusterCoordinator {
         };
 
         if let Some(request) = pre_vote_request {
-            // Send PreVoteRequest to each peer and collect actual responses
+            // Send PreVoteRequest to all peers CONCURRENTLY
             let peer_ids: Vec<u16> = self.peers.peer_states().await.keys().copied().collect();
+            let mut join_set = tokio::task::JoinSet::new();
 
-            let mut grants = 1usize; // Count self
             for peer_id in peer_ids {
-                match self
-                    .peers
-                    .send_pre_vote_request(peer_id, request.clone())
-                    .await
-                {
+                let peers = Arc::clone(&self.peers);
+                let req = request.clone();
+                join_set.spawn(async move {
+                    let result = peers.send_pre_vote_request(peer_id, req).await;
+                    (peer_id, result)
+                });
+            }
+
+            // Process responses sequentially for term checks
+            let mut grants = 1usize; // Count self
+            while let Some(join_result) = join_set.join_next().await {
+                let Ok((peer_id, result)) = join_result else {
+                    continue;
+                };
+                match result {
                     Ok(resp) => {
                         if resp.vote_granted {
                             grants += 1;
@@ -1012,16 +1082,25 @@ impl ClusterCoordinator {
             self.persist_state(raft.current_term(), None);
         }
 
-        // Get peer IDs before sending
+        // Send VoteRequest to all peers CONCURRENTLY
         let peer_ids: Vec<u16> = self.peers.peer_states().await.keys().copied().collect();
+        let mut join_set = tokio::task::JoinSet::new();
 
-        // Send VoteRequest to each peer and process actual responses
         for peer_id in peer_ids {
-            match self
-                .peers
-                .send_vote_request(peer_id, vote_request.clone())
-                .await
-            {
+            let peers = Arc::clone(&self.peers);
+            let req = vote_request.clone();
+            join_set.spawn(async move {
+                let result = peers.send_vote_request(peer_id, req).await;
+                (peer_id, result)
+            });
+        }
+
+        // Process responses sequentially for Raft state machine updates
+        while let Some(join_result) = join_set.join_next().await {
+            let Ok((peer_id, result)) = join_result else {
+                continue;
+            };
+            match result {
                 Ok(resp) => {
                     let won = {
                         let mut raft = self.raft.write().await;
@@ -1029,7 +1108,6 @@ impl ClusterCoordinator {
                     };
 
                     if won {
-                        // We became leader with real votes!
                         lnc_metrics::increment_raft_elections_won();
                         let (term, token) = {
                             let raft = self.raft.read().await;
@@ -1151,7 +1229,22 @@ async fn handle_peer_connection(
                             }
                         },
                         crate::codec::EntryType::Data => {
-                            if let Some((topic_id, payload)) =
+                            // Try enriched decode first, fall back to legacy
+                            if let Some(enriched) =
+                                ClusterCoordinator::decode_data_entry_enriched(&entry.data)
+                            {
+                                debug!(
+                                    target: "lance::cluster",
+                                    node_id,
+                                    topic_id = enriched.topic_id,
+                                    segment = %enriched.segment_name,
+                                    write_offset = enriched.write_offset,
+                                    global_offset = enriched.global_offset,
+                                    payload_len = enriched.payload.len(),
+                                    "Received enriched data replication from leader"
+                                );
+                                let _ = event_tx.send(ClusterEvent::DataReceivedEnriched(enriched));
+                            } else if let Some((topic_id, payload)) =
                                 ClusterCoordinator::decode_data_entry(&entry.data)
                             {
                                 debug!(
@@ -1159,7 +1252,7 @@ async fn handle_peer_connection(
                                     node_id,
                                     topic_id,
                                     payload_len = payload.len(),
-                                    "Received data replication from leader"
+                                    "Received legacy data replication from leader"
                                 );
                                 let _ =
                                     event_tx.send(ClusterEvent::DataReceived { topic_id, payload });

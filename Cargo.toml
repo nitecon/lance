@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "lance",
     "lnc",
+    "lnc-bench",
     "lnc-chaos",
     "lnc-client",
     "lnc-core",

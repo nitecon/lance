@@ -234,8 +234,7 @@ peers = []
 
 # Replication mode:
 #   "l1" - Single node, no replication (default)
-#   "l2" - Async replication to followers
-#   "l3" - Sync replication with quorum
+#   "l3" - Filesystem-consistent quorum replication
 replication_mode = "{}"
 
 # =============================================================================

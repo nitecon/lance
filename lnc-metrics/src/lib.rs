@@ -55,6 +55,7 @@ pub use golden_signals::{
     record_io_latency,
     record_io_latency_sampled,
     record_network_latency,
+    record_peer_replication_latency,
     record_replication_latency,
     saturation_ratio,
     set_buffer_pool_usage,

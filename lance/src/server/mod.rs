@@ -28,8 +28,8 @@ use lnc_core::{BatchPool, NumaTopology, Result};
 #[cfg(feature = "tls")]
 use lnc_network::tls::{TlsAcceptor, TlsConfig};
 use lnc_replication::{
-    ClusterCoordinator, ClusterEvent, ForwardConfig, LeaderConnectionPool, ReplicationActor,
-    TopicOperation, create_leader_pool, create_replication_channel,
+    AsyncQuorumManager, ClusterCoordinator, ClusterEvent, ForwardConfig, LeaderConnectionPool,
+    QuorumConfig, ReplicationActor, TopicOperation, create_leader_pool, create_replication_channel,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -220,8 +220,27 @@ pub async fn run(
                             follower_writers.remove(&topic_id);
                         },
                     },
+                    Ok(ClusterEvent::DataReceivedEnriched(entry)) => {
+                        // Write replicated data using enriched format (L3 byte-identical segments)
+                        let topic_id = entry.topic_id;
+                        if let Err(e) = ingestion::write_replicated_data_enriched(
+                            &event_config,
+                            &event_registry,
+                            &mut follower_writers,
+                            &entry,
+                        ) {
+                            warn!(
+                                target: "lance::server",
+                                topic_id,
+                                segment = %entry.segment_name,
+                                error = %e,
+                                "Failed to write enriched replicated data"
+                            );
+                            follower_writers.remove(&topic_id);
+                        }
+                    },
                     Ok(ClusterEvent::DataReceived { topic_id, payload }) => {
-                        // Write replicated data to local segments (follower path)
+                        // Legacy fallback: write replicated data without segment metadata
                         if let Err(e) = ingestion::write_replicated_data(
                             &event_config,
                             &event_registry,
@@ -234,13 +253,72 @@ pub async fn run(
                                 topic_id,
                                 payload_len = payload.len(),
                                 error = %e,
-                                "Failed to write replicated data"
+                                "Failed to write replicated data (legacy)"
                             );
-                            // Remove writer on error (may be corrupted)
                             follower_writers.remove(&topic_id);
                         }
                     },
-                    Ok(_) => {}, // Ignore other events (BecameLeader, etc.)
+                    Ok(ClusterEvent::BecameLeader { term, .. }) => {
+                        // Close all follower writer segments so the ingestion actor
+                        // doesn't collide with stale active segments when it creates
+                        // new writers for incoming leader writes.
+                        info!(
+                            target: "lance::server",
+                            term,
+                            writers = follower_writers.len(),
+                            "BecameLeader — closing follower writer segments"
+                        );
+                        let end_ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0);
+                        for (topic_id, mut tw) in follower_writers.drain() {
+                            if let Err(e) = tw.writer.fsync() {
+                                warn!(
+                                    target: "lance::server",
+                                    topic_id,
+                                    error = %e,
+                                    "Failed to fsync follower segment on leader transition"
+                                );
+                                continue;
+                            }
+                            match tw.writer.close(end_ts) {
+                                Ok(closed_path) => {
+                                    let _ = tw.index_builder.write_indexes(&closed_path);
+                                    debug!(
+                                        target: "lance::server",
+                                        topic_id,
+                                        segment = %closed_path.display(),
+                                        "Closed follower segment on leader transition"
+                                    );
+                                },
+                                Err(e) => {
+                                    warn!(
+                                        target: "lance::server",
+                                        topic_id,
+                                        error = %e,
+                                        "Failed to close follower segment on leader transition"
+                                    );
+                                },
+                            }
+                        }
+                    },
+                    Ok(ClusterEvent::BecameFollower { leader_id, term }) => {
+                        info!(
+                            target: "lance::server",
+                            term,
+                            leader_id,
+                            "BecameFollower — now following node {leader_id}"
+                        );
+                    },
+                    Ok(ClusterEvent::LostLeadership { term }) => {
+                        warn!(
+                            target: "lance::server",
+                            term,
+                            "LostLeadership — no longer leader"
+                        );
+                    },
+                    Ok(_) => {}, // PeerJoined, PeerLeft, etc.
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(
                             target: "lance::server",
@@ -255,34 +333,6 @@ pub async fn run(
                 }
             }
         });
-
-        // Start data replication forwarder task (leader sends data to followers).
-        // Consumes the receiver half of the data_repl channel created above.
-        // The ingestion actors send DataReplicationRequest after local write;
-        // this task forwards them via coordinator.replicate_data() to peers.
-        if let Some(mut repl_rx) = data_repl_rx {
-            let repl_coord = Arc::clone(&coordinator);
-            tokio::spawn(async move {
-                info!(
-                    target: "lance::server",
-                    "Data replication forwarder task started"
-                );
-                while let Some(req) = repl_rx.recv().await {
-                    if let Err(e) = repl_coord.replicate_data(req.topic_id, req.payload).await {
-                        debug!(
-                            target: "lance::server",
-                            topic_id = req.topic_id,
-                            error = %e,
-                            "Data replication broadcast error (non-fatal)"
-                        );
-                    }
-                }
-                info!(
-                    target: "lance::server",
-                    "Data replication forwarder task stopped"
-                );
-            });
-        }
 
         info!(
             target: "lance::server",
@@ -302,6 +352,86 @@ pub async fn run(
     };
 
     let cluster = cluster_coordinator;
+
+    // Create quorum manager for L3 mode (leader waits for M/2+1 ACKs before ACKing client)
+    let quorum_manager: Option<Arc<AsyncQuorumManager>> =
+        if config.replication_mode().requires_quorum() {
+            let peer_count = config.peer_ids().len();
+            // total_nodes = peers + self
+            let total_nodes = peer_count + 1;
+            let qm_config = QuorumConfig::new(total_nodes)
+                .with_timeout(config.replication_quorum_timeout_ms.unwrap_or(100));
+            info!(
+                target: "lance::server",
+                total_nodes,
+                required_acks = qm_config.required_acks,
+                timeout_ms = qm_config.timeout_ms,
+                "L3 quorum manager initialized"
+            );
+            Some(Arc::new(AsyncQuorumManager::new(qm_config)))
+        } else {
+            None
+        };
+
+    // Start data replication forwarder task (leader sends data to followers).
+    // Placed after quorum_manager creation so the forwarder can record ACKs.
+    let forwarder_handle = if let (Some(coord), Some(mut repl_rx)) = (&cluster, data_repl_rx) {
+        let repl_coord = Arc::clone(coord);
+        let repl_qm = quorum_manager.clone();
+        Some(tokio::spawn(async move {
+            info!(
+                target: "lance::server",
+                "Data replication forwarder task started (enriched)"
+            );
+            while let Some(req) = repl_rx.recv().await {
+                // Build enriched replication entry from the write metadata
+                let mut flags = lnc_replication::ReplicationFlags::empty();
+                if req.is_new_segment {
+                    flags = flags.with_new_segment();
+                }
+                if req.rotated_after {
+                    flags = flags.with_rotate_after();
+                }
+
+                let write_id = req.write_id;
+                let topic_id = req.topic_id;
+                let entry = lnc_replication::DataReplicationEntry {
+                    topic_id,
+                    global_offset: req.global_offset,
+                    segment_name: req.segment_name,
+                    write_offset: req.write_offset,
+                    flags,
+                    payload_crc: lnc_core::crc32c(&req.payload),
+                    payload: req.payload,
+                };
+
+                match repl_coord.replicate_data_enriched(entry).await {
+                    Ok(successful_peers) => {
+                        // Record quorum ACKs for each peer that confirmed
+                        if let (Some(wid), Some(qm)) = (write_id, &repl_qm) {
+                            for peer_id in &successful_peers {
+                                qm.record_ack(wid, *peer_id).await;
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        debug!(
+                            target: "lance::server",
+                            topic_id,
+                            error = %e,
+                            "Data replication broadcast error (non-fatal)"
+                        );
+                    },
+                }
+            }
+            info!(
+                target: "lance::server",
+                "Data replication forwarder task stopped"
+            );
+        }))
+    } else {
+        None
+    };
 
     // Create leader connection pool for write forwarding (only if in cluster mode)
     let leader_pool: Option<Arc<LeaderConnectionPool>> = if let Some(ref coord) = cluster {
@@ -474,6 +604,9 @@ pub async fn run(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, addr)) => {
+                        // Disable Nagle's algorithm — ACKs and small control
+                        // frames must go out immediately, not be batched.
+                        let _ = stream.set_nodelay(true);
                         lnc_metrics::increment_connections();
                         trace!(target: "lance::server", peer = %addr, "Connection accepted");
 
@@ -485,11 +618,12 @@ pub async fn run(
                         let cluster_state = cluster.clone();
                         let fwd_pool = leader_pool.clone();
                         let validator = Arc::clone(&token_validator);
+                        let qm = quorum_manager.clone();
                         let node_id = config.node_id;
                         let max_payload = config.ingestion.max_payload_size;
 
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, tx, pool, registry, node_id, max_payload, limiter, subs, cluster_state, fwd_pool, validator).await {
+                            if let Err(e) = handle_connection(stream, tx, pool, registry, node_id, max_payload, limiter, subs, cluster_state, fwd_pool, validator, qm).await {
                                 debug!(target: "lance::server", peer = %addr, error = %e, "Connection closed");
                             }
                             lnc_metrics::decrement_connections();
@@ -524,6 +658,15 @@ pub async fn run(
     // Shutdown multi-actor system if active
     if let Some(multi) = multi_actor_system {
         multi.shutdown();
+    }
+
+    // Drop replication channel sender so the forwarder sees channel closed.
+    drop(data_repl_tx);
+    // Abort the forwarder — we cannot drain it because send_append_entries()
+    // blocks waiting for peer responses, and peers may be down during rolling
+    // restart. Draining would delay shutdown and cause K8s to force-kill the pod.
+    if let Some(fwd) = forwarder_handle {
+        fwd.abort();
     }
 
     replication_handle.abort();

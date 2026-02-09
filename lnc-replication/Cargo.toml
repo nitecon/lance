@@ -1,6 +1,6 @@
 [package]
 name = "lnc-replication"
-description = "Replication layer for LANCE - L1/L2 modes, follower health, quorum management"
+description = "Replication layer for LANCE - L1/L3 modes, follower health, quorum management"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -14,7 +14,7 @@ tls = ["lnc-network/tls", "tokio-rustls", "rustls"]
 [dependencies]
 lnc-core = { workspace = true }
 lnc-metrics = { workspace = true }
-lnc-network = { workspace = true }
+lnc-network = { workspace = true, features = ["lz4"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 flatbuffers = { workspace = true }

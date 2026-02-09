@@ -21,10 +21,10 @@ pub use actor::{ReplicationActor, create_replication_channel};
 pub use audit::{AuditConfig, AuditEntryHeader, AuditError, AuditLogWriter, AuditOperation};
 pub use cluster::{ClusterCoordinator, ClusterEvent};
 pub use codec::{
-    AppendEntriesRequest, AppendEntriesResponse, ClusterConfig, ConfigNode, EntryType,
-    InstallSnapshotRequest, InstallSnapshotResponse, LogEntry, MessageType, NodeRole,
-    PreVoteRequest, PreVoteResponse, ReplicationCodec, ReplicationMessage, TopicOperation,
-    VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, ClusterConfig, ConfigNode, DataReplicationEntry,
+    EntryType, InstallSnapshotRequest, InstallSnapshotResponse, LogEntry, MessageType, NodeRole,
+    PreVoteRequest, PreVoteResponse, ReplicationAck, ReplicationAckStatus, ReplicationCodec,
+    ReplicationFlags, ReplicationMessage, TopicOperation, VoteRequest, VoteResponse,
 };
 pub use discovery::{
     ClusterConfig as DiscoveryClusterConfig, DiscoveryMethod, PeerDiscovery, PeerInfo,

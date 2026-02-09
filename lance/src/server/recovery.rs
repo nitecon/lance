@@ -6,15 +6,21 @@ use lnc_io::close_unclosed_segments;
 use lnc_recovery::{IndexRebuilder, SegmentRecovery, WalReplay, find_segments_needing_recovery};
 use tracing::{debug, info};
 
-/// Clean up empty segment files from previous aborted sessions
+/// Clean up empty segment files from previous aborted sessions.
+///
+/// Recurses into subdirectories so that topic-partitioned layouts
+/// (`segments/0/`, `segments/1/`, …) are handled correctly.
 pub fn cleanup_empty_segments(data_dir: &std::path::Path) -> Result<()> {
     let segments_dir = data_dir.join("segments");
+    cleanup_empty_segments_recursive(&segments_dir)
+}
 
-    if !segments_dir.exists() {
+fn cleanup_empty_segments_recursive(dir: &std::path::Path) -> Result<()> {
+    if !dir.exists() {
         return Ok(());
     }
 
-    let entries = match std::fs::read_dir(&segments_dir) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
@@ -24,6 +30,12 @@ pub fn cleanup_empty_segments(data_dir: &std::path::Path) -> Result<()> {
 
     for entry in entries.flatten() {
         let path = entry.path();
+
+        // Recurse into topic subdirectories
+        if path.is_dir() {
+            cleanup_empty_segments_recursive(&path)?;
+            continue;
+        }
 
         if path.extension().is_some_and(|ext| ext == "lnc") {
             if let Ok(metadata) = std::fs::metadata(&path) {
@@ -66,29 +78,20 @@ pub fn perform_startup_recovery(config: &Config) -> Result<()> {
     // Clean up empty segment files from previous aborted sessions
     cleanup_empty_segments(&config.data_dir)?;
 
-    // Close any unclosed segments from previous crash/shutdown
-    let segments_dir = config.data_dir.join("segments");
-    if segments_dir.exists() {
-        let closed = close_unclosed_segments(&segments_dir)?;
-        if !closed.is_empty() {
-            info!(
-                target: "lance::server",
-                count = closed.len(),
-                "Closed unclosed segments from previous session"
-            );
-        }
-    }
-
+    // Phase 1: Validate and truncate BEFORE closing.
+    // find_segments_needing_recovery finds active (unclosed) segments and
+    // dirty-marked segments.  We truncate them to the last valid TLV record
+    // boundary so that corrupt trailing bytes don't pollute the read path.
     let segments = find_segments_needing_recovery(&config.data_dir)?;
 
-    for segment_path in segments {
+    for segment_path in &segments {
         info!(
             target: "lance::server",
             segment = %segment_path.display(),
             "Recovering segment"
         );
 
-        let recovery = SegmentRecovery::new(&segment_path);
+        let recovery = SegmentRecovery::new(segment_path);
         let result = recovery.truncate_to_valid()?;
 
         info!(
@@ -100,16 +103,30 @@ pub fn perform_startup_recovery(config: &Config) -> Result<()> {
         );
 
         let rebuilder = IndexRebuilder::with_defaults();
-        if rebuilder.needs_rebuild(&segment_path) {
+        if rebuilder.needs_rebuild(segment_path) {
             info!(
                 target: "lance::server",
                 segment = %segment_path.display(),
                 "Rebuilding indexes"
             );
-            rebuilder.rebuild(&segment_path)?;
+            rebuilder.rebuild(segment_path)?;
         }
 
         recovery.clear_dirty_marker()?;
+    }
+
+    // Phase 2: Close unclosed segments AFTER validation.
+    // Now that the data is clean, rename active segments to closed format.
+    let segments_dir = config.data_dir.join("segments");
+    if segments_dir.exists() {
+        let closed = close_unclosed_segments(&segments_dir)?;
+        if !closed.is_empty() {
+            info!(
+                target: "lance::server",
+                count = closed.len(),
+                "Closed unclosed segments from previous session"
+            );
+        }
     }
 
     if config.wal.enabled {

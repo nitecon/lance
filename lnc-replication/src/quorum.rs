@@ -139,7 +139,7 @@ struct PendingWrite {
     created_at: std::time::Instant,
 }
 
-/// Manages async quorum waiting for L2 sync replication
+/// Manages async quorum waiting for L3 quorum replication
 ///
 /// When a write is submitted, it returns a channel that will receive
 /// the quorum result once enough ACKs are received or timeout occurs.
@@ -238,7 +238,7 @@ impl AsyncQuorumManager {
     }
 
     /// Wait for quorum with timeout
-    /// This is the main API for L2 sync replication
+    /// This is the main API for L3 quorum replication
     pub async fn wait_for_quorum(
         &self,
         write_id: u64,

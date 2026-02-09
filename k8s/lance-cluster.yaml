@@ -79,7 +79,7 @@ spec:
           NODE_ID="${HOSTNAME##*-}"
           exec /usr/local/bin/lance \
             --node-id "$NODE_ID" \
-            --replication-mode l2 \
+            --replication-mode l3 \
             --peers lance-0.lance-headless:1993,lance-1.lance-headless:1993,lance-2.lance-headless:1993 \
             --data-dir /var/lib/lance
         ports:

@@ -441,15 +441,15 @@ run_benchmarks() {
     log "Benchmark results saved to: $BENCH_FILE"
 }
 
-run_l2_quorum_tests() {
-    log "Running L2 Quorum integration tests..."
+run_l3_quorum_tests() {
+    log "Running L3 Quorum integration tests..."
     echo ""
     
     cd "$PROJECT_DIR"
     
-    log "=== L2 Sync Quorum Tests ==="
+    log "=== L3 Sync Quorum Tests ==="
     cargo test --package lnc-replication --lib -- quorum 2>&1 || {
-        log_error "L2 quorum tests failed"
+        log_error "L3 quorum tests failed"
         TEST_EXIT_CODE=1
     }
     
@@ -469,7 +469,7 @@ run_l2_quorum_tests() {
     
     echo ""
     if [ $TEST_EXIT_CODE -eq 0 ]; then
-        log "[OK] All L2 quorum tests passed!"
+        log "[OK] All L3 quorum tests passed!"
     fi
 }
 
@@ -679,7 +679,7 @@ if [ "$LOCAL_ONLY" = true ]; then
     echo ""
     
     # Run local unit/lib tests only
-    run_l2_quorum_tests
+    run_l3_quorum_tests
     
     # Run TEE tests if requested
     if [ "$RUN_TEE_TESTS" = true ]; then
@@ -724,8 +724,8 @@ set_environment
 # Run standard integration tests
 run_tests
 
-# Run L2 quorum tests
-run_l2_quorum_tests
+# Run L3 quorum tests
+run_l3_quorum_tests
 
 # Run TEE-specific tests if requested
 if [ "$RUN_TEE_TESTS" = true ]; then

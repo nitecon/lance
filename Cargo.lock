@@ -1026,6 +1026,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lnc-bench"
+version = "0.1.4"
+dependencies = [
+ "bytes",
+ "clap",
+ "lnc-client",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lnc-chaos"
 version = "0.1.4"
 dependencies = [
@@ -1114,6 +1126,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "webpki-roots 0.26.11",
+ "zerocopy",
  "zstd",
 ]
 

@@ -1,4 +1,5 @@
 use lnc_core::{LANCE_MAGIC, LanceError, Result, crc32c};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 
@@ -54,6 +55,8 @@ pub enum ControlCommand {
     // Data fetch - request/response (0x10-0x1F)
     Fetch = 0x10,
     FetchResponse = 0x11,
+    /// Server has not yet replicated to the requested offset — client should backoff and retry
+    CatchingUp = 0x12,
 
     // Streaming control (0x20-0x2F)
     /// Subscribe to a topic for streaming - server will push data
@@ -88,6 +91,7 @@ impl From<u8> for ControlCommand {
             0x09 => Self::AuthenticateResponse,
             0x10 => Self::Fetch,
             0x11 => Self::FetchResponse,
+            0x12 => Self::CatchingUp,
             0x20 => Self::Subscribe,
             0x21 => Self::Unsubscribe,
             0x22 => Self::CommitOffset,
@@ -220,7 +224,13 @@ impl LwpHeader {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+/// Zero-copy ingest header per Architecture §13.3.
+///
+/// `#[repr(C)]` ensures deterministic field layout matching the wire format.
+/// `zerocopy::{FromBytes, IntoBytes}` enables zero-copy casting from network
+/// buffers without per-field deserialization.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct IngestHeader {
     pub batch_id: u64,
     pub timestamp_ns: u64,
@@ -268,6 +278,11 @@ impl IngestHeader {
         }
     }
 
+    /// Zero-copy parse: reinterpret a byte slice as an `IngestHeader`.
+    ///
+    /// On little-endian architectures this is a simple pointer cast with
+    /// no field-by-field deserialization.  On big-endian it falls back to
+    /// the per-field path (compile-time).
     pub fn parse(buf: &[u8]) -> Result<Self> {
         if buf.len() < Self::SIZE {
             return Err(LanceError::Protocol(
@@ -275,6 +290,17 @@ impl IngestHeader {
             ));
         }
 
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: #[repr(C)] layout matches wire format on LE.
+            // zerocopy::FromBytes guarantees the cast is sound if the
+            // buffer is large enough (checked above).
+            if let Ok(header) = Self::read_from_bytes(&buf[..Self::SIZE]) {
+                return Ok(header);
+            }
+        }
+
+        // Fallback: manual field-by-field parse (big-endian or alignment miss)
         Ok(Self {
             batch_id: u64::from_le_bytes([
                 buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
@@ -289,13 +315,25 @@ impl IngestHeader {
         })
     }
 
+    /// Zero-copy encode: write struct bytes directly into buffer.
+    ///
+    /// On little-endian architectures this is a single memcpy.
     pub fn encode_into(&self, buf: &mut [u8]) {
-        buf[0..8].copy_from_slice(&self.batch_id.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.timestamp_ns.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.record_count.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.payload_length.to_le_bytes());
-        buf[24..28].copy_from_slice(&self.payload_crc.to_le_bytes());
-        buf[28..32].copy_from_slice(&self.topic_id.to_le_bytes());
+        #[cfg(target_endian = "little")]
+        {
+            let src = self.as_bytes();
+            buf[..Self::SIZE].copy_from_slice(src);
+        }
+
+        #[cfg(target_endian = "big")]
+        {
+            buf[0..8].copy_from_slice(&self.batch_id.to_le_bytes());
+            buf[8..16].copy_from_slice(&self.timestamp_ns.to_le_bytes());
+            buf[16..20].copy_from_slice(&self.record_count.to_le_bytes());
+            buf[20..24].copy_from_slice(&self.payload_length.to_le_bytes());
+            buf[24..28].copy_from_slice(&self.payload_crc.to_le_bytes());
+            buf[28..32].copy_from_slice(&self.topic_id.to_le_bytes());
+        }
     }
 
     pub fn validate_payload(&self, payload: &[u8]) -> Result<()> {

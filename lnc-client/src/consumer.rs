@@ -380,11 +380,27 @@ impl Consumer {
 
     /// Fetch with automatic retry on transient errors.
     /// Reconnects and retries from the same offset, preserving position.
+    ///
+    /// On `ServerCatchingUp`, backs off for 5 seconds without marking the
+    /// connection as failed — the server is healthy, just behind on
+    /// replication. This lets the follower catch up before the next attempt.
+    ///
+    /// If the server offset does not advance after several attempts the data
+    /// is considered permanently lost (e.g. segment truncation after crash
+    /// recovery).  In that case the consumer resets its offset to the
+    /// server's position so it can resume reading new data.
     async fn fetch_with_retry(&mut self) -> Result<crate::client::FetchResult> {
         const MAX_RETRIES: u32 = 30;
+        const CATCHING_UP_BACKOFF: Duration = Duration::from_secs(5);
+        /// After this many consecutive CATCHING_UP responses with an
+        /// unchanged server_offset we conclude the gap is permanent.
+        const STALE_RESET_THRESHOLD: u32 = 3;
         let mut attempt = 0u32;
         let mut backoff = Duration::from_millis(500);
         const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+        let mut last_server_offset: Option<u64> = None;
+        let mut stale_count: u32 = 0;
 
         loop {
             let result = match self.client.client().await {
@@ -401,6 +417,52 @@ impl Consumer {
 
             match &result {
                 Ok(_) => return result,
+                // Server is healthy but behind on replication — fixed 5s backoff,
+                // do NOT mark connection as failed (no reconnect needed).
+                Err(ClientError::ServerCatchingUp { server_offset }) => {
+                    attempt += 1;
+
+                    // Track whether the server is making progress.  If the
+                    // server_offset hasn't changed for STALE_RESET_THRESHOLD
+                    // consecutive attempts the data between server_offset and
+                    // our current_offset is permanently gone (crash-recovery
+                    // truncation).  Reset to the server's position to unblock.
+                    if last_server_offset == Some(*server_offset) {
+                        stale_count += 1;
+                    } else {
+                        stale_count = 1;
+                        last_server_offset = Some(*server_offset);
+                    }
+
+                    if stale_count >= STALE_RESET_THRESHOLD {
+                        tracing::warn!(
+                            topic_id = self.config.topic_id,
+                            old_offset = self.current_offset,
+                            new_offset = *server_offset,
+                            lost_bytes = self.current_offset.saturating_sub(*server_offset),
+                            "Data permanently unreachable — resetting consumer offset to server position"
+                        );
+                        self.current_offset = *server_offset;
+                        // Reset retry state so the next fetch starts clean
+                        stale_count = 0;
+                        last_server_offset = None;
+                        attempt = 0;
+                        continue;
+                    }
+
+                    if attempt >= MAX_RETRIES {
+                        return result;
+                    }
+                    tracing::info!(
+                        topic_id = self.config.topic_id,
+                        requested_offset = self.current_offset,
+                        server_offset,
+                        attempt,
+                        "Server catching up, backing off {}s",
+                        CATCHING_UP_BACKOFF.as_secs()
+                    );
+                    tokio::time::sleep(CATCHING_UP_BACKOFF).await;
+                },
                 Err(e) if e.is_retryable() && attempt < MAX_RETRIES => {
                     attempt += 1;
                     self.client.mark_failed();

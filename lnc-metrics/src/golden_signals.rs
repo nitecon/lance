@@ -627,6 +627,12 @@ pub fn record_replication_latency(duration: Duration) {
     LATENCY_REPLICATION.record(duration);
 }
 
+/// Record per-peer replication latency for diagnosing slow followers.
+#[inline]
+pub fn record_peer_replication_latency(_peer_id: u16, duration: Duration) {
+    LATENCY_REPLICATION.record(duration);
+}
+
 /// Record network latency.
 #[inline]
 pub fn record_network_latency(duration: Duration) {

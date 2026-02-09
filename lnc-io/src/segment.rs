@@ -339,7 +339,7 @@ impl SegmentWriter {
 
     /// Durable save at a specific offset: write + sync_data.
     ///
-    /// Follower counterpart of [`save`].  Same durability guarantee —
+    /// Follower counterpart of [`Self::save`].  Same durability guarantee —
     /// data survives process crash — but validates the offset matches
     /// the leader-dictated position first.
     pub fn save_at_offset(&mut self, offset: u64, data: &[u8]) -> Result<u64> {

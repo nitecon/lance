@@ -131,7 +131,7 @@ impl Wal {
     ///
     /// Wire format: `[len: u32 LE][data: len bytes]`
     ///
-    /// This framing allows [`replay`] to iterate entries without external
+    /// This framing allows [`Self::replay`] to iterate entries without external
     /// metadata.  Returns `(segment_id, byte_offset)` of the entry.
     pub fn append(&mut self, data: &[u8]) -> Result<(u64, u64)> {
         let frame_len = 4 + data.len() as u64;

@@ -4018,68 +4018,63 @@ impl RegisteredBufferPool {
 
 ### 17.5 Consumer Rate Limiting
 
-Prevent any single consumer from monopolizing resources:
+**Disabled by default.** The rate limiter is opt-in to maximize throughput in
+burst-performance environments. When disabled, the fetch hot path has zero
+overhead — no atomic loads, no syscalls, no branch mispredicts. Enable it only
+when you need to prevent a single consumer from monopolizing I/O bandwidth in
+multi-tenant or shared-cluster deployments.
+
+#### Enabling
+
+| Method | Example |
+|--------|---------|
+| **CLI flag** | `lance --consumer-rate-limit 104857600` (100 MB/s) |
+| **Config file** | `consumer_rate_limit_bytes_per_sec = 104857600` |
+| **Default** | Omitted / `None` → unlimited, zero overhead |
+
+#### Design
+
+The limiter uses a token-bucket algorithm with per-connection scope. When
+`rate_limit` is `None`, `try_consume()` and `has_capacity()` short-circuit
+immediately, returning the full requested amount with a single branch:
 
 ```rust
 pub struct ConsumerRateLimiter {
-    /// Bytes per second limit
-    rate_limit: u64,
-    /// Token bucket state
+    /// `None` = disabled (unlimited throughput, zero overhead).
+    /// `Some(limit)` = bytes-per-second cap with token bucket.
+    rate_limit: Option<u64>,
     tokens: AtomicU64,
     last_refill: AtomicU64,
 }
 
 impl ConsumerRateLimiter {
-    pub fn new(bytes_per_second: u64) -> Self {
-        Self {
-            rate_limit: bytes_per_second,
-            tokens: AtomicU64::new(bytes_per_second),  // Start with 1 second of tokens
-            last_refill: AtomicU64::new(current_time_ms()),
-        }
-    }
-    
-    /// Try to consume tokens; returns how many bytes allowed
+    /// Disabled — all fetches pass through with no atomic ops.
+    pub fn disabled() -> Self { /* ... */ }
+
+    /// Enabled — token bucket with the given bytes/sec cap.
+    pub fn new(bytes_per_second: u64) -> Self { /* ... */ }
+
+    #[inline]
     pub fn try_consume(&self, requested: u64) -> u64 {
-        self.refill();
-        
-        loop {
-            let current = self.tokens.load(Ordering::Relaxed);
-            let allowed = std::cmp::min(current, requested);
-            
-            if allowed == 0 {
-                return 0;
-            }
-            
-            if self.tokens.compare_exchange_weak(
-                current,
-                current - allowed,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ).is_ok() {
-                return allowed;
-            }
+        if self.rate_limit.is_none() {
+            return requested;  // fast path: single branch, no atomics
         }
-    }
-    
-    fn refill(&self) {
-        let now = current_time_ms();
-        let last = self.last_refill.load(Ordering::Relaxed);
-        let elapsed_ms = now.saturating_sub(last);
-        
-        if elapsed_ms > 0 {
-            let refill_amount = (self.rate_limit * elapsed_ms) / 1000;
-            self.tokens.fetch_add(refill_amount, Ordering::Relaxed);
-            self.last_refill.store(now, Ordering::Relaxed);
-            
-            // Cap at 1 second worth of tokens (burst limit)
-            let current = self.tokens.load(Ordering::Relaxed);
-            if current > self.rate_limit {
-                self.tokens.store(self.rate_limit, Ordering::Relaxed);
-            }
-        }
+        self.try_consume_inner(requested)
     }
 }
 ```
+
+#### When to enable
+
+- **Multi-tenant clusters**: prevent one consumer from starving others.
+- **Shared NVMe**: cap read bandwidth so ingestion writes retain priority.
+- **WAN consumers**: match rate to available network bandwidth.
+
+#### When to leave disabled (default)
+
+- **Local development / testing**: maximum throughput, no artificial limits.
+- **Dedicated consumers**: single consumer per topic, no contention.
+- **Burst replay**: bulk export or backfill where speed is the priority.
 
 ### 17.6 Read Path Summary
 

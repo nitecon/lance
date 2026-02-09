@@ -55,6 +55,12 @@ struct Args {
 
     #[arg(long, value_name = "PATH")]
     gen_config: Option<PathBuf>,
+
+    /// Per-connection consumer read rate limit in bytes per second.
+    /// Omit to disable (unlimited throughput, zero overhead on fetch path).
+    /// Example: --consumer-rate-limit 104857600  (100 MB/s)
+    #[arg(long, value_name = "BYTES_PER_SEC")]
+    consumer_rate_limit: Option<u64>,
 }
 
 #[tokio::main]
@@ -289,6 +295,16 @@ sparse_index_interval = {}
 
 # Maximum segment file size in bytes (default: 1 GB)
 segment_max_size = {}
+
+# =============================================================================
+# Consumer Rate Limiting
+# =============================================================================
+
+# Per-connection consumer read rate limit in bytes per second.
+# Disabled by default — consumers read at full speed with zero overhead.
+# Uncomment and set a value to cap per-connection read throughput.
+# Example: 104857600 = 100 MB/s, 1073741824 = 1 GB/s
+# consumer_rate_limit_bytes_per_sec = 104857600
 "#,
         path.display(),
         config.node_id,

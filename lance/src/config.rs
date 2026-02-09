@@ -33,6 +33,11 @@ pub struct Config {
     /// Quorum timeout in milliseconds for L3 replication (default: 100ms)
     #[serde(default)]
     pub replication_quorum_timeout_ms: Option<u64>,
+    /// Per-connection consumer read rate limit in bytes per second.
+    /// Disabled by default (unlimited throughput, zero overhead on fetch path).
+    /// Set to cap how fast any single consumer can read, e.g. `104857600` for 100 MB/s.
+    #[serde(default)]
+    pub consumer_rate_limit_bytes_per_sec: Option<u64>,
 }
 
 /// Authentication configuration for the server
@@ -146,6 +151,7 @@ impl Default for Config {
             auth: AuthSettings::default(),
             tls: TlsSettings::default(),
             replication_quorum_timeout_ms: None,
+            consumer_rate_limit_bytes_per_sec: None,
         }
     }
 }
@@ -230,6 +236,7 @@ impl Config {
                 size: args.wal_size,
                 path: Some(args.data_dir.join("wal")),
             },
+            consumer_rate_limit_bytes_per_sec: args.consumer_rate_limit,
             ..Default::default()
         }
     }

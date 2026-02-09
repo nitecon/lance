@@ -15,28 +15,76 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Rate limiter using token bucket algorithm
-/// Prevents any single consumer from monopolizing resources.
+/// Consumer rate limiter using a token bucket algorithm.
+///
+/// **Disabled by default.** When disabled, all fetch requests pass through
+/// with zero overhead — no atomic loads, no syscalls, no branch mispredicts.
+/// Enable via `--consumer-rate-limit <BYTES_PER_SEC>` or the
+/// `consumer_rate_limit_bytes_per_sec` config field to cap per-connection
+/// read throughput and prevent a single consumer from monopolizing I/O.
 pub struct ConsumerRateLimiter {
-    /// Bytes per second limit
-    rate_limit: u64,
-    /// Token bucket state
+    /// `None` = disabled (unlimited throughput, zero overhead).
+    /// `Some(limit)` = bytes-per-second cap with token bucket.
+    rate_limit: Option<u64>,
+    /// Token bucket state (only used when enabled)
     tokens: AtomicU64,
-    /// Last refill timestamp in milliseconds
+    /// Last refill timestamp in milliseconds (only used when enabled)
     last_refill: AtomicU64,
 }
 
 impl ConsumerRateLimiter {
+    /// Create a rate limiter with the given bytes-per-second cap.
     pub fn new(bytes_per_second: u64) -> Self {
         Self {
-            rate_limit: bytes_per_second,
+            rate_limit: Some(bytes_per_second),
             tokens: AtomicU64::new(bytes_per_second), // Start with 1 second of tokens
             last_refill: AtomicU64::new(current_time_ms()),
         }
     }
 
-    /// Try to consume tokens; returns how many bytes allowed
+    /// Create a disabled (unlimited) rate limiter.
+    ///
+    /// All calls to [`try_consume`] return the full requested amount and
+    /// [`has_capacity`] always returns `true`, with no atomic operations.
+    pub fn disabled() -> Self {
+        Self {
+            rate_limit: None,
+            tokens: AtomicU64::new(0),
+            last_refill: AtomicU64::new(0),
+        }
+    }
+
+    /// Returns `true` when rate limiting is active.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_enabled(&self) -> bool {
+        self.rate_limit.is_some()
+    }
+
+    /// Try to consume tokens; returns how many bytes allowed.
+    ///
+    /// When the limiter is disabled this is a no-op that returns `requested`.
+    #[inline]
     pub fn try_consume(&self, requested: u64) -> u64 {
+        if self.rate_limit.is_none() {
+            return requested;
+        }
+        self.try_consume_inner(requested)
+    }
+
+    /// Check if any tokens are available without consuming.
+    ///
+    /// Always returns `true` when the limiter is disabled.
+    #[inline]
+    pub fn has_capacity(&self) -> bool {
+        if self.rate_limit.is_none() {
+            return true;
+        }
+        self.refill();
+        self.tokens.load(Ordering::Relaxed) > 0
+    }
+
+    fn try_consume_inner(&self, requested: u64) -> u64 {
         self.refill();
 
         loop {
@@ -62,27 +110,27 @@ impl ConsumerRateLimiter {
         }
     }
 
-    /// Check if any tokens are available without consuming
-    pub fn has_capacity(&self) -> bool {
-        self.refill();
-        self.tokens.load(Ordering::Relaxed) > 0
-    }
-
     fn refill(&self) {
+        // SAFETY: only called when rate_limit is Some
+        let limit = match self.rate_limit {
+            Some(l) => l,
+            None => return,
+        };
+
         let now = current_time_ms();
         let last = self.last_refill.load(Ordering::Relaxed);
         let elapsed_ms = now.saturating_sub(last);
 
         if elapsed_ms > 0 {
-            let refill_amount = (self.rate_limit * elapsed_ms) / 1000;
+            let refill_amount = (limit * elapsed_ms) / 1000;
             if refill_amount > 0 {
                 self.tokens.fetch_add(refill_amount, Ordering::Relaxed);
                 self.last_refill.store(now, Ordering::Relaxed);
 
                 // Cap at 1 second worth of tokens (burst limit)
                 let current = self.tokens.load(Ordering::Relaxed);
-                if current > self.rate_limit {
-                    self.tokens.store(self.rate_limit, Ordering::Relaxed);
+                if current > limit {
+                    self.tokens.store(limit, Ordering::Relaxed);
                 }
             }
         }
@@ -232,6 +280,7 @@ mod tests {
         // test deterministic — it would need ≥10 ms of wall-clock drift
         // before a single token is refilled.
         let limiter = ConsumerRateLimiter::new(100); // 100 B/s
+        assert!(limiter.is_enabled());
 
         // Should be able to consume up to rate limit
         let consumed = limiter.try_consume(60);
@@ -243,6 +292,23 @@ mod tests {
         // Should be exhausted now (test executes in <10 ms, so no refill)
         let consumed = limiter.try_consume(10);
         assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn test_rate_limiter_disabled() {
+        let limiter = ConsumerRateLimiter::disabled();
+        assert!(!limiter.is_enabled());
+
+        // Disabled limiter always allows full requested amount
+        assert_eq!(limiter.try_consume(1_000_000_000), 1_000_000_000);
+        assert_eq!(limiter.try_consume(u64::MAX), u64::MAX);
+        assert!(limiter.has_capacity());
+
+        // Still unlimited after many calls
+        for _ in 0..1000 {
+            assert_eq!(limiter.try_consume(1_000_000), 1_000_000);
+        }
+        assert!(limiter.has_capacity());
     }
 
     #[test]

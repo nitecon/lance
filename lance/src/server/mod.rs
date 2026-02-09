@@ -518,8 +518,24 @@ pub async fn run(
 
     let listener = TcpListener::bind(&config.listen_addr).await?;
 
-    // Create rate limiter for consumer reads (100MB/s per connection)
-    let rate_limiter = Arc::new(ConsumerRateLimiter::new(100 * 1024 * 1024));
+    // Create rate limiter for consumer reads (disabled by default for max throughput)
+    let rate_limiter = Arc::new(match config.consumer_rate_limit_bytes_per_sec {
+        Some(limit) => {
+            info!(
+                target: "lance::server",
+                bytes_per_sec = limit,
+                "Consumer rate limiter enabled"
+            );
+            ConsumerRateLimiter::new(limit)
+        },
+        None => {
+            info!(
+                target: "lance::server",
+                "Consumer rate limiter disabled (unlimited throughput)"
+            );
+            ConsumerRateLimiter::disabled()
+        },
+    });
 
     // Create subscription manager for streaming consumers
     let subscription_manager = Arc::new(SubscriptionManager::new());

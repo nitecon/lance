@@ -182,7 +182,13 @@ pub async fn run_ingestion_actor(
                 }
             }
 
-            match process_ingestion_request(&config, &topic_registry, &mut topic_writers, request) {
+            match process_ingestion_request(
+                &config,
+                &topic_registry,
+                &mut topic_writers,
+                request,
+                &payload,
+            ) {
                 Ok(meta) => {
                     dirty_topics.insert(topic_id);
                     dirty_bytes += payload_len;
@@ -532,12 +538,16 @@ fn flush_and_signal(
     }
 }
 
-/// Process a single ingestion request, returning write metadata for replication
+/// Process a single ingestion request, returning write metadata for replication.
+///
+/// `payload` is passed separately because the caller has already taken it from
+/// the request via `std::mem::take` for WAL and deferred-signal storage.
 fn process_ingestion_request(
     config: &Config,
     topic_registry: &TopicRegistry,
     topic_writers: &mut HashMap<u32, TopicWriter>,
     request: IngestionRequest,
+    payload: &Bytes,
 ) -> Result<WriteMetadata> {
     let topic_id = request.topic_id;
 
@@ -563,14 +573,14 @@ fn process_ingestion_request(
     let seq = SEQUENCE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let sort_key = SortKey::from_timestamp_ns(request.timestamp_ns, seq as u32);
 
-    let offset = topic_writer.writer.write_batch(&request.payload)?;
+    let offset = topic_writer.writer.write_batch(payload)?;
 
     topic_writer
         .index_builder
         .add_record(sort_key, request.timestamp_ns, offset);
 
     lnc_metrics::increment_records_ingested(request.record_count as u64);
-    lnc_metrics::increment_bytes_ingested(request.payload.len() as u64);
+    lnc_metrics::increment_bytes_ingested(payload.len() as u64);
 
     let rotated_after = if topic_writer.writer.current_offset() >= config.io.segment_max_size {
         rotate_topic_segment(config, topic_registry, topic_id, topic_writer)?;

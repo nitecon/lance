@@ -11,8 +11,9 @@ mod wal;
 pub use backend::{IoBackend, IoBackendType, probe_io_uring};
 pub use priority::{IoPriority, IoPriorityQueue, IoPriorityStats, PrioritizedIoRequest};
 pub use segment::{
-    BorrowedSlice, CompactionConfig, CompactionResult, SegmentCompactor, SegmentMetadata,
-    SegmentReader, SegmentState, SegmentWriter, ZeroCopyReader, close_unclosed_segments,
+    BorrowedSlice, CompactionConfig, CompactionResult, DirectBackend, SegmentCompactor,
+    SegmentMetadata, SegmentReader, SegmentState, SegmentWriter, ZeroCopyReader,
+    close_unclosed_segments,
 };
 pub use tier::{
     StorageTier, TierConfig, TierMoveResult, TierStats, TierableSegment, TieredStorageConfig,

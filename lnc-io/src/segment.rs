@@ -1,4 +1,5 @@
 use crate::backend::IoBackend;
+use crate::fallback::Pwritev2Backend;
 use bytes::Bytes;
 use lnc_core::{LanceError, Result};
 use lnc_metrics::time_io_sampled;
@@ -14,6 +15,8 @@ use std::path::{Path, PathBuf};
 const DEFAULT_WRITE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 #[cfg(target_os = "linux")]
+use crate::uring::IoUringBackend;
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,17 +26,48 @@ pub enum SegmentState {
     Archived,
 }
 
+/// Concrete direct I/O backend — monomorphized to avoid dynamic dispatch.
+///
+/// Per Engineering Standards §1: No dynamic dispatch on data plane.
+/// This enum wraps the two known `IoBackend` implementations with static
+/// dispatch via match arms instead of a vtable.
+pub enum DirectBackend {
+    #[cfg(target_os = "linux")]
+    IoUring(IoUringBackend),
+    Pwritev2(Pwritev2Backend),
+}
+
+impl DirectBackend {
+    #[inline]
+    fn write(&mut self, data: &[u8], offset: u64) -> Result<usize> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::IoUring(b) => b.write(data, offset),
+            Self::Pwritev2(b) => b.write(data, offset),
+        }
+    }
+
+    #[inline]
+    fn fsync(&mut self) -> Result<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::IoUring(b) => b.fsync(),
+            Self::Pwritev2(b) => b.fsync(),
+        }
+    }
+}
+
 /// I/O backend for `SegmentWriter`.
 ///
 /// - **Buffered** (default): `BufWriter<File>` — cross-platform, sequential
 ///   writes with a 4 MiB user-space buffer.  Best for Ceph RBD and general
 ///   use.
-/// - **Direct**: Any `IoBackend` implementation (`IoUringBackend` with
-///   `O_DIRECT`, or `Pwritev2Backend`).  Uses positional writes and bypasses
-///   the page cache.  Best for local NVMe with io_uring.
+/// - **Direct**: `DirectBackend` (`IoUringBackend` with `O_DIRECT`, or
+///   `Pwritev2Backend`).  Uses positional writes and bypasses the page cache.
+///   Best for local NVMe with io_uring.
 enum WriteBackend {
     Buffered(BufWriter<File>),
-    Direct(Box<dyn IoBackend>),
+    Direct(DirectBackend),
 }
 
 pub struct SegmentWriter {
@@ -86,11 +120,11 @@ impl SegmentWriter {
         })
     }
 
-    /// Create a segment writer backed by an `IoBackend` (io_uring or pwritev2).
+    /// Create a segment writer backed by a direct I/O backend (io_uring or pwritev2).
     ///
     /// The backend handles its own file opening (with `O_DIRECT` if
     /// appropriate), so we only need the path for metadata.
-    pub fn create_with_backend(path: &Path, backend: Box<dyn IoBackend>) -> Result<Self> {
+    pub fn create_with_backend(path: &Path, backend: DirectBackend) -> Result<Self> {
         Ok(Self {
             backend: WriteBackend::Direct(backend),
             path: path.to_path_buf(),

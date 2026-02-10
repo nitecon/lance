@@ -272,6 +272,15 @@ Flags byte:
 
 Any mismatch is a fatal inconsistency that triggers an immediate alert and follower resync.
 
+**Follower Resync Protocol**: When a follower restarts with stale or empty segment files, it executes a deterministic resync protocol to catch up with the leader. This includes segment manifest exchange, CRC32C-based audit, chunked segment transfer, and a "wartime" term extension to prevent disruptive elections during catch-up. See [RaftQuorumWartime.md](./RaftQuorumWartime.md) for the full specification.
+
+**Implementation files**:
+- Wire protocol types: `lnc-replication/src/codec.rs` (ResyncBegin, ResyncComplete, SegmentManifest*, SegmentFetch*, ReplicationAckStatus::CatchingUp)
+- Leader-side handlers: `lnc-replication/src/cluster.rs` (wartime state, event dispatch), `lance/src/server/resync.rs` (manifest builder, chunk server)
+- Follower state machine: `lance/src/server/resync.rs` (`run_follower_resync`, audit, fetch, write, CRC verify)
+- Event wiring: `lance/src/server/mod.rs` (BecameFollower spawns resync, data write skip guard, event forwarding)
+- Health integration: `lance/src/health.rs` (`catching_up` state, `/health` endpoint)
+
 #### 4.1.2 Global Offset
 
 The **global offset** is a monotonically-increasing byte counter per topic, maintained by the leader. Because all nodes have byte-identical segment files, the cumulative byte position IS the global offset — it's the same on every node.
@@ -4039,7 +4048,7 @@ The limiter uses a token-bucket algorithm with per-connection scope. When
 immediately, returning the full requested amount with a single branch:
 
 ```rust
-pub struct ConsumerRateLimiter {
+pub struct ConsumerRateLimiter { kubectl logs -n rithmic -l app=rithmic -l env=dev
     /// `None` = disabled (unlimited throughput, zero overhead).
     /// `Some(limit)` = bytes-per-second cap with token bucket.
     rate_limit: Option<u64>,

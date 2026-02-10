@@ -9,6 +9,7 @@ mod connection;
 mod ingestion;
 mod multi_actor;
 mod recovery;
+pub mod resync;
 pub mod retention;
 mod writer;
 
@@ -158,12 +159,17 @@ pub async fn run(
         let event_registry = Arc::clone(&topic_registry);
         let event_config = config.clone();
         let event_coord = Arc::clone(&coordinator);
+        let event_health = Arc::clone(&health_state);
+        let event_node_id = config.node_id;
         tokio::spawn(async move {
             // Track last known leader for change detection
             let mut last_leader = event_coord.leader_addr();
             // Topic writers for follower data replication (only used by followers)
             let mut follower_writers: std::collections::HashMap<u32, writer::TopicWriter> =
                 std::collections::HashMap::new();
+            // Channel for forwarding resync events to the follower resync state machine.
+            // Created when BecameFollower fires, dropped when resync completes.
+            let mut resync_tx: Option<tokio::sync::mpsc::Sender<resync::ResyncEvent>> = None;
 
             loop {
                 // Check for leader changes periodically
@@ -221,6 +227,25 @@ pub async fn run(
                         },
                     },
                     Ok(ClusterEvent::DataReceivedEnriched(entry)) => {
+                        // Per RaftQuorumWartime.md §4.2:
+                        // During resync, skip data writes — the resync state machine
+                        // is fetching segments directly from the leader. Incoming data
+                        // entries are acknowledged (at the Raft level) but not written.
+                        // Check if resync is still active (receiver not dropped).
+                        if let Some(ref tx) = resync_tx {
+                            if tx.is_closed() {
+                                // Resync task completed — clear the channel
+                                resync_tx = None;
+                            } else {
+                                debug!(
+                                    target: "lance::server",
+                                    topic_id = entry.topic_id,
+                                    segment = %entry.segment_name,
+                                    "Skipping data write during resync (catching up)"
+                                );
+                                continue;
+                            }
+                        }
                         // Write replicated data using enriched format (L3 byte-identical segments)
                         let topic_id = entry.topic_id;
                         if let Err(e) = ingestion::write_replicated_data_enriched(
@@ -229,17 +254,35 @@ pub async fn run(
                             &mut follower_writers,
                             &entry,
                         ) {
+                            // Log but do NOT remove the writer on offset mismatch.
+                            // Removing the writer causes a tight create/truncate/fail
+                            // loop that leads to OOM. Instead, keep the writer alive
+                            // so subsequent writes at the correct offset can succeed,
+                            // or wait for a NEW_SEGMENT flag to start fresh.
                             warn!(
                                 target: "lance::server",
                                 topic_id,
                                 segment = %entry.segment_name,
+                                write_offset = entry.write_offset,
                                 error = %e,
-                                "Failed to write enriched replicated data"
+                                "Failed to write enriched replicated data (writer retained)"
                             );
-                            follower_writers.remove(&topic_id);
                         }
                     },
                     Ok(ClusterEvent::DataReceived { topic_id, payload }) => {
+                        // Skip legacy data writes during resync (same guard as enriched path)
+                        if let Some(ref tx) = resync_tx {
+                            if tx.is_closed() {
+                                resync_tx = None;
+                            } else {
+                                debug!(
+                                    target: "lance::server",
+                                    topic_id,
+                                    "Skipping legacy data write during resync (catching up)"
+                                );
+                                continue;
+                            }
+                        }
                         // Legacy fallback: write replicated data without segment metadata
                         if let Err(e) = ingestion::write_replicated_data(
                             &event_config,
@@ -310,6 +353,24 @@ pub async fn run(
                             leader_id,
                             "BecameFollower — now following node {leader_id}"
                         );
+                        // Per RaftQuorumWartime.md §5.2:
+                        // Spawn the follower resync state machine to sync
+                        // local segments with the leader before accepting traffic.
+                        let (tx, rx) = tokio::sync::mpsc::channel::<resync::ResyncEvent>(64);
+                        resync_tx = Some(tx);
+                        let resync_coord = Arc::clone(&event_coord);
+                        let resync_registry = Arc::clone(&event_registry);
+                        let resync_health = Arc::clone(&event_health);
+                        tokio::spawn(async move {
+                            resync::run_follower_resync(
+                                event_node_id,
+                                resync_coord,
+                                resync_registry,
+                                resync_health,
+                                rx,
+                            )
+                            .await;
+                        });
                     },
                     Ok(ClusterEvent::LostLeadership { term }) => {
                         warn!(
@@ -317,6 +378,153 @@ pub async fn run(
                             term,
                             "LostLeadership — no longer leader"
                         );
+                    },
+                    Ok(ClusterEvent::ResyncBeginReceived(req)) => {
+                        // Leader: enter wartime for this follower
+                        if event_coord.is_leader() {
+                            if event_coord.enter_wartime(req.node_id) {
+                                info!(
+                                    target: "lance::server",
+                                    follower_id = req.node_id,
+                                    term = req.term,
+                                    "Entered wartime for resyncing follower"
+                                );
+                            } else {
+                                warn!(
+                                    target: "lance::server",
+                                    follower_id = req.node_id,
+                                    "Wartime max terms exceeded for follower"
+                                );
+                            }
+                        }
+                    },
+                    Ok(ClusterEvent::ResyncCompleteReceived(req)) => {
+                        // Leader: exit wartime for this follower
+                        if event_coord.is_leader() {
+                            event_coord.exit_wartime(req.node_id);
+                            info!(
+                                target: "lance::server",
+                                follower_id = req.node_id,
+                                term = req.term,
+                                "Follower resync complete, exited wartime"
+                            );
+                        }
+                    },
+                    Ok(ClusterEvent::SegmentManifestRequested { node_id, .. }) => {
+                        // Leader: build and send manifest to requesting follower
+                        if event_coord.is_leader() {
+                            match resync::build_segment_manifest(&event_registry) {
+                                Ok(manifest) => {
+                                    let msg = lnc_replication::ReplicationMessage::SegmentManifestResponse(manifest);
+                                    if let Err(e) = event_coord.send_to_peer(node_id, &msg).await {
+                                        warn!(
+                                            target: "lance::server",
+                                            follower_id = node_id,
+                                            error = %e,
+                                            "Failed to send segment manifest to follower"
+                                        );
+                                    }
+                                },
+                                Err(e) => {
+                                    warn!(
+                                        target: "lance::server",
+                                        follower_id = node_id,
+                                        error = %e,
+                                        "Failed to build segment manifest"
+                                    );
+                                },
+                            }
+                        }
+                    },
+                    Ok(ClusterEvent::SegmentFetchRequested(request)) => {
+                        // Leader: read chunk and send to requesting follower
+                        if event_coord.is_leader() {
+                            let follower_id = request.node_id;
+                            match resync::read_segment_chunk(
+                                &event_registry,
+                                request.topic_id,
+                                &request.segment_name,
+                                request.offset,
+                                request.max_chunk_size,
+                            ) {
+                                Ok((data, total_size, done)) => {
+                                    let resp = lnc_replication::SegmentFetchResponse {
+                                        topic_id: request.topic_id,
+                                        segment_name: request.segment_name,
+                                        offset: request.offset,
+                                        total_size,
+                                        done,
+                                        data,
+                                    };
+                                    let msg =
+                                        lnc_replication::ReplicationMessage::SegmentFetchResponse(
+                                            resp,
+                                        );
+                                    if let Err(e) =
+                                        event_coord.send_to_peer(follower_id, &msg).await
+                                    {
+                                        warn!(
+                                            target: "lance::server",
+                                            follower_id,
+                                            error = %e,
+                                            "Failed to send segment chunk to follower"
+                                        );
+                                    }
+                                },
+                                Err(e) => {
+                                    warn!(
+                                        target: "lance::server",
+                                        follower_id,
+                                        topic_id = request.topic_id,
+                                        segment = %request.segment_name,
+                                        error = %e,
+                                        "Failed to read segment chunk"
+                                    );
+                                },
+                            }
+                        }
+                    },
+                    Ok(ClusterEvent::SegmentManifestReceived(manifest)) => {
+                        // Follower: forward manifest to resync state machine
+                        if let Some(ref tx) = resync_tx {
+                            if tx
+                                .send(resync::ResyncEvent::ManifestReceived(manifest))
+                                .await
+                                .is_err()
+                            {
+                                debug!(
+                                    target: "lance::server",
+                                    "Resync channel closed — manifest dropped"
+                                );
+                                resync_tx = None;
+                            }
+                        } else {
+                            debug!(
+                                target: "lance::server",
+                                "Received segment manifest but no resync active"
+                            );
+                        }
+                    },
+                    Ok(ClusterEvent::SegmentFetchReceived(resp)) => {
+                        // Follower: forward fetch response to resync state machine
+                        if let Some(ref tx) = resync_tx {
+                            if tx
+                                .send(resync::ResyncEvent::FetchReceived(resp))
+                                .await
+                                .is_err()
+                            {
+                                debug!(
+                                    target: "lance::server",
+                                    "Resync channel closed — fetch response dropped"
+                                );
+                                resync_tx = None;
+                            }
+                        } else {
+                            debug!(
+                                target: "lance::server",
+                                "Received segment chunk but no resync active"
+                            );
+                        }
                     },
                     Ok(_) => {}, // PeerJoined, PeerLeft, etc.
                     Err(broadcast::error::RecvError::Lagged(n)) => {

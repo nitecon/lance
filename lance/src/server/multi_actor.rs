@@ -3,16 +3,17 @@
 //! Implements N ingestion actors with client hash partitioning per Architecture §5.2.
 //! Uses crossbeam::ArrayQueue for lock-free MPMC communication per CodingGuidelines §3.3.
 
-use super::ingestion::{DataReplicationRequest, IngestionRequest, WriteMetadata};
-use super::writer::{TopicWriter, create_topic_writer, rotate_topic_segment};
+use super::ingestion::{
+    BatchSuccess, DataReplicationRequest, IngestionRequest, flush_and_signal,
+    process_ingestion_request,
+};
+use super::writer::TopicWriter;
 use crate::config::Config;
 use crate::topic::TopicRegistry;
-use bytes::Bytes;
 use crossbeam::queue::ArrayQueue;
-use lnc_core::{LanceError, Result, SortKey, pin_thread_to_cpu};
+use lnc_core::{LanceError, Result, pin_thread_to_cpu};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use tracing::{debug, info, warn};
 
@@ -37,9 +38,6 @@ impl IngestionSender {
         }
     }
 }
-
-/// Shared sequence counter across all ingestion actors
-static SEQUENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Multi-actor ingestion system with hash partitioning
 pub struct MultiActorIngestion {
@@ -278,7 +276,7 @@ fn run_ingestion_actor_sync(
                         }
                     }
 
-                    match process_request_sync(
+                    match process_ingestion_request(
                         &config,
                         &topic_registry,
                         &mut topic_writers,
@@ -314,7 +312,7 @@ fn run_ingestion_actor_sync(
 
                 // ── Phase 3: Flush if threshold crossed ──────────────
                 if dirty_bytes >= FLUSH_THRESHOLD {
-                    flush_and_signal_sync(
+                    flush_and_signal(
                         &mut topic_writers,
                         &mut dirty_topics,
                         &mut pending_signals,
@@ -335,7 +333,7 @@ fn run_ingestion_actor_sync(
 
                 // Flush on timeout if we have pending data
                 if !pending_signals.is_empty() && last_write.elapsed() >= FLUSH_TIMEOUT {
-                    flush_and_signal_sync(
+                    flush_and_signal(
                         &mut topic_writers,
                         &mut dirty_topics,
                         &mut pending_signals,
@@ -355,7 +353,7 @@ fn run_ingestion_actor_sync(
 
     // ── Shutdown: flush remaining buffered data ───────────────────────
     if !pending_signals.is_empty() {
-        flush_and_signal_sync(
+        flush_and_signal(
             &mut topic_writers,
             &mut dirty_topics,
             &mut pending_signals,
@@ -411,129 +409,6 @@ fn run_ingestion_actor_sync(
         actor_id,
         "Ingestion actor shutdown complete"
     );
-}
-
-/// Holds the state for a single successful write within a batch.
-struct BatchSuccess {
-    write_done_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    topic_id: u32,
-    payload: Bytes,
-    payload_len: usize,
-    write_id: Option<u64>,
-    meta: WriteMetadata,
-}
-
-/// Synchronous flush helper for the multi-actor path.
-/// Same semantics as `flush_and_signal` in ingestion.rs but callable
-/// from a plain thread (no async runtime).
-fn flush_and_signal_sync(
-    topic_writers: &mut HashMap<u32, TopicWriter>,
-    dirty_topics: &mut std::collections::HashSet<u32>,
-    pending_signals: &mut Vec<BatchSuccess>,
-    replication_tx: &Option<tokio::sync::mpsc::Sender<DataReplicationRequest>>,
-    wal: &mut Option<lnc_io::Wal>,
-) {
-    // Sync WAL before segment fsyncs (batched, not per-append)
-    if let Some(w) = wal {
-        if let Err(e) = w.sync() {
-            tracing::error!(
-                target: "lance::ingestion",
-                error = %e,
-                "WAL batch sync failed"
-            );
-        }
-    }
-    for topic_id in dirty_topics.iter() {
-        if let Some(tw) = topic_writers.get_mut(topic_id) {
-            if let Err(e) = tw.writer.fsync() {
-                tracing::error!(
-                    target: "lance::ingestion",
-                    topic_id,
-                    error = %e,
-                    "Batch fsync failed"
-                );
-            }
-        }
-    }
-    dirty_topics.clear();
-
-    for s in pending_signals.drain(..) {
-        if let Some(tx) = s.write_done_tx {
-            let _ = tx.send(());
-        }
-
-        if let Some(tx) = replication_tx {
-            let _ = tx.try_send(DataReplicationRequest {
-                topic_id: s.topic_id,
-                payload: s.payload,
-                segment_name: s.meta.segment_name,
-                write_offset: s.meta.write_offset,
-                global_offset: s.meta.write_offset + s.payload_len as u64,
-                is_new_segment: s.meta.is_new_segment,
-                rotated_after: s.meta.rotated_after,
-                write_id: s.write_id,
-            });
-        }
-    }
-}
-
-/// Process a single ingestion request (synchronous), returning write metadata for replication.
-///
-/// `payload` is passed separately because the caller has already taken it from
-/// the request via `std::mem::take` for WAL and deferred-signal storage.
-fn process_request_sync(
-    config: &Config,
-    topic_registry: &TopicRegistry,
-    topic_writers: &mut HashMap<u32, TopicWriter>,
-    request: IngestionRequest,
-    payload: &Bytes,
-) -> Result<WriteMetadata> {
-    let topic_id = request.topic_id;
-
-    // Get or create writer for this topic
-    let is_new_segment = !topic_writers.contains_key(&topic_id);
-    let topic_writer = match topic_writers.get_mut(&topic_id) {
-        Some(tw) => tw,
-        None => {
-            let tw = create_topic_writer(config, topic_registry, topic_id)?;
-            topic_writers.insert(topic_id, tw);
-            topic_writers
-                .get_mut(&topic_id)
-                .ok_or_else(|| LanceError::Protocol("Failed to get topic writer".into()))?
-        },
-    };
-
-    let segment_name = topic_writer
-        .writer
-        .filename()
-        .unwrap_or_default()
-        .to_string();
-
-    let seq = SEQUENCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let sort_key = SortKey::from_timestamp_ns(request.timestamp_ns, seq as u32);
-
-    let offset = topic_writer.writer.write_batch(payload)?;
-
-    topic_writer
-        .index_builder
-        .add_record(sort_key, request.timestamp_ns, offset);
-
-    lnc_metrics::increment_records_ingested(request.record_count as u64);
-    lnc_metrics::increment_bytes_ingested(payload.len() as u64);
-
-    let rotated_after = if topic_writer.writer.current_offset() >= config.io.segment_max_size {
-        rotate_topic_segment(config, topic_registry, topic_id, topic_writer)?;
-        true
-    } else {
-        false
-    };
-
-    Ok(WriteMetadata {
-        write_offset: offset,
-        segment_name,
-        is_new_segment,
-        rotated_after,
-    })
 }
 
 #[cfg(test)]

@@ -378,6 +378,8 @@ pub enum ReplicationAckStatus {
     Error = 0x01,
     /// Follower is out of sync and needs resync.
     ResyncNeeded = 0x02,
+    /// Follower is alive but catching up (resync in progress).
+    CatchingUp = 0x03,
 }
 
 impl ReplicationAckStatus {
@@ -388,6 +390,7 @@ impl ReplicationAckStatus {
             0x00 => Self::Ok,
             0x01 => Self::Error,
             0x02 => Self::ResyncNeeded,
+            0x03 => Self::CatchingUp,
             _ => Self::Error,
         }
     }
@@ -657,6 +660,112 @@ pub struct TimeoutNowResponse {
     pub accepted: bool,
 }
 
+/// Resync begin request (follower → leader).
+///
+/// Per RaftQuorumWartime.md §5.2 Step 4:
+/// Follower sends this to enter wartime and begin the resync protocol.
+#[derive(Debug, Clone)]
+pub struct ResyncBegin {
+    /// Follower's node ID.
+    pub node_id: u16,
+    /// Current Raft term.
+    pub term: u64,
+}
+
+/// Resync complete notification (follower → leader).
+///
+/// Per RaftQuorumWartime.md §5.2 Step 10:
+/// Follower sends this when resync is finished; leader exits wartime.
+#[derive(Debug, Clone)]
+pub struct ResyncComplete {
+    /// Follower's node ID.
+    pub node_id: u16,
+    /// Current Raft term.
+    pub term: u64,
+}
+
+/// Segment manifest request (follower → leader).
+///
+/// Per RaftQuorumWartime.md §7.1:
+/// Follower requests the leader's segment inventory for all topics.
+#[derive(Debug, Clone)]
+pub struct SegmentManifestRequest {
+    /// Follower's node ID.
+    pub node_id: u16,
+}
+
+/// Information about a single closed (immutable) segment file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentInfo {
+    /// Segment filename (e.g., `0_1706918400000000000-1706918500000000000.lnc`).
+    pub name: String,
+    /// CRC32C of entire file contents.
+    pub crc32c: u32,
+    /// File size in bytes.
+    pub size_bytes: u64,
+}
+
+/// Per-topic segment inventory from the leader.
+#[derive(Debug, Clone)]
+pub struct TopicManifest {
+    /// Topic identifier.
+    pub topic_id: u32,
+    /// Topic name.
+    pub topic_name: String,
+    /// Currently active (being written) segment filename.
+    pub active_segment: String,
+    /// Closed (immutable) segments with checksums.
+    pub closed_segments: Vec<SegmentInfo>,
+}
+
+/// Segment manifest response (leader → follower).
+///
+/// Per RaftQuorumWartime.md §7.1:
+/// Leader responds with per-topic segment inventory.
+#[derive(Debug, Clone)]
+pub struct SegmentManifestResponse {
+    /// Per-topic manifests.
+    pub topics: Vec<TopicManifest>,
+}
+
+/// Segment fetch request (follower → leader).
+///
+/// Per RaftQuorumWartime.md §7.2:
+/// Follower requests a chunk of a specific segment file.
+#[derive(Debug, Clone)]
+pub struct SegmentFetchRequest {
+    /// Requesting follower's node ID.
+    pub node_id: u16,
+    /// Target topic identifier.
+    pub topic_id: u32,
+    /// Segment filename to fetch.
+    pub segment_name: String,
+    /// Byte offset to start reading from (for resumption).
+    pub offset: u64,
+    /// Requested chunk size (default: 256KB).
+    pub max_chunk_size: u32,
+}
+
+/// Segment fetch response (leader → follower).
+///
+/// Per RaftQuorumWartime.md §7.2:
+/// Leader responds with a chunk of segment data.
+#[derive(Debug, Clone)]
+pub struct SegmentFetchResponse {
+    /// Topic identifier.
+    pub topic_id: u32,
+    /// Segment filename.
+    pub segment_name: String,
+    /// Byte offset of this chunk within the segment.
+    pub offset: u64,
+    /// Total segment file size.
+    pub total_size: u64,
+    /// True if this is the last chunk.
+    pub done: bool,
+    /// Chunk data.
+    pub data: Bytes,
+}
+
 /// All possible replication messages.
 #[derive(Debug, Clone)]
 pub enum ReplicationMessage {
@@ -670,6 +779,12 @@ pub enum ReplicationMessage {
     InstallSnapshotResponse(InstallSnapshotResponse),
     TimeoutNowRequest(TimeoutNowRequest),
     TimeoutNowResponse(TimeoutNowResponse),
+    ResyncBegin(ResyncBegin),
+    ResyncComplete(ResyncComplete),
+    SegmentManifestRequest(SegmentManifestRequest),
+    SegmentManifestResponse(SegmentManifestResponse),
+    SegmentFetchRequest(SegmentFetchRequest),
+    SegmentFetchResponse(SegmentFetchResponse),
 }
 
 /// Message type discriminant for wire format.
@@ -686,6 +801,12 @@ pub enum MessageType {
     InstallSnapshotResponse = 8,
     TimeoutNowRequest = 9,
     TimeoutNowResponse = 10,
+    ResyncBegin = 11,
+    ResyncComplete = 12,
+    SegmentManifestRequest = 13,
+    SegmentManifestResponse = 14,
+    SegmentFetchRequest = 15,
+    SegmentFetchResponse = 16,
 }
 
 impl MessageType {
@@ -703,6 +824,12 @@ impl MessageType {
             8 => Some(Self::InstallSnapshotResponse),
             9 => Some(Self::TimeoutNowRequest),
             10 => Some(Self::TimeoutNowResponse),
+            11 => Some(Self::ResyncBegin),
+            12 => Some(Self::ResyncComplete),
+            13 => Some(Self::SegmentManifestRequest),
+            14 => Some(Self::SegmentManifestResponse),
+            15 => Some(Self::SegmentFetchRequest),
+            16 => Some(Self::SegmentFetchResponse),
             _ => None,
         }
     }
@@ -760,12 +887,24 @@ impl ReplicationCodec {
             },
             ReplicationMessage::TimeoutNowRequest(req) => self.encode_timeout_now_request(req),
             ReplicationMessage::TimeoutNowResponse(resp) => self.encode_timeout_now_response(resp),
+            ReplicationMessage::ResyncBegin(req) => Self::encode_resync_begin(req),
+            ReplicationMessage::ResyncComplete(req) => Self::encode_resync_complete(req),
+            ReplicationMessage::SegmentManifestRequest(req) => {
+                Self::encode_segment_manifest_request(req)
+            },
+            ReplicationMessage::SegmentManifestResponse(resp) => {
+                Self::encode_segment_manifest_response(resp)
+            },
+            ReplicationMessage::SegmentFetchRequest(req) => Self::encode_segment_fetch_request(req),
+            ReplicationMessage::SegmentFetchResponse(resp) => {
+                Self::encode_segment_fetch_response(resp)
+            },
         }
     }
 
     /// Decode a replication message from bytes.
     pub fn decode(data: &[u8]) -> Result<ReplicationMessage> {
-        if data.len() < 5 {
+        if data.is_empty() {
             return Err(LanceError::InvalidData("Message too short".into()));
         }
 
@@ -785,6 +924,12 @@ impl ReplicationCodec {
             MessageType::InstallSnapshotResponse => Self::decode_install_snapshot_response(payload),
             MessageType::TimeoutNowRequest => Self::decode_timeout_now_request(payload),
             MessageType::TimeoutNowResponse => Self::decode_timeout_now_response(payload),
+            MessageType::ResyncBegin => Self::decode_resync_begin(payload),
+            MessageType::ResyncComplete => Self::decode_resync_complete(payload),
+            MessageType::SegmentManifestRequest => Self::decode_segment_manifest_request(payload),
+            MessageType::SegmentManifestResponse => Self::decode_segment_manifest_response(payload),
+            MessageType::SegmentFetchRequest => Self::decode_segment_fetch_request(payload),
+            MessageType::SegmentFetchResponse => Self::decode_segment_fetch_response(payload),
         }
     }
 
@@ -1394,6 +1539,418 @@ impl ReplicationCodec {
         }))
     }
 
+    // === Resync protocol encode helpers ===
+
+    fn encode_resync_begin(req: &ResyncBegin) -> Result<Bytes> {
+        let mut buf = BytesMut::with_capacity(11);
+        buf.extend_from_slice(&[MessageType::ResyncBegin as u8]);
+        buf.extend_from_slice(&req.node_id.to_le_bytes());
+        buf.extend_from_slice(&req.term.to_le_bytes());
+        Ok(buf.freeze())
+    }
+
+    fn encode_resync_complete(req: &ResyncComplete) -> Result<Bytes> {
+        let mut buf = BytesMut::with_capacity(11);
+        buf.extend_from_slice(&[MessageType::ResyncComplete as u8]);
+        buf.extend_from_slice(&req.node_id.to_le_bytes());
+        buf.extend_from_slice(&req.term.to_le_bytes());
+        Ok(buf.freeze())
+    }
+
+    fn encode_segment_manifest_request(req: &SegmentManifestRequest) -> Result<Bytes> {
+        let mut buf = BytesMut::with_capacity(3);
+        buf.extend_from_slice(&[MessageType::SegmentManifestRequest as u8]);
+        buf.extend_from_slice(&req.node_id.to_le_bytes());
+        Ok(buf.freeze())
+    }
+
+    fn encode_segment_manifest_response(resp: &SegmentManifestResponse) -> Result<Bytes> {
+        // Estimate capacity: header(1) + topic_count(4) + per-topic overhead
+        let est = 5 + resp.topics.len() * 128;
+        let mut buf = BytesMut::with_capacity(est);
+        buf.extend_from_slice(&[MessageType::SegmentManifestResponse as u8]);
+        buf.extend_from_slice(&(resp.topics.len() as u32).to_le_bytes());
+
+        for topic in &resp.topics {
+            buf.extend_from_slice(&topic.topic_id.to_le_bytes());
+
+            let name_bytes = topic.topic_name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+
+            let active_bytes = topic.active_segment.as_bytes();
+            buf.extend_from_slice(&(active_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(active_bytes);
+
+            buf.extend_from_slice(&(topic.closed_segments.len() as u32).to_le_bytes());
+            for seg in &topic.closed_segments {
+                let seg_name_bytes = seg.name.as_bytes();
+                buf.extend_from_slice(&(seg_name_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(seg_name_bytes);
+                buf.extend_from_slice(&seg.crc32c.to_le_bytes());
+                buf.extend_from_slice(&seg.size_bytes.to_le_bytes());
+            }
+        }
+
+        Ok(buf.freeze())
+    }
+
+    fn encode_segment_fetch_request(req: &SegmentFetchRequest) -> Result<Bytes> {
+        let seg_bytes = req.segment_name.as_bytes();
+        let mut buf = BytesMut::with_capacity(1 + 2 + 4 + 2 + seg_bytes.len() + 8 + 4);
+        buf.extend_from_slice(&[MessageType::SegmentFetchRequest as u8]);
+        buf.extend_from_slice(&req.node_id.to_le_bytes());
+        buf.extend_from_slice(&req.topic_id.to_le_bytes());
+        buf.extend_from_slice(&(seg_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(seg_bytes);
+        buf.extend_from_slice(&req.offset.to_le_bytes());
+        buf.extend_from_slice(&req.max_chunk_size.to_le_bytes());
+        Ok(buf.freeze())
+    }
+
+    fn encode_segment_fetch_response(resp: &SegmentFetchResponse) -> Result<Bytes> {
+        let seg_bytes = resp.segment_name.as_bytes();
+        let mut buf =
+            BytesMut::with_capacity(1 + 4 + 2 + seg_bytes.len() + 8 + 8 + 1 + 4 + resp.data.len());
+        buf.extend_from_slice(&[MessageType::SegmentFetchResponse as u8]);
+        buf.extend_from_slice(&resp.topic_id.to_le_bytes());
+        buf.extend_from_slice(&(seg_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(seg_bytes);
+        buf.extend_from_slice(&resp.offset.to_le_bytes());
+        buf.extend_from_slice(&resp.total_size.to_le_bytes());
+        buf.extend_from_slice(&[resp.done as u8]);
+        buf.extend_from_slice(&(resp.data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&resp.data);
+        Ok(buf.freeze())
+    }
+
+    // === Resync protocol decode helpers ===
+
+    fn decode_resync_begin(data: &[u8]) -> Result<ReplicationMessage> {
+        if data.len() < 10 {
+            return Err(LanceError::InvalidData("ResyncBegin too short".into()));
+        }
+        let node_id = u16::from_le_bytes(
+            data[0..2]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid node_id".into()))?,
+        );
+        let term = u64::from_le_bytes(
+            data[2..10]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid term".into()))?,
+        );
+        Ok(ReplicationMessage::ResyncBegin(ResyncBegin {
+            node_id,
+            term,
+        }))
+    }
+
+    fn decode_resync_complete(data: &[u8]) -> Result<ReplicationMessage> {
+        if data.len() < 10 {
+            return Err(LanceError::InvalidData("ResyncComplete too short".into()));
+        }
+        let node_id = u16::from_le_bytes(
+            data[0..2]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid node_id".into()))?,
+        );
+        let term = u64::from_le_bytes(
+            data[2..10]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid term".into()))?,
+        );
+        Ok(ReplicationMessage::ResyncComplete(ResyncComplete {
+            node_id,
+            term,
+        }))
+    }
+
+    fn decode_segment_manifest_request(data: &[u8]) -> Result<ReplicationMessage> {
+        if data.len() < 2 {
+            return Err(LanceError::InvalidData(
+                "SegmentManifestRequest too short".into(),
+            ));
+        }
+        let node_id = u16::from_le_bytes(
+            data[0..2]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid node_id".into()))?,
+        );
+        Ok(ReplicationMessage::SegmentManifestRequest(
+            SegmentManifestRequest { node_id },
+        ))
+    }
+
+    fn decode_segment_manifest_response(data: &[u8]) -> Result<ReplicationMessage> {
+        if data.len() < 4 {
+            return Err(LanceError::InvalidData(
+                "SegmentManifestResponse too short".into(),
+            ));
+        }
+        let mut pos = 0;
+
+        let topic_count = u32::from_le_bytes(
+            data[pos..pos + 4]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid topic_count".into()))?,
+        ) as usize;
+        pos += 4;
+
+        let mut topics = Vec::with_capacity(topic_count);
+        for _ in 0..topic_count {
+            if pos + 4 > data.len() {
+                return Err(LanceError::InvalidData("Truncated topic manifest".into()));
+            }
+            let topic_id = u32::from_le_bytes(
+                data[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| LanceError::InvalidData("Invalid topic_id".into()))?,
+            );
+            pos += 4;
+
+            if pos + 2 > data.len() {
+                return Err(LanceError::InvalidData("Truncated topic_name_len".into()));
+            }
+            let name_len = u16::from_le_bytes(
+                data[pos..pos + 2]
+                    .try_into()
+                    .map_err(|_| LanceError::InvalidData("Invalid name_len".into()))?,
+            ) as usize;
+            pos += 2;
+            if pos + name_len > data.len() {
+                return Err(LanceError::InvalidData("Truncated topic_name".into()));
+            }
+            let topic_name = std::str::from_utf8(&data[pos..pos + name_len])
+                .map_err(|_| LanceError::InvalidData("Invalid topic_name UTF-8".into()))?
+                .to_string();
+            pos += name_len;
+
+            if pos + 2 > data.len() {
+                return Err(LanceError::InvalidData(
+                    "Truncated active_segment_len".into(),
+                ));
+            }
+            let active_len = u16::from_le_bytes(
+                data[pos..pos + 2]
+                    .try_into()
+                    .map_err(|_| LanceError::InvalidData("Invalid active_len".into()))?,
+            ) as usize;
+            pos += 2;
+            if pos + active_len > data.len() {
+                return Err(LanceError::InvalidData("Truncated active_segment".into()));
+            }
+            let active_segment = std::str::from_utf8(&data[pos..pos + active_len])
+                .map_err(|_| LanceError::InvalidData("Invalid active_segment UTF-8".into()))?
+                .to_string();
+            pos += active_len;
+
+            if pos + 4 > data.len() {
+                return Err(LanceError::InvalidData(
+                    "Truncated closed_segment_count".into(),
+                ));
+            }
+            let seg_count = u32::from_le_bytes(
+                data[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| LanceError::InvalidData("Invalid seg_count".into()))?,
+            ) as usize;
+            pos += 4;
+
+            let mut closed_segments = Vec::with_capacity(seg_count);
+            for _ in 0..seg_count {
+                if pos + 2 > data.len() {
+                    return Err(LanceError::InvalidData("Truncated seg_name_len".into()));
+                }
+                let seg_name_len = u16::from_le_bytes(
+                    data[pos..pos + 2]
+                        .try_into()
+                        .map_err(|_| LanceError::InvalidData("Invalid seg_name_len".into()))?,
+                ) as usize;
+                pos += 2;
+                if pos + seg_name_len + 12 > data.len() {
+                    return Err(LanceError::InvalidData("Truncated segment info".into()));
+                }
+                let name = std::str::from_utf8(&data[pos..pos + seg_name_len])
+                    .map_err(|_| LanceError::InvalidData("Invalid seg_name UTF-8".into()))?
+                    .to_string();
+                pos += seg_name_len;
+
+                let crc32c = u32::from_le_bytes(
+                    data[pos..pos + 4]
+                        .try_into()
+                        .map_err(|_| LanceError::InvalidData("Invalid crc32c".into()))?,
+                );
+                pos += 4;
+
+                let size_bytes = u64::from_le_bytes(
+                    data[pos..pos + 8]
+                        .try_into()
+                        .map_err(|_| LanceError::InvalidData("Invalid size_bytes".into()))?,
+                );
+                pos += 8;
+
+                closed_segments.push(SegmentInfo {
+                    name,
+                    crc32c,
+                    size_bytes,
+                });
+            }
+
+            topics.push(TopicManifest {
+                topic_id,
+                topic_name,
+                active_segment,
+                closed_segments,
+            });
+        }
+
+        Ok(ReplicationMessage::SegmentManifestResponse(
+            SegmentManifestResponse { topics },
+        ))
+    }
+
+    fn decode_segment_fetch_request(data: &[u8]) -> Result<ReplicationMessage> {
+        if data.len() < 8 {
+            return Err(LanceError::InvalidData(
+                "SegmentFetchRequest too short".into(),
+            ));
+        }
+        let mut pos = 0;
+
+        let node_id = u16::from_le_bytes(
+            data[pos..pos + 2]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid node_id".into()))?,
+        );
+        pos += 2;
+
+        let topic_id = u32::from_le_bytes(
+            data[pos..pos + 4]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid topic_id".into()))?,
+        );
+        pos += 4;
+
+        let seg_name_len = u16::from_le_bytes(
+            data[pos..pos + 2]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid seg_name_len".into()))?,
+        ) as usize;
+        pos += 2;
+
+        if pos + seg_name_len + 12 > data.len() {
+            return Err(LanceError::InvalidData(
+                "Truncated SegmentFetchRequest".into(),
+            ));
+        }
+
+        let segment_name = std::str::from_utf8(&data[pos..pos + seg_name_len])
+            .map_err(|_| LanceError::InvalidData("Invalid segment_name UTF-8".into()))?
+            .to_string();
+        pos += seg_name_len;
+
+        let offset = u64::from_le_bytes(
+            data[pos..pos + 8]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid offset".into()))?,
+        );
+        pos += 8;
+
+        let max_chunk_size = u32::from_le_bytes(
+            data[pos..pos + 4]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid max_chunk_size".into()))?,
+        );
+
+        Ok(ReplicationMessage::SegmentFetchRequest(
+            SegmentFetchRequest {
+                node_id,
+                topic_id,
+                segment_name,
+                offset,
+                max_chunk_size,
+            },
+        ))
+    }
+
+    fn decode_segment_fetch_response(data: &[u8]) -> Result<ReplicationMessage> {
+        if data.len() < 6 {
+            return Err(LanceError::InvalidData(
+                "SegmentFetchResponse too short".into(),
+            ));
+        }
+        let mut pos = 0;
+
+        let topic_id = u32::from_le_bytes(
+            data[pos..pos + 4]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid topic_id".into()))?,
+        );
+        pos += 4;
+
+        let seg_name_len = u16::from_le_bytes(
+            data[pos..pos + 2]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid seg_name_len".into()))?,
+        ) as usize;
+        pos += 2;
+
+        if pos + seg_name_len + 21 > data.len() {
+            return Err(LanceError::InvalidData(
+                "Truncated SegmentFetchResponse".into(),
+            ));
+        }
+
+        let segment_name = std::str::from_utf8(&data[pos..pos + seg_name_len])
+            .map_err(|_| LanceError::InvalidData("Invalid segment_name UTF-8".into()))?
+            .to_string();
+        pos += seg_name_len;
+
+        let offset = u64::from_le_bytes(
+            data[pos..pos + 8]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid offset".into()))?,
+        );
+        pos += 8;
+
+        let total_size = u64::from_le_bytes(
+            data[pos..pos + 8]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid total_size".into()))?,
+        );
+        pos += 8;
+
+        let done = data[pos] != 0;
+        pos += 1;
+
+        if pos + 4 > data.len() {
+            return Err(LanceError::InvalidData("Truncated data_len".into()));
+        }
+        let data_len = u32::from_le_bytes(
+            data[pos..pos + 4]
+                .try_into()
+                .map_err(|_| LanceError::InvalidData("Invalid data_len".into()))?,
+        ) as usize;
+        pos += 4;
+
+        if pos + data_len > data.len() {
+            return Err(LanceError::InvalidData("Truncated segment data".into()));
+        }
+        let chunk_data = Bytes::copy_from_slice(&data[pos..pos + data_len]);
+
+        Ok(ReplicationMessage::SegmentFetchResponse(
+            SegmentFetchResponse {
+                topic_id,
+                segment_name,
+                offset,
+                total_size,
+                done,
+                data: chunk_data,
+            },
+        ))
+    }
+
     fn decode_config(data: &[u8]) -> Result<ClusterConfig> {
         if data.is_empty() {
             return Err(LanceError::InvalidData("Config data empty".into()));
@@ -1882,5 +2439,250 @@ mod tests {
     #[test]
     fn test_replication_ack_decode_too_short() {
         assert!(ReplicationAck::decode(&[0u8; 14]).is_none());
+    }
+
+    #[test]
+    fn test_replication_ack_catching_up() {
+        assert_eq!(
+            ReplicationAckStatus::from_u8(0x03),
+            ReplicationAckStatus::CatchingUp
+        );
+
+        let ack = ReplicationAck {
+            topic_id: 1,
+            confirmed_offset: 0,
+            status: ReplicationAckStatus::CatchingUp,
+            node_id: 3,
+        };
+        let encoded = ack.encode();
+        let decoded = ReplicationAck::decode(&encoded).expect("decode failed");
+        assert_eq!(decoded.status, ReplicationAckStatus::CatchingUp);
+    }
+
+    // =========================================================================
+    // Resync protocol tests
+    // =========================================================================
+
+    #[test]
+    fn test_resync_begin_roundtrip() {
+        let mut codec = ReplicationCodec::new();
+        let msg = ResyncBegin {
+            node_id: 2,
+            term: 42,
+        };
+        let encoded = codec
+            .encode(&ReplicationMessage::ResyncBegin(msg.clone()))
+            .unwrap();
+        let decoded = ReplicationCodec::decode(&encoded).unwrap();
+        if let ReplicationMessage::ResyncBegin(d) = decoded {
+            assert_eq!(d.node_id, 2);
+            assert_eq!(d.term, 42);
+        } else {
+            panic!("Wrong message type");
+        }
+    }
+
+    #[test]
+    fn test_resync_complete_roundtrip() {
+        let mut codec = ReplicationCodec::new();
+        let msg = ResyncComplete {
+            node_id: 3,
+            term: 99,
+        };
+        let encoded = codec
+            .encode(&ReplicationMessage::ResyncComplete(msg.clone()))
+            .unwrap();
+        let decoded = ReplicationCodec::decode(&encoded).unwrap();
+        if let ReplicationMessage::ResyncComplete(d) = decoded {
+            assert_eq!(d.node_id, 3);
+            assert_eq!(d.term, 99);
+        } else {
+            panic!("Wrong message type");
+        }
+    }
+
+    #[test]
+    fn test_segment_manifest_request_roundtrip() {
+        let mut codec = ReplicationCodec::new();
+        let msg = SegmentManifestRequest { node_id: 1 };
+        let encoded = codec
+            .encode(&ReplicationMessage::SegmentManifestRequest(msg.clone()))
+            .unwrap();
+        let decoded = ReplicationCodec::decode(&encoded).unwrap();
+        if let ReplicationMessage::SegmentManifestRequest(d) = decoded {
+            assert_eq!(d.node_id, 1);
+        } else {
+            panic!("Wrong message type");
+        }
+    }
+
+    #[test]
+    fn test_segment_manifest_response_roundtrip() {
+        let mut codec = ReplicationCodec::new();
+        let msg = SegmentManifestResponse {
+            topics: vec![
+                TopicManifest {
+                    topic_id: 1,
+                    topic_name: "market-data".to_string(),
+                    active_segment: "100_1706918500000000000.lnc".to_string(),
+                    closed_segments: vec![
+                        SegmentInfo {
+                            name: "0_1706918400000000000-1706918450000000000.lnc".to_string(),
+                            crc32c: 0xAABBCCDD,
+                            size_bytes: 1_048_576,
+                        },
+                        SegmentInfo {
+                            name: "50_1706918450000000000-1706918500000000000.lnc".to_string(),
+                            crc32c: 0x11223344,
+                            size_bytes: 2_097_152,
+                        },
+                    ],
+                },
+                TopicManifest {
+                    topic_id: 2,
+                    topic_name: "orders".to_string(),
+                    active_segment: "0_1706918500000000000.lnc".to_string(),
+                    closed_segments: vec![],
+                },
+            ],
+        };
+        let encoded = codec
+            .encode(&ReplicationMessage::SegmentManifestResponse(msg.clone()))
+            .unwrap();
+        let decoded = ReplicationCodec::decode(&encoded).unwrap();
+        if let ReplicationMessage::SegmentManifestResponse(d) = decoded {
+            assert_eq!(d.topics.len(), 2);
+            assert_eq!(d.topics[0].topic_id, 1);
+            assert_eq!(d.topics[0].topic_name, "market-data");
+            assert_eq!(d.topics[0].active_segment, "100_1706918500000000000.lnc");
+            assert_eq!(d.topics[0].closed_segments.len(), 2);
+            assert_eq!(d.topics[0].closed_segments[0].crc32c, 0xAABBCCDD);
+            assert_eq!(d.topics[0].closed_segments[0].size_bytes, 1_048_576);
+            assert_eq!(d.topics[0].closed_segments[1].crc32c, 0x11223344);
+            assert_eq!(d.topics[1].topic_id, 2);
+            assert_eq!(d.topics[1].topic_name, "orders");
+            assert!(d.topics[1].closed_segments.is_empty());
+        } else {
+            panic!("Wrong message type");
+        }
+    }
+
+    #[test]
+    fn test_segment_manifest_response_empty() {
+        let mut codec = ReplicationCodec::new();
+        let msg = SegmentManifestResponse { topics: vec![] };
+        let encoded = codec
+            .encode(&ReplicationMessage::SegmentManifestResponse(msg))
+            .unwrap();
+        let decoded = ReplicationCodec::decode(&encoded).unwrap();
+        if let ReplicationMessage::SegmentManifestResponse(d) = decoded {
+            assert!(d.topics.is_empty());
+        } else {
+            panic!("Wrong message type");
+        }
+    }
+
+    #[test]
+    fn test_segment_fetch_request_roundtrip() {
+        let mut codec = ReplicationCodec::new();
+        let msg = SegmentFetchRequest {
+            node_id: 3,
+            topic_id: 5,
+            segment_name: "0_1706918400000000000-1706918450000000000.lnc".to_string(),
+            offset: 65536,
+            max_chunk_size: 262144,
+        };
+        let encoded = codec
+            .encode(&ReplicationMessage::SegmentFetchRequest(msg.clone()))
+            .unwrap();
+        let decoded = ReplicationCodec::decode(&encoded).unwrap();
+        if let ReplicationMessage::SegmentFetchRequest(d) = decoded {
+            assert_eq!(d.node_id, 3);
+            assert_eq!(d.topic_id, 5);
+            assert_eq!(
+                d.segment_name,
+                "0_1706918400000000000-1706918450000000000.lnc"
+            );
+            assert_eq!(d.offset, 65536);
+            assert_eq!(d.max_chunk_size, 262144);
+        } else {
+            panic!("Wrong message type");
+        }
+    }
+
+    #[test]
+    fn test_segment_fetch_response_roundtrip() {
+        let mut codec = ReplicationCodec::new();
+        let chunk = Bytes::from(vec![0xABu8; 1024]);
+        let msg = SegmentFetchResponse {
+            topic_id: 5,
+            segment_name: "seg.lnc".to_string(),
+            offset: 0,
+            total_size: 4096,
+            done: false,
+            data: chunk.clone(),
+        };
+        let encoded = codec
+            .encode(&ReplicationMessage::SegmentFetchResponse(msg))
+            .unwrap();
+        let decoded = ReplicationCodec::decode(&encoded).unwrap();
+        if let ReplicationMessage::SegmentFetchResponse(d) = decoded {
+            assert_eq!(d.topic_id, 5);
+            assert_eq!(d.segment_name, "seg.lnc");
+            assert_eq!(d.offset, 0);
+            assert_eq!(d.total_size, 4096);
+            assert!(!d.done);
+            assert_eq!(d.data.len(), 1024);
+            assert_eq!(d.data[0], 0xAB);
+        } else {
+            panic!("Wrong message type");
+        }
+    }
+
+    #[test]
+    fn test_segment_fetch_response_final_chunk() {
+        let mut codec = ReplicationCodec::new();
+        let msg = SegmentFetchResponse {
+            topic_id: 1,
+            segment_name: "s.lnc".to_string(),
+            offset: 3072,
+            total_size: 4096,
+            done: true,
+            data: Bytes::from(vec![0u8; 1024]),
+        };
+        let encoded = codec
+            .encode(&ReplicationMessage::SegmentFetchResponse(msg))
+            .unwrap();
+        let decoded = ReplicationCodec::decode(&encoded).unwrap();
+        if let ReplicationMessage::SegmentFetchResponse(d) = decoded {
+            assert!(d.done);
+            assert_eq!(d.offset, 3072);
+            assert_eq!(d.total_size, 4096);
+        } else {
+            panic!("Wrong message type");
+        }
+    }
+
+    #[test]
+    fn test_message_type_resync_discriminants() {
+        assert_eq!(MessageType::from_u8(11), Some(MessageType::ResyncBegin));
+        assert_eq!(MessageType::from_u8(12), Some(MessageType::ResyncComplete));
+        assert_eq!(
+            MessageType::from_u8(13),
+            Some(MessageType::SegmentManifestRequest)
+        );
+        assert_eq!(
+            MessageType::from_u8(14),
+            Some(MessageType::SegmentManifestResponse)
+        );
+        assert_eq!(
+            MessageType::from_u8(15),
+            Some(MessageType::SegmentFetchRequest)
+        );
+        assert_eq!(
+            MessageType::from_u8(16),
+            Some(MessageType::SegmentFetchResponse)
+        );
+        assert_eq!(MessageType::from_u8(17), None);
     }
 }

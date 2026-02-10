@@ -61,9 +61,8 @@ jobs:
       - name: Set version from tag
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          echo "Publishing version: $VERSION (was $CURRENT)"
-          sed -i "s/version = \"$CURRENT\"/version = \"$VERSION\"/g" Cargo.toml
+          echo "Publishing version: $VERSION (replacing 0.0.0-source sentinel)"
+          sed -i 's/0\.0\.0-source/'"$VERSION"'/g' Cargo.toml
           echo "--- Updated Cargo.toml versions ---"
           grep 'version' Cargo.toml | head -20
       
@@ -104,6 +103,9 @@ jobs:
           targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
       
+      - name: Set version from tag
+        run: sed -i 's/0\.0\.0-source/'"${GITHUB_REF_NAME#v}"'/g' Cargo.toml
+      
       - name: Build
         run: cargo build --release --target x86_64-unknown-linux-gnu
         
@@ -142,6 +144,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
           
+      - name: Set version from tag
+        run: sed -i 's/0\.0\.0-source/'"${GITHUB_REF_NAME#v}"'/g' Cargo.toml
+      
       - name: Build
         run: |
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
@@ -177,6 +182,9 @@ jobs:
           targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       
+      - name: Set version from tag
+        run: sed -i '' 's/0\.0\.0-source/'"${GITHUB_REF_NAME#v}"'/g' Cargo.toml
+      
       - name: Build
         run: cargo build --release --target x86_64-apple-darwin
         
@@ -209,6 +217,9 @@ jobs:
         with:
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
+      
+      - name: Set version from tag
+        run: sed -i '' 's/0\.0\.0-source/'"${GITHUB_REF_NAME#v}"'/g' Cargo.toml
       
       - name: Build
         run: cargo build --release --target aarch64-apple-darwin
@@ -254,6 +265,9 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           
+      - name: Set version from tag
+        run: sed -i 's/0\.0\.0-source/'"${GITHUB_REF_NAME#v}"'/g' Cargo.toml
+      
       - name: Extract version
         id: version
         run: |

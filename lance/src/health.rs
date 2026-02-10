@@ -29,6 +29,10 @@ pub struct HealthState {
     ready: AtomicBool,
     /// Server is alive (always true while running)
     alive: AtomicBool,
+    /// Server is catching up (follower resync in progress).
+    /// Per RaftQuorumWartime.md §5.2: readiness probe returns NOT_READY
+    /// while catching_up is true, but the node still ACKs heartbeats.
+    catching_up: AtomicBool,
 }
 
 impl Default for HealthState {
@@ -44,6 +48,7 @@ impl HealthState {
             startup_complete: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             alive: AtomicBool::new(true),
+            catching_up: AtomicBool::new(false),
         }
     }
 
@@ -81,6 +86,24 @@ impl HealthState {
     #[must_use]
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    /// Set catching-up state (follower resync in progress).
+    /// Per RaftQuorumWartime.md §5.2: sets ready=false while catching up.
+    #[allow(dead_code)]
+    pub fn set_catching_up(&self, catching_up: bool) {
+        self.catching_up.store(catching_up, Ordering::Release);
+        if catching_up {
+            self.ready.store(false, Ordering::Release);
+            info!(target: "lance::health", "Entering catching-up state (not ready)");
+        } else {
+            info!(target: "lance::health", "Exiting catching-up state");
+        }
+    }
+
+    #[must_use]
+    pub fn is_catching_up(&self) -> bool {
+        self.catching_up.load(Ordering::Acquire)
     }
 }
 
@@ -131,14 +154,15 @@ async fn handle_request(
             let alive = state.is_alive();
             let ready = state.is_ready();
             let startup = state.is_startup_complete();
+            let catching_up = state.is_catching_up();
             let status = if alive && ready && startup {
                 StatusCode::OK
             } else {
                 StatusCode::SERVICE_UNAVAILABLE
             };
             let body = format!(
-                r#"{{"alive":{},"ready":{},"startup_complete":{}}}"#,
-                alive, ready, startup
+                r#"{{"alive":{},"ready":{},"startup_complete":{},"catching_up":{}}}"#,
+                alive, ready, startup, catching_up
             );
             json_response(status, &body)
         },

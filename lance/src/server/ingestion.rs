@@ -1,6 +1,6 @@
 //! Ingestion actor - batch processing and record ingestion
 
-use super::writer::{TopicWriter, create_topic_writer, rotate_topic_segment};
+use super::writer::{TopicWriter, create_topic_writer, resolve_topic_dir, rotate_topic_segment};
 use crate::config::Config;
 use crate::topic::TopicRegistry;
 use bytes::Bytes;
@@ -354,11 +354,7 @@ pub fn write_replicated_data_enriched(
     entry: &lnc_replication::DataReplicationEntry,
 ) -> Result<()> {
     let topic_id = entry.topic_id;
-    let topic_dir = if topic_id == 0 {
-        config.data_dir.join("segments").join("0")
-    } else {
-        topic_registry.get_topic_dir(topic_id)
-    };
+    let topic_dir = resolve_topic_dir(config, topic_registry, topic_id);
     std::fs::create_dir_all(&topic_dir)?;
 
     // Handle NEW_SEGMENT flag: create the segment with the leader-dictated name
@@ -386,14 +382,18 @@ pub fn write_replicated_data_enriched(
         Some(tw) => tw,
         None => {
             // No writer and no NEW_SEGMENT flag — the follower may be behind.
-            // Create a writer with the leader-dictated segment name as a recovery path.
+            // Open existing segment (resume at current offset) or create if new.
+            // Using open_or_create_named avoids truncating existing segment data
+            // on the PVC after a follower restart, which would reset the writer
+            // to offset 0 and cause a write-offset mismatch loop with the leader.
             tracing::warn!(
                 target: "lance::ingestion",
                 topic_id,
                 segment = %entry.segment_name,
-                "No active writer for topic, creating from leader segment name"
+                "No active writer for topic, opening/creating from leader segment name"
             );
-            let writer = lnc_io::SegmentWriter::create_named(&topic_dir, &entry.segment_name)?;
+            let writer =
+                lnc_io::SegmentWriter::open_or_create_named(&topic_dir, &entry.segment_name)?;
             let index_builder = lnc_index::IndexBuilder::with_defaults();
             topic_writers.insert(
                 topic_id,
@@ -421,8 +421,28 @@ pub fn write_replicated_data_enriched(
         }
     }
 
-    // Write at the exact offset the leader specifies
+    // Write at the exact offset the leader specifies.
+    // If the follower's writer offset doesn't match (e.g., after restart with
+    // a stale/empty segment on the PVC), skip the write gracefully instead of
+    // returning an error. The follower accepts data loss for this segment and
+    // waits for the leader to rotate (NEW_SEGMENT flag) to resync.
     if !entry.payload.is_empty() {
+        let current_offset = topic_writer.writer.current_offset();
+        if entry.write_offset != current_offset {
+            // Offset mismatch — follower is behind or ahead of the leader.
+            // Log once per topic (sampled) and skip the write to avoid an
+            // error loop that leads to OOM.
+            tracing::debug!(
+                target: "lance::ingestion",
+                topic_id,
+                segment = %entry.segment_name,
+                expected = current_offset,
+                leader_offset = entry.write_offset,
+                "Skipping write — offset mismatch, awaiting segment rotation"
+            );
+            return Ok(());
+        }
+
         topic_writer
             .writer
             .save_at_offset(entry.write_offset, &entry.payload)?;
@@ -470,13 +490,13 @@ pub fn write_replicated_data_enriched(
 /// Holds the state for a single successful write within a batch.
 /// Used to defer completion signalling and replication queuing
 /// until after the batch fsync.
-struct BatchSuccess {
-    write_done_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    topic_id: u32,
-    payload: Bytes,
-    payload_len: usize,
-    write_id: Option<u64>,
-    meta: WriteMetadata,
+pub(super) struct BatchSuccess {
+    pub(super) write_done_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(super) topic_id: u32,
+    pub(super) payload: Bytes,
+    pub(super) payload_len: usize,
+    pub(super) write_id: Option<u64>,
+    pub(super) meta: WriteMetadata,
 }
 
 /// Flush all dirty topic writers to stable storage, signal pending
@@ -485,7 +505,7 @@ struct BatchSuccess {
 /// This is the single point where data becomes durable and ACKs are
 /// released.  Called when the flush threshold is reached, the timeout
 /// fires, or the actor is shutting down.
-fn flush_and_signal(
+pub(super) fn flush_and_signal(
     topic_writers: &mut HashMap<u32, TopicWriter>,
     dirty_topics: &mut std::collections::HashSet<u32>,
     pending_signals: &mut Vec<BatchSuccess>,
@@ -542,7 +562,7 @@ fn flush_and_signal(
 ///
 /// `payload` is passed separately because the caller has already taken it from
 /// the request via `std::mem::take` for WAL and deferred-signal storage.
-fn process_ingestion_request(
+pub(super) fn process_ingestion_request(
     config: &Config,
     topic_registry: &TopicRegistry,
     topic_writers: &mut HashMap<u32, TopicWriter>,

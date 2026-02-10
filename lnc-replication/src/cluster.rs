@@ -49,7 +49,47 @@ pub enum ClusterEvent {
     },
     /// Enriched data received from leader with segment metadata (L3 filesystem-consistent mode)
     DataReceivedEnriched(crate::codec::DataReplicationEntry),
+    /// Follower requests resync begin (leader receives this)
+    ResyncBeginReceived(crate::codec::ResyncBegin),
+    /// Follower signals resync complete (leader receives this)
+    ResyncCompleteReceived(crate::codec::ResyncComplete),
+    /// Follower requests segment manifest (leader receives this)
+    SegmentManifestRequested {
+        node_id: u16,
+        /// Peer stream index for sending the response back
+        peer_addr: SocketAddr,
+    },
+    /// Leader sent segment manifest response (follower receives this)
+    SegmentManifestReceived(crate::codec::SegmentManifestResponse),
+    /// Follower requests segment fetch (leader receives this).
+    /// The request contains the follower's node_id for response routing.
+    SegmentFetchRequested(crate::codec::SegmentFetchRequest),
+    /// Leader sent segment fetch response (follower receives this)
+    SegmentFetchReceived(crate::codec::SegmentFetchResponse),
 }
+
+/// Per-follower wartime state for the resync protocol.
+///
+/// Per RaftQuorumWartime.md §6:
+/// Leader extends its term while a follower is catching up.
+/// TTL prevents a pinned leader if the follower never completes resync.
+#[derive(Debug, Clone)]
+pub struct WartimeEntry {
+    /// Follower node ID that triggered wartime.
+    pub follower_id: u16,
+    /// When this wartime entry was created.
+    pub started_at: Instant,
+    /// TTL for this wartime entry (default: 60s).
+    pub ttl: Duration,
+    /// Number of consecutive terms this follower has been in wartime.
+    pub consecutive_terms: u32,
+}
+
+/// Maximum consecutive wartime terms per follower before forcing an election.
+pub const MAX_WARTIME_TERMS: u32 = 3;
+
+/// Default wartime TTL per follower.
+pub const WARTIME_TTL: Duration = Duration::from_secs(60);
 
 /// Cluster coordinator state
 pub struct ClusterCoordinator {
@@ -69,6 +109,9 @@ pub struct ClusterCoordinator {
     log_store: Option<Arc<std::sync::Mutex<LogStore>>>,
     /// Timestamp of last successful replication sync (for lag metrics)
     last_sync_time: std::sync::atomic::AtomicU64,
+    /// Active wartime entries (per-follower), keyed by follower node_id.
+    /// Only populated on the leader node.
+    wartime: std::sync::RwLock<std::collections::HashMap<u16, WartimeEntry>>,
 }
 
 impl ClusterCoordinator {
@@ -118,6 +161,7 @@ impl ClusterCoordinator {
             quorum_manager,
             log_store: None,
             last_sync_time: std::sync::atomic::AtomicU64::new(0),
+            wartime: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -191,6 +235,7 @@ impl ClusterCoordinator {
             quorum_manager,
             log_store: Some(Arc::new(std::sync::Mutex::new(log_store))),
             last_sync_time: std::sync::atomic::AtomicU64::new(0),
+            wartime: std::sync::RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -275,6 +320,99 @@ impl ClusterCoordinator {
         let repl_addr = self.peer_addr(leader_id).await?;
         // Client port is replication port - 1
         Some(SocketAddr::new(repl_addr.ip(), repl_addr.port() - 1))
+    }
+
+    /// Enter wartime for a specific follower (leader only).
+    ///
+    /// Per RaftQuorumWartime.md §6:
+    /// The leader extends its term to prevent disruptive elections while
+    /// a follower is catching up. Each follower gets its own TTL.
+    /// Returns `false` if the follower has exceeded MAX_WARTIME_TERMS.
+    pub fn enter_wartime(&self, follower_id: u16) -> bool {
+        if let Ok(mut guard) = self.wartime.write() {
+            let entry = guard.entry(follower_id).or_insert(WartimeEntry {
+                follower_id,
+                started_at: Instant::now(),
+                ttl: WARTIME_TTL,
+                consecutive_terms: 0,
+            });
+            entry.consecutive_terms += 1;
+            entry.started_at = Instant::now();
+
+            if entry.consecutive_terms > MAX_WARTIME_TERMS {
+                warn!(
+                    target: "lance::cluster",
+                    follower_id,
+                    consecutive_terms = entry.consecutive_terms,
+                    "Wartime max terms exceeded — forcing election"
+                );
+                guard.remove(&follower_id);
+                return false;
+            }
+
+            info!(
+                target: "lance::cluster",
+                follower_id,
+                consecutive_terms = entry.consecutive_terms,
+                ttl_secs = WARTIME_TTL.as_secs(),
+                "Entered wartime for follower"
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Exit wartime for a specific follower (leader only).
+    pub fn exit_wartime(&self, follower_id: u16) {
+        if let Ok(mut guard) = self.wartime.write() {
+            if guard.remove(&follower_id).is_some() {
+                info!(
+                    target: "lance::cluster",
+                    follower_id,
+                    "Exited wartime for follower"
+                );
+            }
+        }
+    }
+
+    /// Check if the leader is currently in wartime for any follower.
+    pub fn is_in_wartime(&self) -> bool {
+        if let Ok(guard) = self.wartime.read() {
+            // Prune expired entries
+            !guard.values().any(|e| e.started_at.elapsed() < e.ttl)
+        } else {
+            false
+        }
+    }
+
+    /// Prune expired wartime entries. Called periodically by the coordination loop.
+    pub fn prune_wartime(&self) {
+        if let Ok(mut guard) = self.wartime.write() {
+            let before = guard.len();
+            guard.retain(|_, entry| entry.started_at.elapsed() < entry.ttl);
+            let pruned = before - guard.len();
+            if pruned > 0 {
+                info!(
+                    target: "lance::cluster",
+                    pruned,
+                    remaining = guard.len(),
+                    "Pruned expired wartime entries"
+                );
+            }
+        }
+    }
+
+    /// Send a replication message directly to a peer by node ID.
+    ///
+    /// Used by the server layer to send resync responses (manifest, fetch)
+    /// back to the requesting follower.
+    pub async fn send_to_peer(
+        &self,
+        peer_id: u16,
+        message: &ReplicationMessage,
+    ) -> Result<(), std::io::Error> {
+        self.peers.send_to_peer(peer_id, message).await
     }
 
     /// Re-resolve DNS for raw peer hostname strings and update the peer map.
@@ -1177,6 +1315,9 @@ async fn handle_peer_connection(
     event_tx: broadcast::Sender<ClusterEvent>,
     log_store: Option<Arc<std::sync::Mutex<LogStore>>>,
 ) -> Result<(), std::io::Error> {
+    let peer_addr = stream
+        .peer_addr()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
     let mut buf = vec![0u8; 64 * 1024]; // 64KB buffer
 
     loop {
@@ -1359,6 +1500,77 @@ async fn handle_peer_connection(
                         bytes_stored,
                     },
                 ))
+            },
+            ReplicationMessage::ResyncBegin(req) => {
+                info!(
+                    target: "lance::cluster",
+                    node_id,
+                    follower_id = req.node_id,
+                    term = req.term,
+                    "Received ResyncBegin from follower"
+                );
+                let _ = event_tx.send(ClusterEvent::ResyncBeginReceived(req));
+                None // Response handled by server layer via event
+            },
+            ReplicationMessage::ResyncComplete(req) => {
+                info!(
+                    target: "lance::cluster",
+                    node_id,
+                    follower_id = req.node_id,
+                    term = req.term,
+                    "Received ResyncComplete from follower"
+                );
+                let _ = event_tx.send(ClusterEvent::ResyncCompleteReceived(req));
+                None
+            },
+            ReplicationMessage::SegmentManifestRequest(req) => {
+                info!(
+                    target: "lance::cluster",
+                    node_id,
+                    follower_id = req.node_id,
+                    "Received SegmentManifestRequest from follower"
+                );
+                let _ = event_tx.send(ClusterEvent::SegmentManifestRequested {
+                    node_id: req.node_id,
+                    peer_addr,
+                });
+                None // Response built and sent by server layer
+            },
+            ReplicationMessage::SegmentManifestResponse(resp) => {
+                info!(
+                    target: "lance::cluster",
+                    node_id,
+                    topic_count = resp.topics.len(),
+                    "Received SegmentManifestResponse from leader"
+                );
+                let _ = event_tx.send(ClusterEvent::SegmentManifestReceived(resp));
+                None
+            },
+            ReplicationMessage::SegmentFetchRequest(req) => {
+                debug!(
+                    target: "lance::cluster",
+                    node_id,
+                    topic_id = req.topic_id,
+                    segment = %req.segment_name,
+                    offset = req.offset,
+                    "Received SegmentFetchRequest from follower"
+                );
+                let _ = event_tx.send(ClusterEvent::SegmentFetchRequested(req));
+                None // Response built and sent by server layer
+            },
+            ReplicationMessage::SegmentFetchResponse(resp) => {
+                debug!(
+                    target: "lance::cluster",
+                    node_id,
+                    topic_id = resp.topic_id,
+                    segment = %resp.segment_name,
+                    offset = resp.offset,
+                    done = resp.done,
+                    chunk_len = resp.data.len(),
+                    "Received SegmentFetchResponse from leader"
+                );
+                let _ = event_tx.send(ClusterEvent::SegmentFetchReceived(resp));
+                None
             },
             _ => {
                 debug!(

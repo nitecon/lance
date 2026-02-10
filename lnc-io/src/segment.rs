@@ -297,6 +297,25 @@ impl SegmentWriter {
         Self::create(&path)
     }
 
+    /// Open or create a segment with a specific filename (leader-dictated).
+    ///
+    /// Used by followers in L3 mode for recovery. If the segment file already
+    /// exists on the PVC, it is **opened** (seeking to the end) so the writer
+    /// resumes at the correct byte offset. If it does not exist, a new file
+    /// is created.
+    ///
+    /// This avoids the data-loss bug where `create_named` would truncate an
+    /// existing segment, resetting the writer to offset 0 and causing a
+    /// write-offset mismatch loop with the leader.
+    pub fn open_or_create_named(dir: &Path, segment_name: &str) -> Result<Self> {
+        let path = dir.join(segment_name);
+        if path.exists() {
+            Self::open(&path)
+        } else {
+            Self::create(&path)
+        }
+    }
+
     /// Write data at a specific offset within the segment.
     ///
     /// Used by followers in L3 mode to write at the exact offset dictated

@@ -12,18 +12,29 @@ pub struct TopicWriter {
     pub index_builder: lnc_index::IndexBuilder,
 }
 
+/// Resolve the directory for a given topic.
+///
+/// Topic 0 is the legacy/default topic stored under `segments/0/`.
+/// All other topics use the registry's configured directory.
+pub fn resolve_topic_dir(
+    config: &Config,
+    topic_registry: &TopicRegistry,
+    topic_id: u32,
+) -> std::path::PathBuf {
+    if topic_id == 0 {
+        config.data_dir.join("segments").join("0")
+    } else {
+        topic_registry.get_topic_dir(topic_id)
+    }
+}
+
 /// Create a new topic writer for the given topic
 pub fn create_topic_writer(
     config: &Config,
     topic_registry: &TopicRegistry,
     topic_id: u32,
 ) -> Result<TopicWriter> {
-    let topic_dir = if topic_id == 0 {
-        // Legacy/default topic uses segments/ directly
-        config.data_dir.join("segments").join("0")
-    } else {
-        topic_registry.get_topic_dir(topic_id)
-    };
+    let topic_dir = resolve_topic_dir(config, topic_registry, topic_id);
 
     std::fs::create_dir_all(&topic_dir)?;
 
@@ -67,11 +78,7 @@ pub fn rotate_topic_segment(
     let closed_path = topic_writer.writer.close(end_timestamp)?;
     topic_writer.index_builder.write_indexes(&closed_path)?;
 
-    let topic_dir = if topic_id == 0 {
-        config.data_dir.join("segments").join("0")
-    } else {
-        topic_registry.get_topic_dir(topic_id)
-    };
+    let topic_dir = resolve_topic_dir(config, topic_registry, topic_id);
 
     let new_start_index = topic_writer.writer.start_index() + topic_writer.writer.record_count();
     let new_segment_path = topic_dir.join(format!("{}_{}.lnc", new_start_index, end_timestamp));

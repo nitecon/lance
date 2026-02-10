@@ -960,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.1.4"
+version = "0.0.0-source"
 dependencies = [
  "bytes",
  "clap",
@@ -1008,7 +1008,7 @@ checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 
 [[package]]
 name = "lnc"
-version = "0.1.4"
+version = "0.0.0-source"
 dependencies = [
  "bytes",
  "chrono",
@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "lnc-bench"
-version = "0.1.4"
+version = "0.0.0-source"
 dependencies = [
  "bytes",
  "clap",
@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "lnc-chaos"
-version = "0.1.4"
+version = "0.0.0-source"
 dependencies = [
  "bytes",
  "clap",
@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "lnc-client"
-version = "0.1.4"
+version = "0.0.0-source"
 dependencies = [
  "bytes",
  "libc",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "lnc-core"
-version = "0.1.4"
+version = "0.0.0-source"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "lnc-index"
-version = "0.1.4"
+version = "0.0.0-source"
 dependencies = [
  "lnc-core",
  "memmap2",
@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "lnc-io"
-version = "0.1.4"
+version = "0.0.0-source"
 dependencies = [
  "bytes",
  "crossbeam",
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "lnc-metrics"
-version = "0.1.4"
+version = "0.0.0-source"
 dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "lnc-network"
-version = "0.1.4"
+version = "0.0.0-source"
 dependencies = [
  "bytes",
  "lnc-core",
@@ -1132,7 +1132,7 @@ dependencies = [
 
 [[package]]
 name = "lnc-recovery"
-version = "0.1.4"
+version = "0.0.0-source"
 dependencies = [
  "lnc-core",
  "lnc-index",
@@ -1143,7 +1143,7 @@ dependencies = [
 
 [[package]]
 name = "lnc-replication"
-version = "0.1.4"
+version = "0.0.0-source"
 dependencies = [
  "bytes",
  "flatbuffers",

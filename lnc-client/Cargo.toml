@@ -34,7 +34,7 @@ dangerous-testing = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
-tempfile = "3.14"
+tempfile = "3.25"
 
 [package.metadata.docs.rs]
 all-features = true

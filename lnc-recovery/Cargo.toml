@@ -14,4 +14,4 @@ lnc-index = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3.10"
+tempfile = "3.25"

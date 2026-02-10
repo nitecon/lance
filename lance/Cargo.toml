@@ -47,7 +47,7 @@ default = []
 tls = ["lnc-network/tls"]
 
 [dev-dependencies]
-tempfile = "3.10"
+tempfile = "3.25"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]

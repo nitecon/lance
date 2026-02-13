@@ -61,9 +61,12 @@ jobs:
       - name: Set version from tag
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          CURRENT=$(grep '^\[workspace.package\]' -A 1 Cargo.toml | grep '^version = ' | sed 's/version = "\(.*\)"/\1/')
           echo "Publishing version: $VERSION (was $CURRENT)"
-          sed -i "s/version = \"$CURRENT\"/version = \"$VERSION\"/g" Cargo.toml
+          # Update workspace.package version
+          sed -i "/^\[workspace.package\]/,/^\[/ s/version = \"$CURRENT\"/version = \"$VERSION\"/" Cargo.toml
+          # Update all workspace.dependencies versions
+          sed -i "s/\(lnc-[a-z-]* = { path = \"[^\"]*\", version = \)\"$CURRENT\"/\1\"$VERSION\"/g" Cargo.toml
           echo "--- Updated Cargo.toml versions ---"
           grep 'version' Cargo.toml | head -20
       

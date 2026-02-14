@@ -776,7 +776,7 @@ impl PeerManager {
     /// replication at 100Gbps where even 3 sequential RTTs compound.
     ///
     /// **Single-pass compression**: the message is serialized, compressed,
-    /// and framed exactly once via [`prepare_wire_frame`]. Each spawned
+    /// and framed exactly once via [`Self::prepare_wire_frame`]. Each spawned
     /// task receives the identical `Arc<[u8]>` wire bytes and calls
     /// `send_wire_frame` which does only a `write_all` syscall.
     pub async fn broadcast(
@@ -838,7 +838,7 @@ impl PeerManager {
     /// Send a pre-framed wire envelope directly to a specific peer.
     ///
     /// The `wire_frame` has already been through encode + compress + frame
-    /// via [`prepare_wire_frame`], so this only does connect-if-needed +
+    /// via [`Self::prepare_wire_frame`], so this only does connect-if-needed +
     /// `write_all`. Zero per-peer CPU work.
     async fn send_wire_frame_to_peer(
         peers: &Arc<RwLock<HashMap<u16, PeerConnection>>>,
@@ -860,7 +860,7 @@ impl PeerManager {
     /// Send pre-framed wire bytes directly to a peer (for actor JoinSet path).
     ///
     /// This is the public API for the `ReplicationActor` to use when it has
-    /// already prepared the wire frame via [`prepare_wire_frame`]. Each
+    /// already prepared the wire frame via [`Self::prepare_wire_frame`]. Each
     /// follower task clones the `Arc<[u8]>` and calls this method — zero
     /// compression, zero encoding, just a `write_all`.
     pub async fn send_wire_bytes_directly(

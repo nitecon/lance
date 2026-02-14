@@ -29,7 +29,8 @@ use lnc_core::{BatchPool, NumaTopology, Result};
 use lnc_network::tls::{TlsAcceptor, TlsConfig};
 use lnc_replication::{
     AsyncQuorumManager, ClusterCoordinator, ClusterEvent, ForwardConfig, LeaderConnectionPool,
-    QuorumConfig, ReplicationActor, TopicOperation, create_leader_pool, create_replication_channel,
+    QuorumConfig, ReplicationActor, ResyncActor, ResyncConfig, ResyncServer, TopicOperation,
+    create_leader_pool, create_replication_channel,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -126,7 +127,28 @@ pub async fn run(
     // Start cluster coordinator for multi-node replication
     let cluster_coordinator = if config.replication_mode().is_replicated() {
         let cluster_config = config.cluster_config_async().await;
-        let coordinator = Arc::new(ClusterCoordinator::new(cluster_config));
+
+        // Use persistent log storage for durable Raft state (term, voted_for, log entries).
+        // Falls back to in-memory-only mode if persistence fails (e.g. first run, permissions).
+        let coordinator =
+            match ClusterCoordinator::with_persistence(cluster_config.clone(), &config.data_dir) {
+                Ok(c) => {
+                    info!(
+                        target: "lance::server",
+                        data_dir = %config.data_dir.display(),
+                        "Cluster coordinator initialized with persistent Raft log"
+                    );
+                    Arc::new(c)
+                },
+                Err(e) => {
+                    warn!(
+                        target: "lance::server",
+                        error = %e,
+                        "Failed to open persistent Raft log, falling back to in-memory mode"
+                    );
+                    Arc::new(ClusterCoordinator::new(cluster_config))
+                },
+            };
 
         // Start replication listener first (so peers can connect to us)
         if let Err(e) = coordinator.start_listener().await {
@@ -146,6 +168,78 @@ pub async fn run(
             );
         }
 
+        // Start ResyncServer on leader side (dedicated port for bulk segment transfer).
+        // The server listens on replication_port + port_offset (default: +1) and handles
+        // incoming resync requests from followers that are too far behind for AppendEntries.
+        let resync_config = ResyncConfig::default();
+        let resync_server = Arc::new(ResyncServer::new(
+            config.node_id,
+            config.data_dir.clone(),
+            resync_config.clone(),
+        ));
+        let resync_coord = Arc::clone(&coordinator);
+        let resync_listen_port = config.replication_addr.port() + 1;
+        let resync_listen_addr =
+            std::net::SocketAddr::new(config.replication_addr.ip(), resync_listen_port);
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(resync_listen_addr).await {
+                Ok(l) => {
+                    info!(
+                        target: "lance::resync",
+                        addr = %resync_listen_addr,
+                        "Resync server listening"
+                    );
+                    l
+                },
+                Err(e) => {
+                    warn!(
+                        target: "lance::resync",
+                        addr = %resync_listen_addr,
+                        error = %e,
+                        "Failed to start resync server listener"
+                    );
+                    return;
+                },
+            };
+
+            loop {
+                match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        // Only serve resync requests if we are the leader
+                        if !resync_coord.is_leader() {
+                            debug!(
+                                target: "lance::resync",
+                                peer = %addr,
+                                "Rejecting resync request — not leader"
+                            );
+                            continue;
+                        }
+
+                        let server = Arc::clone(&resync_server);
+                        let coord = Arc::clone(&resync_coord);
+                        tokio::spawn(async move {
+                            let term = coord.current_term().await;
+                            if let Err(e) = server.handle_follower(stream, term).await {
+                                warn!(
+                                    target: "lance::resync",
+                                    peer = %addr,
+                                    error = %e,
+                                    "Resync session failed"
+                                );
+                            }
+                        });
+                    },
+                    Err(e) => {
+                        warn!(
+                            target: "lance::resync",
+                            error = %e,
+                            "Failed to accept resync connection"
+                        );
+                    },
+                }
+            }
+        });
+
         // Start cluster coordination loop
         let coord_clone = Arc::clone(&coordinator);
         let shutdown_for_cluster = shutdown_rx.resubscribe();
@@ -158,12 +252,17 @@ pub async fn run(
         let event_registry = Arc::clone(&topic_registry);
         let event_config = config.clone();
         let event_coord = Arc::clone(&coordinator);
+        let resync_data_dir = config.data_dir.clone();
+        let resync_node_id = config.node_id;
         tokio::spawn(async move {
             // Track last known leader for change detection
             let mut last_leader = event_coord.leader_addr();
             // Topic writers for follower data replication (only used by followers)
             let mut follower_writers: std::collections::HashMap<u32, writer::TopicWriter> =
                 std::collections::HashMap::new();
+            // Resync actor for bulk segment transfer when follower is too far behind
+            let mut resync_actor =
+                ResyncActor::new(resync_node_id, resync_data_dir, ResyncConfig::default());
 
             loop {
                 // Check for leader changes periodically
@@ -310,6 +409,58 @@ pub async fn run(
                             leader_id,
                             "BecameFollower — now following node {leader_id}"
                         );
+
+                        // Check if we need a bulk resync (follower too far behind).
+                        // Compute local data offset and compare against the threshold.
+                        // The ResyncServer (leader side) determines the exact missing
+                        // segments via manifest exchange — we only need to decide
+                        // whether to attempt the resync connection at all.
+                        if !resync_actor.is_active() {
+                            if let Some(leader_repl_addr) = event_coord.peer_addr(leader_id).await {
+                                // Compute local offset from segment files
+                                let local_data_dir = event_config.data_dir.clone();
+                                let local_offset = tokio::task::spawn_blocking(move || {
+                                    let mut total = 0u64;
+                                    if let Ok(entries) = std::fs::read_dir(&local_data_dir) {
+                                        for entry in entries.flatten() {
+                                            let path = entry.path();
+                                            if path.extension().is_some_and(|ext| ext == "lnc") {
+                                                if let Ok(meta) = std::fs::metadata(&path) {
+                                                    total += meta.len();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    total
+                                })
+                                .await
+                                .unwrap_or(0);
+
+                                // Fresh node (no data) — always attempt resync to bootstrap.
+                                // initiate_resync handles the full protocol: connect to
+                                // leader's resync port (repl_port + port_offset), exchange
+                                // manifest, stream missing segments, and rebuild indices.
+                                if local_offset == 0 {
+                                    info!(
+                                        target: "lance::resync",
+                                        leader_id,
+                                        leader_addr = %leader_repl_addr,
+                                        "Fresh node detected, initiating bulk resync"
+                                    );
+                                    if let Err(e) = resync_actor
+                                        .initiate_resync(leader_repl_addr, local_offset)
+                                        .await
+                                    {
+                                        warn!(
+                                            target: "lance::resync",
+                                            error = %e,
+                                            "Bulk resync failed"
+                                        );
+                                        resync_actor.reset();
+                                    }
+                                }
+                            }
+                        }
                     },
                     Ok(ClusterEvent::LostLeadership { term }) => {
                         warn!(

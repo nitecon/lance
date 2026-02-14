@@ -44,8 +44,8 @@ impl ConsumerRateLimiter {
 
     /// Create a disabled (unlimited) rate limiter.
     ///
-    /// All calls to [`try_consume`] return the full requested amount and
-    /// [`has_capacity`] always returns `true`, with no atomic operations.
+    /// All calls to [`Self::try_consume`] return the full requested amount and
+    /// [`Self::has_capacity`] always returns `true`, with no atomic operations.
     pub fn disabled() -> Self {
         Self {
             rate_limit: None,

@@ -177,7 +177,7 @@ pub struct LeaderConnectionPool {
     total_connections: AtomicUsize,
     /// Pre-allocated response buffer pool for zero-alloc forwarding
     ///
-    /// **Zero-Allocation (§15)**: Lock-free ArrayQueue of reusable Vec<u8> buffers.
+    /// **Zero-Allocation (§15)**: Lock-free ArrayQueue of reusable `Vec<u8>` buffers.
     /// Eliminates per-forward heap allocation that causes global allocator contention
     /// at 100Gbps forwarding rates.
     buffer_pool: ForwardBufferPool,

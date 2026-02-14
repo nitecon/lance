@@ -376,6 +376,34 @@ pub fn parse_node_id_from_hostname(hostname: &str) -> Option<u16> {
     suffix.parse::<u16>().ok()
 }
 
+/// Extract a node ID from a peer string, centralizing the ID-extraction logic
+/// used by both synchronous (`peer_ids()`) and async (`parse_peers_async()`) paths.
+///
+/// Supports three formats:
+/// - `"node_id@host:port"` → explicit node ID
+/// - `"lance-N.lance-headless:port"` → hostname-based ID via [`parse_node_id_from_hostname`]
+/// - `"192.168.1.1:port"` → raw IP, falls back to `fallback_idx`
+///
+/// The `fallback_idx` is used when no ID can be derived (raw IPs without explicit IDs).
+pub fn parse_peer_node_id(peer_str: &str, fallback_idx: usize) -> u16 {
+    if peer_str.contains('@') {
+        // "node_id@host:port" format
+        peer_str
+            .split('@')
+            .next()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(fallback_idx as u16)
+    } else {
+        let host = peer_str.split(':').next().unwrap_or(peer_str);
+        // Raw IP addresses don't carry node IDs
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            fallback_idx as u16
+        } else {
+            parse_node_id_from_hostname(host).unwrap_or(fallback_idx as u16)
+        }
+    }
+}
+
 /// Resolve the node ID using the Architecture §10.7 priority chain.
 ///
 /// 1. **`LANCE_NODE_ID` env-var** — explicit override (Docker, bare metal)
@@ -540,6 +568,30 @@ mod tests {
         assert_eq!(parse_node_id_from_hostname("lance-abc"), None);
         // u16 overflow
         assert_eq!(parse_node_id_from_hostname("lance-99999"), None);
+    }
+
+    #[test]
+    fn test_parse_peer_node_id_hostname() {
+        assert_eq!(parse_peer_node_id("lance-0.lance-headless:1993", 0), 0);
+        assert_eq!(parse_peer_node_id("lance-1.lance-headless:1993", 1), 1);
+        assert_eq!(parse_peer_node_id("lance-2.lance-headless:1993", 2), 2);
+        // Hostname ID takes precedence over fallback index
+        assert_eq!(parse_peer_node_id("lance-2.lance-headless:1993", 99), 2);
+    }
+
+    #[test]
+    fn test_parse_peer_node_id_explicit() {
+        assert_eq!(parse_peer_node_id("0@127.0.0.1:1993", 99), 0);
+        assert_eq!(parse_peer_node_id("1@127.0.0.1:1994", 99), 1);
+        assert_eq!(parse_peer_node_id("5@10.0.0.1:1993", 0), 5);
+    }
+
+    #[test]
+    fn test_parse_peer_node_id_raw_ip_fallback() {
+        // Raw IPs can't carry node IDs, so fallback_idx is used
+        assert_eq!(parse_peer_node_id("127.0.0.1:1992", 0), 0);
+        assert_eq!(parse_peer_node_id("127.0.0.1:1993", 1), 1);
+        assert_eq!(parse_peer_node_id("10.244.1.48:1993", 3), 3);
     }
 
     #[test]

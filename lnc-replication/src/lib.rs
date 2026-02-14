@@ -30,7 +30,7 @@ pub use codec::{
 };
 pub use discovery::{
     ClusterConfig as DiscoveryClusterConfig, DiscoveryMethod, PeerDiscovery, PeerInfo,
-    parse_node_id_from_hostname, resolve_node_id, validate_node_id_consistency,
+    parse_node_id_from_hostname, parse_peer_node_id, resolve_node_id, validate_node_id_consistency,
 };
 pub use follower::{FollowerHealth, FollowerStatus};
 pub use forward::{

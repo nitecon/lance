@@ -69,11 +69,11 @@ spec:
         image: nitecon/lance:latest
         imagePullPolicy: Always
         securityContext:
-          allowPrivilegeEscalation: false
-          runAsNonRoot: true
+          seccompProfile:
+            type: Unconfined
           capabilities:
-            drop:
-              - ALL
+            add:
+              - SYS_ADMIN
         command: ["/bin/sh", "-c"]
         args:
         - |

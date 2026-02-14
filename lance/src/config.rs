@@ -1,7 +1,8 @@
 use lnc_core::{LanceError, Result};
 use lnc_io::WalConfig;
 use lnc_replication::{
-    DiscoveryClusterConfig, DiscoveryMethod, PeerInfo, ReplicationMode, parse_node_id_from_hostname,
+    DiscoveryClusterConfig, DiscoveryMethod, PeerInfo, ReplicationMode,
+    parse_node_id_from_hostname, parse_peer_node_id,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -267,7 +268,7 @@ impl Config {
         self.peers
             .iter()
             .enumerate()
-            .map(|(i, _)| (i + 1) as u16)
+            .map(|(idx, peer_str)| parse_peer_node_id(peer_str, idx))
             .filter(|&id| id != self.node_id)
             .collect()
     }
@@ -294,24 +295,14 @@ impl Config {
 
         // First pass: collect all peer info and try initial resolution
         for (idx, peer_str) in self.peers.iter().enumerate() {
-            // Support both "host:port" and "node_id@host:port" formats
-            let (node_id, host_port) = if peer_str.contains('@') {
-                let parts: Vec<&str> = peer_str.splitn(2, '@').collect();
-                if parts.len() == 2 {
-                    if let Ok(id) = parts[0].parse::<u16>() {
-                        (id, parts[1].to_string())
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
+            let node_id = parse_peer_node_id(peer_str, idx);
+            let host_port = if peer_str.contains('@') {
+                match peer_str.split_once('@').map(|x| x.1) {
+                    Some(hp) => hp.to_string(),
+                    None => continue,
                 }
             } else {
-                // Try hostname-based ID resolution per Architecture §10.7
-                // e.g., "lance-1.lance-headless:1993" → node_id 1
-                let host = peer_str.rsplit(':').next_back().unwrap_or(peer_str);
-                let id = parse_node_id_from_hostname(host).unwrap_or(idx as u16);
-                (id, peer_str.to_string())
+                peer_str.to_string()
             };
 
             // Skip self
@@ -334,14 +325,7 @@ impl Config {
             .peers
             .iter()
             .enumerate()
-            .filter(|(idx, p)| {
-                let node_id = if p.contains('@') {
-                    p.split('@').next().and_then(|s| s.parse::<u16>().ok())
-                } else {
-                    Some(*idx as u16)
-                };
-                node_id.is_some_and(|id| id != self.node_id)
-            })
+            .filter(|(idx, p)| parse_peer_node_id(p, *idx) != self.node_id)
             .count();
 
         // Retry loop for DNS resolution
@@ -651,7 +635,7 @@ segment_max_size = 2147483648
     }
 
     #[test]
-    fn test_peer_ids() {
+    fn test_peer_ids_ip_addresses() {
         let mut config = Config::default();
         config.node_id = 1;
         config.peers = vec![
@@ -661,9 +645,63 @@ segment_max_size = 2147483648
         ];
 
         let peer_ids = config.peer_ids();
-        // Should exclude own node_id (1)
+        // IP addresses fall back to idx-based IDs: [0, 1, 2], filter out self (1)
         assert!(!peer_ids.contains(&1));
+        assert!(peer_ids.contains(&0));
         assert!(peer_ids.contains(&2));
-        assert!(peer_ids.contains(&3));
+        assert_eq!(peer_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_peer_ids_hostname_node0() {
+        // Regression: node_id=0 must correctly filter itself from hostname-based peers
+        let mut config = Config::default();
+        config.node_id = 0;
+        config.peers = vec![
+            "lance-0.lance-headless:1993".into(),
+            "lance-1.lance-headless:1993".into(),
+            "lance-2.lance-headless:1993".into(),
+        ];
+
+        let peer_ids = config.peer_ids();
+        // Should extract IDs [0, 1, 2] from hostnames, filter out self (0)
+        assert!(!peer_ids.contains(&0));
+        assert!(peer_ids.contains(&1));
+        assert!(peer_ids.contains(&2));
+        assert_eq!(peer_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_peer_ids_hostname_node1() {
+        let mut config = Config::default();
+        config.node_id = 1;
+        config.peers = vec![
+            "lance-0.lance-headless:1993".into(),
+            "lance-1.lance-headless:1993".into(),
+            "lance-2.lance-headless:1993".into(),
+        ];
+
+        let peer_ids = config.peer_ids();
+        assert!(!peer_ids.contains(&1));
+        assert!(peer_ids.contains(&0));
+        assert!(peer_ids.contains(&2));
+        assert_eq!(peer_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_peer_ids_explicit_format() {
+        let mut config = Config::default();
+        config.node_id = 0;
+        config.peers = vec![
+            "0@127.0.0.1:1993".into(),
+            "1@127.0.0.1:1994".into(),
+            "2@127.0.0.1:1995".into(),
+        ];
+
+        let peer_ids = config.peer_ids();
+        assert!(!peer_ids.contains(&0));
+        assert!(peer_ids.contains(&1));
+        assert!(peer_ids.contains(&2));
+        assert_eq!(peer_ids.len(), 2);
     }
 }

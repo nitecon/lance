@@ -14,6 +14,7 @@ mod mode;
 mod peer;
 mod quorum;
 mod raft;
+mod segment;
 
 pub mod schema;
 
@@ -28,11 +29,13 @@ pub use codec::{
 };
 pub use discovery::{
     ClusterConfig as DiscoveryClusterConfig, DiscoveryMethod, PeerDiscovery, PeerInfo,
+    parse_node_id_from_hostname, resolve_node_id, validate_node_id_consistency,
 };
 pub use follower::{FollowerHealth, FollowerStatus};
 pub use forward::{
-    ForwardConfig, ForwardError, LeaderConnectionPool, LocalWriteError, LocalWriteProcessor,
-    NoOpLocalProcessor, TeeForwardingStatus, check_tee_support, create_leader_pool,
+    ForwardBufferPool, ForwardConfig, ForwardError, LeaderConnectionPool, LocalWriteError,
+    LocalWriteProcessor, NoOpLocalProcessor, PooledForwardBuffer, TeeForwardingStatus,
+    check_tee_support, create_leader_pool,
 };
 pub use log_store::{LogStore, PersistentState};
 pub use mode::ReplicationMode;

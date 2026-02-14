@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Segment file metadata for retention decisions
 #[derive(Debug, Clone)]
@@ -169,7 +169,7 @@ async fn run_retention_cycle(
             "Retention cycle complete"
         );
     } else {
-        debug!(
+        trace!(
             target: "lance::retention",
             "Retention cycle complete, no segments expired"
         );

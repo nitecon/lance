@@ -1,6 +1,8 @@
 use lnc_core::{LanceError, Result};
 use lnc_io::WalConfig;
-use lnc_replication::{DiscoveryClusterConfig, DiscoveryMethod, PeerInfo, ReplicationMode};
+use lnc_replication::{
+    DiscoveryClusterConfig, DiscoveryMethod, PeerInfo, ReplicationMode, parse_node_id_from_hostname,
+};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -305,7 +307,11 @@ impl Config {
                     continue;
                 }
             } else {
-                (idx as u16, peer_str.to_string())
+                // Try hostname-based ID resolution per Architecture §10.7
+                // e.g., "lance-1.lance-headless:1993" → node_id 1
+                let host = peer_str.rsplit(':').last().unwrap_or(peer_str);
+                let id = parse_node_id_from_hostname(host).unwrap_or(idx as u16);
+                (id, peer_str.to_string())
             };
 
             // Skip self
@@ -411,6 +417,10 @@ impl Config {
     }
 
     /// Create cluster configuration for replication (with async peer resolution)
+    ///
+    /// Automatically selects `DnsStateful` discovery when peer strings contain
+    /// hostnames with parseable node IDs (e.g., `lance-1.lance-headless:1993`).
+    /// Falls back to `Static` discovery for raw IP addresses.
     pub async fn cluster_config_async(&self) -> DiscoveryClusterConfig {
         let peers = self.parse_peers_async().await;
         tracing::info!(
@@ -419,10 +429,71 @@ impl Config {
             peer_count = peers.len(),
             "Parsed cluster peers"
         );
+
+        // Detect if peers use hostname patterns suitable for DnsStateful discovery.
+        // If any peer string contains a hostname with a parseable node ID suffix,
+        // use DnsStateful for stable node ID resolution on DNS refresh.
+        let has_hostname_peers = self.peers.iter().any(|p| {
+            let host = if p.contains('@') {
+                // node_id@host:port format — already has explicit ID
+                return false;
+            } else {
+                p.rsplit(':').last().unwrap_or(p)
+            };
+            // Check if it's NOT a raw IP and HAS a parseable hostname ID
+            host.parse::<std::net::IpAddr>().is_err() && parse_node_id_from_hostname(host).is_some()
+        });
+
+        let discovery = if has_hostname_peers {
+            // Extract hostnames (without port) for DnsStateful discovery
+            let peer_hostnames: Vec<String> = self
+                .peers
+                .iter()
+                .filter_map(|p| {
+                    if p.contains('@') {
+                        return None;
+                    }
+                    // Split off port to get hostname
+                    if let Some(colon_pos) = p.rfind(':') {
+                        let host = &p[..colon_pos];
+                        if host.parse::<std::net::IpAddr>().is_err() {
+                            return Some(host.to_string());
+                        }
+                    }
+                    None
+                })
+                .collect();
+
+            let port = self
+                .peers
+                .first()
+                .and_then(|p| p.rsplit(':').next())
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(1993);
+
+            if peer_hostnames.is_empty() {
+                DiscoveryMethod::Static(peers)
+            } else {
+                tracing::info!(
+                    target: "lance::config",
+                    hostnames = ?peer_hostnames,
+                    port,
+                    "Using DnsStateful discovery for stable node IDs"
+                );
+                DiscoveryMethod::DnsStateful {
+                    peer_hostnames,
+                    port,
+                    refresh_interval: Duration::from_secs(30),
+                }
+            }
+        } else {
+            DiscoveryMethod::Static(peers)
+        };
+
         DiscoveryClusterConfig {
             node_id: self.node_id,
             listen_addr: self.replication_addr,
-            discovery: DiscoveryMethod::Static(peers),
+            discovery,
             heartbeat_interval: Duration::from_millis(150),
             election_timeout_min: Duration::from_millis(300),
             election_timeout_max: Duration::from_millis(500),

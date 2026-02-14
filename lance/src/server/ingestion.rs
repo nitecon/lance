@@ -386,14 +386,34 @@ pub fn write_replicated_data_enriched(
         Some(tw) => tw,
         None => {
             // No writer and no NEW_SEGMENT flag — the follower may be behind.
-            // Create a writer with the leader-dictated segment name as a recovery path.
+            // Create a writer with the leader-dictated segment name
             tracing::warn!(
                 target: "lance::ingestion",
                 topic_id,
                 segment = %entry.segment_name,
-                "No active writer for topic, creating from leader segment name"
+                "No active writer for topic, opening or creating segment from leader name"
             );
-            let writer = lnc_io::SegmentWriter::create_named(&topic_dir, &entry.segment_name)?;
+
+            // Try to open existing segment first, create only if it doesn't exist
+            let segment_path = topic_dir.join(&entry.segment_name);
+            let writer = if segment_path.exists() {
+                tracing::debug!(
+                    target: "lance::ingestion",
+                    topic_id,
+                    segment = %entry.segment_name,
+                    "Opening existing segment file"
+                );
+                lnc_io::SegmentWriter::open(&segment_path)?
+            } else {
+                tracing::debug!(
+                    target: "lance::ingestion",
+                    topic_id,
+                    segment = %entry.segment_name,
+                    "Creating new segment file"
+                );
+                lnc_io::SegmentWriter::create_named(&topic_dir, &entry.segment_name)?
+            };
+
             let index_builder = lnc_index::IndexBuilder::with_defaults();
             topic_writers.insert(
                 topic_id,

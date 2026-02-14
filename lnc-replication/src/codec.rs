@@ -16,6 +16,152 @@
 use bytes::{Bytes, BytesMut};
 use flatbuffers::FlatBufferBuilder;
 use lnc_core::{HlcTimestamp, LanceError, Result};
+use std::mem::size_of;
+use zerocopy::{FromBytes, Immutable, KnownLayout};
+
+// =============================================================================
+// Zero-copy wire structs (§18)
+//
+// These `#[repr(C, packed)]` structs map directly onto the wire format.
+// `zerocopy::FromBytes::ref_from_prefix` performs a single bounds check and
+// reinterprets the byte slice as a typed reference — no per-field parsing,
+// no `try_into()` chains, no intermediate allocations.
+//
+// All multi-byte fields are little-endian on the wire. Since zerocopy gives
+// us the raw bytes, accessor methods call `from_le_bytes` on the fixed-size
+// arrays. On LE architectures (x86_64, aarch64) the compiler elides these
+// to plain loads.
+// =============================================================================
+
+/// Wire header for `AppendEntriesRequest` (46 bytes, hot path).
+///
+/// Layout: term(8) + leader_id(2) + prev_log_index(8) + prev_log_term(8)
+///       + leader_commit(8) + leader_hlc(8) + entry_count(4)
+#[derive(FromBytes, Immutable, KnownLayout, Clone, Copy)]
+#[repr(C, packed)]
+pub struct AppendEntriesRequestHeader {
+    term: [u8; 8],
+    leader_id: [u8; 2],
+    prev_log_index: [u8; 8],
+    prev_log_term: [u8; 8],
+    leader_commit: [u8; 8],
+    leader_hlc: [u8; 8],
+    entry_count: [u8; 4],
+}
+
+impl AppendEntriesRequestHeader {
+    #[inline] pub fn term(&self) -> u64 { u64::from_le_bytes(self.term) }
+    #[inline] pub fn leader_id(&self) -> u16 { u16::from_le_bytes(self.leader_id) }
+    #[inline] pub fn prev_log_index(&self) -> u64 { u64::from_le_bytes(self.prev_log_index) }
+    #[inline] pub fn prev_log_term(&self) -> u64 { u64::from_le_bytes(self.prev_log_term) }
+    #[inline] pub fn leader_commit(&self) -> u64 { u64::from_le_bytes(self.leader_commit) }
+    #[inline] pub fn leader_hlc(&self) -> u64 { u64::from_le_bytes(self.leader_hlc) }
+    #[inline] pub fn entry_count(&self) -> u32 { u32::from_le_bytes(self.entry_count) }
+}
+
+/// Wire header for `AppendEntriesResponse` (27 bytes).
+///
+/// Layout: term(8) + success(1) + match_index(8) + follower_hlc(8) + follower_id(2)
+#[derive(FromBytes, Immutable, KnownLayout, Clone, Copy)]
+#[repr(C, packed)]
+pub struct AppendEntriesResponseWire {
+    term: [u8; 8],
+    success: u8,
+    match_index: [u8; 8],
+    follower_hlc: [u8; 8],
+    follower_id: [u8; 2],
+}
+
+impl AppendEntriesResponseWire {
+    #[inline] pub fn term(&self) -> u64 { u64::from_le_bytes(self.term) }
+    #[inline] pub fn success(&self) -> bool { self.success != 0 }
+    #[inline] pub fn match_index(&self) -> u64 { u64::from_le_bytes(self.match_index) }
+    #[inline] pub fn follower_hlc(&self) -> u64 { u64::from_le_bytes(self.follower_hlc) }
+    #[inline] pub fn follower_id(&self) -> u16 { u16::from_le_bytes(self.follower_id) }
+}
+
+/// Wire format for vote/pre-vote requests (26 bytes).
+///
+/// Layout: term(8) + candidate_id(2) + last_log_index(8) + last_log_term(8)
+#[derive(FromBytes, Immutable, KnownLayout, Clone, Copy)]
+#[repr(C, packed)]
+pub struct VoteRequestWire {
+    term: [u8; 8],
+    candidate_id: [u8; 2],
+    last_log_index: [u8; 8],
+    last_log_term: [u8; 8],
+}
+
+impl VoteRequestWire {
+    #[inline] pub fn term(&self) -> u64 { u64::from_le_bytes(self.term) }
+    #[inline] pub fn candidate_id(&self) -> u16 { u16::from_le_bytes(self.candidate_id) }
+    #[inline] pub fn last_log_index(&self) -> u64 { u64::from_le_bytes(self.last_log_index) }
+    #[inline] pub fn last_log_term(&self) -> u64 { u64::from_le_bytes(self.last_log_term) }
+}
+
+/// Wire format for vote/pre-vote responses (9 bytes).
+///
+/// Layout: term(8) + granted(1)
+#[derive(FromBytes, Immutable, KnownLayout, Clone, Copy)]
+#[repr(C, packed)]
+pub struct VoteResponseWire {
+    term: [u8; 8],
+    granted: u8,
+}
+
+impl VoteResponseWire {
+    #[inline] pub fn term(&self) -> u64 { u64::from_le_bytes(self.term) }
+    #[inline] pub fn granted(&self) -> bool { self.granted != 0 }
+}
+
+/// Wire format for `ReplicationAck` (15 bytes).
+///
+/// Layout: topic_id(4) + confirmed_offset(8) + status(1) + node_id(2)
+#[derive(FromBytes, Immutable, KnownLayout, Clone, Copy)]
+#[repr(C, packed)]
+pub struct ReplicationAckWire {
+    topic_id: [u8; 4],
+    confirmed_offset: [u8; 8],
+    status: u8,
+    node_id: [u8; 2],
+}
+
+impl ReplicationAckWire {
+    #[inline] pub fn topic_id(&self) -> u32 { u32::from_le_bytes(self.topic_id) }
+    #[inline] pub fn confirmed_offset(&self) -> u64 { u64::from_le_bytes(self.confirmed_offset) }
+    #[inline] pub fn status(&self) -> u8 { self.status }
+    #[inline] pub fn node_id(&self) -> u16 { u16::from_le_bytes(self.node_id) }
+}
+
+/// Wire header for `InstallSnapshotResponse` (16 bytes).
+///
+/// Layout: term(8) + bytes_stored(8)
+#[derive(FromBytes, Immutable, KnownLayout, Clone, Copy)]
+#[repr(C, packed)]
+pub struct InstallSnapshotResponseWire {
+    term: [u8; 8],
+    bytes_stored: [u8; 8],
+}
+
+impl InstallSnapshotResponseWire {
+    #[inline] pub fn term(&self) -> u64 { u64::from_le_bytes(self.term) }
+    #[inline] pub fn bytes_stored(&self) -> u64 { u64::from_le_bytes(self.bytes_stored) }
+}
+
+/// Wire header for `TimeoutNowRequest` (10 bytes).
+///
+/// Layout: term(8) + leader_id(2)
+#[derive(FromBytes, Immutable, KnownLayout, Clone, Copy)]
+#[repr(C, packed)]
+pub struct TimeoutNowRequestWire {
+    term: [u8; 8],
+    leader_id: [u8; 2],
+}
+
+impl TimeoutNowRequestWire {
+    #[inline] pub fn term(&self) -> u64 { u64::from_le_bytes(self.term) }
+    #[inline] pub fn leader_id(&self) -> u16 { u16::from_le_bytes(self.leader_id) }
+}
 
 /// Entry type for Raft log entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -404,20 +550,14 @@ impl ReplicationAck {
         buf.freeze()
     }
 
-    /// Decode an ACK from bytes.
+    /// Decode an ACK from bytes using zero-copy wire struct.
     pub fn decode(data: &[u8]) -> Option<Self> {
-        if data.len() < 15 {
-            return None;
-        }
-        let topic_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        let confirmed_offset = u64::from_le_bytes(data[4..12].try_into().ok()?);
-        let status = ReplicationAckStatus::from_u8(data[12]);
-        let node_id = u16::from_le_bytes([data[13], data[14]]);
+        let (wire, _) = ReplicationAckWire::ref_from_prefix(data).ok()?;
         Some(Self {
-            topic_id,
-            confirmed_offset,
-            status,
-            node_id,
+            topic_id: wire.topic_id(),
+            confirmed_offset: wire.confirmed_offset(),
+            status: ReplicationAckStatus::from_u8(wire.status()),
+            node_id: wire.node_id(),
         })
     }
 }
@@ -764,7 +904,12 @@ impl ReplicationCodec {
     }
 
     /// Decode a replication message from bytes.
-    pub fn decode(data: &[u8]) -> Result<ReplicationMessage> {
+    ///
+    /// **Zero-Copy (§2.1)**: Takes `Bytes` by value so that internal decode
+    /// helpers can use `buf.slice()` (refcount increment) instead of
+    /// `Bytes::copy_from_slice` (heap alloc + memcpy) when extracting
+    /// variable-length payload fields.
+    pub fn decode(data: Bytes) -> Result<ReplicationMessage> {
         if data.len() < 5 {
             return Err(LanceError::InvalidData("Message too short".into()));
         }
@@ -772,19 +917,22 @@ impl ReplicationCodec {
         let msg_type = MessageType::from_u8(data[0])
             .ok_or_else(|| LanceError::InvalidData("Unknown message type".into()))?;
 
-        let payload = &data[1..];
+        // Slice off the 1-byte type discriminant — refcount increment, no copy
+        let payload = data.slice(1..);
 
         match msg_type {
+            // These two produce Bytes fields — pass Bytes for zero-copy slicing
             MessageType::AppendEntriesRequest => Self::decode_append_entries_request(payload),
-            MessageType::AppendEntriesResponse => Self::decode_append_entries_response(payload),
-            MessageType::PreVoteRequest => Self::decode_pre_vote_request(payload),
-            MessageType::PreVoteResponse => Self::decode_pre_vote_response(payload),
-            MessageType::VoteRequest => Self::decode_vote_request(payload),
-            MessageType::VoteResponse => Self::decode_vote_response(payload),
             MessageType::InstallSnapshotRequest => Self::decode_install_snapshot_request(payload),
-            MessageType::InstallSnapshotResponse => Self::decode_install_snapshot_response(payload),
-            MessageType::TimeoutNowRequest => Self::decode_timeout_now_request(payload),
-            MessageType::TimeoutNowResponse => Self::decode_timeout_now_response(payload),
+            // These only extract fixed-size scalars — &[u8] is sufficient
+            MessageType::AppendEntriesResponse => Self::decode_append_entries_response(&payload),
+            MessageType::PreVoteRequest => Self::decode_pre_vote_request(&payload),
+            MessageType::PreVoteResponse => Self::decode_pre_vote_response(&payload),
+            MessageType::VoteRequest => Self::decode_vote_request(&payload),
+            MessageType::VoteResponse => Self::decode_vote_response(&payload),
+            MessageType::InstallSnapshotResponse => Self::decode_install_snapshot_response(&payload),
+            MessageType::TimeoutNowRequest => Self::decode_timeout_now_request(&payload),
+            MessageType::TimeoutNowResponse => Self::decode_timeout_now_response(&payload),
         }
     }
 
@@ -972,65 +1120,20 @@ impl ReplicationCodec {
 
     // === Decoding helpers ===
 
-    fn decode_append_entries_request(data: &[u8]) -> Result<ReplicationMessage> {
-        // Minimum size: term(8) + leader_id(2) + prev_log_index(8) + prev_log_term(8) +
-        //              leader_commit(8) + leader_hlc(8) + entry_count(4) = 46 bytes
-        if data.len() < 46 {
-            return Err(LanceError::InvalidData(
-                "AppendEntriesRequest too short".into(),
-            ));
-        }
+    fn decode_append_entries_request(data: Bytes) -> Result<ReplicationMessage> {
+        // Parse the 46-byte fixed header in one bounds check via zerocopy
+        let (hdr, _) = AppendEntriesRequestHeader::ref_from_prefix(&data)
+            .map_err(|_| LanceError::InvalidData("AppendEntriesRequest too short".into()))?;
 
-        let mut pos = 0;
+        let term = hdr.term();
+        let leader_id = hdr.leader_id();
+        let prev_log_index = hdr.prev_log_index();
+        let prev_log_term = hdr.prev_log_term();
+        let leader_commit = hdr.leader_commit();
+        let leader_hlc = HlcTimestamp::from_raw(hdr.leader_hlc());
+        let entry_count = hdr.entry_count() as usize;
 
-        let term = u64::from_le_bytes(
-            data[pos..pos + 8]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid term".into()))?,
-        );
-        pos += 8;
-
-        let leader_id = u16::from_le_bytes(
-            data[pos..pos + 2]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid leader_id".into()))?,
-        );
-        pos += 2;
-
-        let prev_log_index = u64::from_le_bytes(
-            data[pos..pos + 8]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid prev_log_index".into()))?,
-        );
-        pos += 8;
-
-        let prev_log_term = u64::from_le_bytes(
-            data[pos..pos + 8]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid prev_log_term".into()))?,
-        );
-        pos += 8;
-
-        let leader_commit = u64::from_le_bytes(
-            data[pos..pos + 8]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid leader_commit".into()))?,
-        );
-        pos += 8;
-
-        let leader_hlc = HlcTimestamp::from_raw(u64::from_le_bytes(
-            data[pos..pos + 8]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid leader_hlc".into()))?,
-        ));
-        pos += 8;
-
-        let entry_count = u32::from_le_bytes(
-            data[pos..pos + 4]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid entry_count".into()))?,
-        ) as usize;
-        pos += 4;
+        let mut pos = size_of::<AppendEntriesRequestHeader>();
 
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
@@ -1038,7 +1141,7 @@ impl ReplicationCodec {
                 return Err(LanceError::InvalidData("Truncated log entry".into()));
             }
 
-            let term = u64::from_le_bytes(
+            let entry_term = u64::from_le_bytes(
                 data[pos..pos + 8]
                     .try_into()
                     .map_err(|_| LanceError::InvalidData("Invalid entry term".into()))?,
@@ -1073,11 +1176,12 @@ impl ReplicationCodec {
                 return Err(LanceError::InvalidData("Truncated entry data".into()));
             }
 
-            let entry_data = Bytes::copy_from_slice(&data[pos..pos + data_len]);
+            // Zero-copy: refcount increment instead of heap alloc + memcpy
+            let entry_data = data.slice(pos..pos + data_len);
             pos += data_len;
 
             entries.push(LogEntry {
-                term,
+                term: entry_term,
                 index,
                 hlc,
                 entry_type,
@@ -1099,150 +1203,65 @@ impl ReplicationCodec {
     }
 
     fn decode_append_entries_response(data: &[u8]) -> Result<ReplicationMessage> {
-        if data.len() < 27 {
-            return Err(LanceError::InvalidData(
-                "AppendEntriesResponse too short".into(),
-            ));
-        }
-
-        let term = u64::from_le_bytes(
-            data[0..8]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid term".into()))?,
-        );
-        let success = data[8] != 0;
-        let match_index = u64::from_le_bytes(
-            data[9..17]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid match_index".into()))?,
-        );
-        let follower_hlc = HlcTimestamp::from_raw(u64::from_le_bytes(
-            data[17..25]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid follower_hlc".into()))?,
-        ));
-        let follower_id = u16::from_le_bytes(
-            data[25..27]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid follower_id".into()))?,
-        );
+        let (wire, _) = AppendEntriesResponseWire::ref_from_prefix(data)
+            .map_err(|_| LanceError::InvalidData("AppendEntriesResponse too short".into()))?;
 
         Ok(ReplicationMessage::AppendEntriesResponse(
             AppendEntriesResponse {
-                term,
-                success,
-                match_index,
-                follower_hlc,
-                follower_id,
+                term: wire.term(),
+                success: wire.success(),
+                match_index: wire.match_index(),
+                follower_hlc: HlcTimestamp::from_raw(wire.follower_hlc()),
+                follower_id: wire.follower_id(),
             },
         ))
     }
 
     fn decode_pre_vote_request(data: &[u8]) -> Result<ReplicationMessage> {
-        if data.len() < 26 {
-            return Err(LanceError::InvalidData("PreVoteRequest too short".into()));
-        }
-
-        let term = u64::from_le_bytes(
-            data[0..8]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid term".into()))?,
-        );
-        let candidate_id = u16::from_le_bytes(
-            data[8..10]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid candidate_id".into()))?,
-        );
-        let last_log_index = u64::from_le_bytes(
-            data[10..18]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid last_log_index".into()))?,
-        );
-        let last_log_term = u64::from_le_bytes(
-            data[18..26]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid last_log_term".into()))?,
-        );
+        let (wire, _) = VoteRequestWire::ref_from_prefix(data)
+            .map_err(|_| LanceError::InvalidData("PreVoteRequest too short".into()))?;
 
         Ok(ReplicationMessage::PreVoteRequest(PreVoteRequest {
-            term,
-            candidate_id,
-            last_log_index,
-            last_log_term,
+            term: wire.term(),
+            candidate_id: wire.candidate_id(),
+            last_log_index: wire.last_log_index(),
+            last_log_term: wire.last_log_term(),
         }))
     }
 
     fn decode_pre_vote_response(data: &[u8]) -> Result<ReplicationMessage> {
-        if data.len() < 9 {
-            return Err(LanceError::InvalidData("PreVoteResponse too short".into()));
-        }
-
-        let term = u64::from_le_bytes(
-            data[0..8]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid term".into()))?,
-        );
-        let vote_granted = data[8] != 0;
+        let (wire, _) = VoteResponseWire::ref_from_prefix(data)
+            .map_err(|_| LanceError::InvalidData("PreVoteResponse too short".into()))?;
 
         Ok(ReplicationMessage::PreVoteResponse(PreVoteResponse {
-            term,
-            vote_granted,
+            term: wire.term(),
+            vote_granted: wire.granted(),
         }))
     }
 
     fn decode_vote_request(data: &[u8]) -> Result<ReplicationMessage> {
-        if data.len() < 26 {
-            return Err(LanceError::InvalidData("VoteRequest too short".into()));
-        }
-
-        let term = u64::from_le_bytes(
-            data[0..8]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid term".into()))?,
-        );
-        let candidate_id = u16::from_le_bytes(
-            data[8..10]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid candidate_id".into()))?,
-        );
-        let last_log_index = u64::from_le_bytes(
-            data[10..18]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid last_log_index".into()))?,
-        );
-        let last_log_term = u64::from_le_bytes(
-            data[18..26]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid last_log_term".into()))?,
-        );
+        let (wire, _) = VoteRequestWire::ref_from_prefix(data)
+            .map_err(|_| LanceError::InvalidData("VoteRequest too short".into()))?;
 
         Ok(ReplicationMessage::VoteRequest(VoteRequest {
-            term,
-            candidate_id,
-            last_log_index,
-            last_log_term,
+            term: wire.term(),
+            candidate_id: wire.candidate_id(),
+            last_log_index: wire.last_log_index(),
+            last_log_term: wire.last_log_term(),
         }))
     }
 
     fn decode_vote_response(data: &[u8]) -> Result<ReplicationMessage> {
-        if data.len() < 9 {
-            return Err(LanceError::InvalidData("VoteResponse too short".into()));
-        }
-
-        let term = u64::from_le_bytes(
-            data[0..8]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid term".into()))?,
-        );
-        let vote_granted = data[8] != 0;
+        let (wire, _) = VoteResponseWire::ref_from_prefix(data)
+            .map_err(|_| LanceError::InvalidData("VoteResponse too short".into()))?;
 
         Ok(ReplicationMessage::VoteResponse(VoteResponse {
-            term,
-            vote_granted,
+            term: wire.term(),
+            vote_granted: wire.granted(),
         }))
     }
 
-    fn decode_install_snapshot_request(data: &[u8]) -> Result<ReplicationMessage> {
+    fn decode_install_snapshot_request(data: Bytes) -> Result<ReplicationMessage> {
         if data.len() < 51 {
             return Err(LanceError::InvalidData(
                 "InstallSnapshotRequest too short".into(),
@@ -1307,7 +1326,8 @@ impl ReplicationCodec {
             return Err(LanceError::InvalidData("Truncated snapshot data".into()));
         }
 
-        let snapshot_data = Bytes::copy_from_slice(&data[pos..pos + data_len]);
+        // Zero-copy: refcount increment instead of heap alloc + memcpy
+        let snapshot_data = data.slice(pos..pos + data_len);
         pos += data_len;
 
         let config = Self::decode_config(&data[pos..])?;
@@ -1328,69 +1348,34 @@ impl ReplicationCodec {
     }
 
     fn decode_install_snapshot_response(data: &[u8]) -> Result<ReplicationMessage> {
-        if data.len() < 16 {
-            return Err(LanceError::InvalidData(
-                "InstallSnapshotResponse too short".into(),
-            ));
-        }
-
-        let term = u64::from_le_bytes(
-            data[0..8]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid term".into()))?,
-        );
-        let bytes_stored = u64::from_le_bytes(
-            data[8..16]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid bytes_stored".into()))?,
-        );
+        let (wire, _) = InstallSnapshotResponseWire::ref_from_prefix(data)
+            .map_err(|_| LanceError::InvalidData("InstallSnapshotResponse too short".into()))?;
 
         Ok(ReplicationMessage::InstallSnapshotResponse(
-            InstallSnapshotResponse { term, bytes_stored },
+            InstallSnapshotResponse {
+                term: wire.term(),
+                bytes_stored: wire.bytes_stored(),
+            },
         ))
     }
 
     fn decode_timeout_now_request(data: &[u8]) -> Result<ReplicationMessage> {
-        if data.len() < 10 {
-            return Err(LanceError::InvalidData(
-                "TimeoutNowRequest too short".into(),
-            ));
-        }
-
-        let term = u64::from_le_bytes(
-            data[0..8]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid term".into()))?,
-        );
-        let leader_id = u16::from_le_bytes(
-            data[8..10]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid leader_id".into()))?,
-        );
+        let (wire, _) = TimeoutNowRequestWire::ref_from_prefix(data)
+            .map_err(|_| LanceError::InvalidData("TimeoutNowRequest too short".into()))?;
 
         Ok(ReplicationMessage::TimeoutNowRequest(TimeoutNowRequest {
-            term,
-            leader_id,
+            term: wire.term(),
+            leader_id: wire.leader_id(),
         }))
     }
 
     fn decode_timeout_now_response(data: &[u8]) -> Result<ReplicationMessage> {
-        if data.len() < 9 {
-            return Err(LanceError::InvalidData(
-                "TimeoutNowResponse too short".into(),
-            ));
-        }
-
-        let term = u64::from_le_bytes(
-            data[0..8]
-                .try_into()
-                .map_err(|_| LanceError::InvalidData("Invalid term".into()))?,
-        );
-        let accepted = data[8] != 0;
+        let (wire, _) = VoteResponseWire::ref_from_prefix(data)
+            .map_err(|_| LanceError::InvalidData("TimeoutNowResponse too short".into()))?;
 
         Ok(ReplicationMessage::TimeoutNowResponse(TimeoutNowResponse {
-            term,
-            accepted,
+            term: wire.term(),
+            accepted: wire.granted(),
         }))
     }
 
@@ -1504,7 +1489,7 @@ mod tests {
         let encoded = codec
             .encode(&ReplicationMessage::AppendEntriesRequest(req.clone()))
             .unwrap();
-        let decoded = ReplicationCodec::decode(&encoded).unwrap();
+        let decoded = ReplicationCodec::decode(encoded).unwrap();
 
         if let ReplicationMessage::AppendEntriesRequest(decoded_req) = decoded {
             assert_eq!(decoded_req.term, req.term);
@@ -1531,7 +1516,7 @@ mod tests {
         let encoded = codec
             .encode(&ReplicationMessage::PreVoteRequest(req.clone()))
             .unwrap();
-        let decoded = ReplicationCodec::decode(&encoded).unwrap();
+        let decoded = ReplicationCodec::decode(encoded).unwrap();
 
         if let ReplicationMessage::PreVoteRequest(decoded_req) = decoded {
             assert_eq!(decoded_req.term, req.term);

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/zsh
 # LANCE Build Script
 # Runs all CI checks per CodingGuidelines.md §10.1, then builds and pushes Docker image.
 # Usage: ./build.sh [--skip-push] [--skip-tests]
@@ -128,3 +128,6 @@ echo ""
 echo "=============================================="
 echo "  Build complete!"
 echo "==============================================" 
+
+kubectl rollout restart statefulset/lance
+kubectl rollout status statefulset/lance

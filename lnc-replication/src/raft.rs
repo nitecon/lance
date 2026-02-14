@@ -110,7 +110,7 @@ pub struct RaftNode {
     /// Current term.
     current_term: u64,
     /// Node voted for in current term (if any).
-    voted_for: Option<u16>,
+    pub(crate) voted_for: Option<u16>,
     /// Current leader (if known).
     leader_id: Option<u16>,
     /// Last time we heard from the leader.
@@ -131,13 +131,16 @@ pub struct RaftNode {
     last_log_term: u64,
     /// Commit index.
     commit_index: u64,
-    /// Last applied index.
-    #[allow(dead_code)] // Will be used when state machine application is implemented
+    /// Last applied index (entries applied to state machine via Apply Loop).
     last_applied: u64,
     /// Pre-vote in progress.
     pre_vote_in_progress: bool,
     /// Votes received in current election.
-    votes_received: HashSet<u16>,
+    pub(crate) votes_received: HashSet<u16>,
+    /// Next log index to send to each peer (leader only).
+    next_index: std::collections::HashMap<u16, u64>,
+    /// Highest log index known to be replicated on each peer (leader only).
+    match_index: std::collections::HashMap<u16, u64>,
 }
 
 impl RaftNode {
@@ -163,6 +166,8 @@ impl RaftNode {
             last_applied: 0,
             pre_vote_in_progress: false,
             votes_received: HashSet::new(),
+            next_index: std::collections::HashMap::new(),
+            match_index: std::collections::HashMap::new(),
         }
     }
 
@@ -220,6 +225,20 @@ impl RaftNode {
     #[must_use]
     pub const fn last_log_index(&self) -> u64 {
         self.last_log_index
+    }
+
+    /// Get the last applied index.
+    #[inline]
+    #[must_use]
+    pub const fn last_applied(&self) -> u64 {
+        self.last_applied
+    }
+
+    /// Update last_applied after successfully applying an entry to the state machine.
+    pub fn advance_last_applied(&mut self, new_last_applied: u64) {
+        if new_last_applied > self.last_applied {
+            self.last_applied = new_last_applied;
+        }
     }
 
     /// Advance the Raft log index after a successful write or replication.
@@ -312,8 +331,8 @@ impl RaftNode {
     /// Handle an incoming pre-vote response.
     ///
     /// Returns `true` if pre-vote succeeded and we should start a real election.
-    pub fn handle_pre_vote_response(&mut self, resp: &PreVoteResponse) -> bool {
-        if !self.pre_vote_in_progress {
+    pub fn handle_pre_vote_response(&mut self, voter_id: u16, resp: &PreVoteResponse) -> bool {
+        if !self.pre_vote_in_progress || resp.term < self.current_term {
             return false;
         }
 
@@ -325,21 +344,11 @@ impl RaftNode {
         }
 
         if resp.vote_granted {
-            // Count the vote — caller must pass the actual voter node ID
-            // via the resp.term field context or track externally.
-            // For pre-vote we track grants via an external counter,
-            // so this path is only reached if the coordinator feeds
-            // individual responses. We return early based on quorum.
+            self.votes_received.insert(voter_id);
         }
 
-        // Check if we have enough pre-votes
-        let quorum = self.quorum_size();
-        if self.votes_received.len() >= quorum {
-            self.pre_vote_in_progress = false;
-            return true; // Proceed to real election
-        }
-
-        false
+        // Check if we have enough pre-votes for quorum
+        self.votes_received.len() >= self.quorum_size()
     }
 
     // =========================================================================
@@ -598,6 +607,11 @@ impl RaftNode {
         self.voted_for = None;
         self.pre_vote_in_progress = false;
 
+        // Reset election timeout to prevent election storms when discovering higher term
+        // This is critical: without this, a partitioned node will continuously retry
+        // elections every 50ms when it discovers the cluster has moved to a higher term
+        self.reset_election_timeout();
+
         if was_leader {
             // Revoke fencing token
             self.fencing_token = None;
@@ -620,6 +634,19 @@ impl RaftNode {
         // Create new fencing token
         self.fencing_token = Some(FencingToken::new(self.current_term, self.node_id));
 
+        // Initialize next_index and match_index for all peers (Raft §5.3)
+        // next_index: optimistically assume peers are caught up (last_log_index + 1)
+        // match_index: conservatively assume no replication yet (0)
+        self.next_index.clear();
+        self.match_index.clear();
+        for node in &self.config.old_nodes {
+            if node.node_id != self.node_id {
+                self.next_index
+                    .insert(node.node_id, self.last_log_index + 1);
+                self.match_index.insert(node.node_id, 0);
+            }
+        }
+
         tracing::info!(
             target: "lance::raft",
             node_id = self.node_id,
@@ -627,6 +654,30 @@ impl RaftNode {
             fencing_token = ?self.fencing_token,
             "Became leader"
         );
+    }
+
+    /// Create a No-Op entry for a new leader to commit (Raft §5.4.2).
+    ///
+    /// A new leader cannot immediately commit entries from previous terms,
+    /// even if they are stored on a majority. The leader must first replicate
+    /// and commit at least one entry from its own term to "seal" the log.
+    ///
+    /// Industry best practice: append a No-Op entry immediately upon election.
+    pub fn create_noop_entry(&mut self) -> Option<crate::codec::LogEntry> {
+        if self.state != RaftState::Leader {
+            return None;
+        }
+
+        // Advance log for the No-Op entry
+        self.advance_log(1);
+
+        Some(crate::codec::LogEntry {
+            term: self.current_term,
+            index: self.last_log_index,
+            hlc: self.hlc.now(),
+            entry_type: crate::codec::EntryType::Noop,
+            data: bytes::Bytes::new(),
+        })
     }
 
     // =========================================================================
@@ -779,7 +830,7 @@ impl RaftNode {
     }
 
     /// Calculate quorum size.
-    fn quorum_size(&self) -> usize {
+    pub fn quorum_size(&self) -> usize {
         let total = if self.config.is_joint {
             // Joint consensus: use larger of old/new configs
             self.config.old_nodes.len().max(self.config.new_nodes.len())
@@ -788,6 +839,55 @@ impl RaftNode {
         };
 
         total / 2 + 1
+    }
+
+    /// Check if a vote count constitutes a quorum.
+    pub fn has_quorum(&self, vote_count: usize) -> bool {
+        vote_count >= self.quorum_size()
+    }
+
+    /// Update match_index for a peer after successful replication.
+    /// Returns the new commit_index if it advanced.
+    pub fn update_match_index(&mut self, peer_id: u16, match_index: u64) -> Option<u64> {
+        if self.state != RaftState::Leader {
+            return None;
+        }
+
+        // Update the peer's match_index
+        self.match_index.insert(peer_id, match_index);
+
+        // Advance commit_index if a majority of peers have replicated up to some index N
+        // Raft §5.3: Only commit entries from current term
+        let old_commit = self.commit_index;
+
+        // Collect all match indices including self
+        let mut indices: Vec<u64> = self.match_index.values().copied().collect();
+        indices.push(self.last_log_index); // Leader's own log
+        indices.sort_unstable();
+
+        // Find the median (majority) index
+        let quorum_idx = indices.len() - self.quorum_size();
+        let new_commit = indices[quorum_idx];
+
+        // Only advance commit_index, never decrease
+        if new_commit > old_commit {
+            self.commit_index = new_commit;
+            tracing::debug!(
+                target: "lance::raft",
+                node_id = self.node_id,
+                old_commit,
+                new_commit,
+                "Advanced commit_index"
+            );
+            Some(new_commit)
+        } else {
+            None
+        }
+    }
+
+    /// Get the current commit index.
+    pub fn commit_index(&self) -> u64 {
+        self.commit_index
     }
 
     /// Update the cluster configuration (for membership changes).

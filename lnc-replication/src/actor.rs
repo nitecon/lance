@@ -1,14 +1,21 @@
 use crate::follower::{FollowerHealth, FollowerStatus};
 use crate::mode::ReplicationMode;
 use crate::quorum::{QuorumConfig, QuorumResult, QuorumTracker};
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 
 pub struct ReplicationRequest {
     pub batch_id: u64,
     pub offset: u64,
-    pub data: Vec<u8>,
+    /// Payload data using `Bytes` for zero-copy reference counting.
+    ///
+    /// Unlike `Vec<u8>`, cloning a `Bytes` is an `Arc` refcount increment —
+    /// no heap allocation, no memcpy. This is critical on the hot path where
+    /// every write produces a `ReplicationRequest`.
+    pub data: Bytes,
     pub quorum_tx: oneshot::Sender<QuorumResult>,
 }
 
@@ -64,7 +71,13 @@ impl ReplicationActor {
         );
     }
 
-    async fn handle_request(&mut self, batch_id: u64, data: &[u8]) -> QuorumResult {
+    /// Handle a replication request using concurrent broadcast via JoinSet.
+    ///
+    /// All follower replication requests fire simultaneously so P99 latency
+    /// is determined by the fastest quorum (max of quorum-size RTTs), not
+    /// the sum of all follower RTTs. As results arrive, the tracker records
+    /// ACKs/NACKs and returns as soon as quorum is reached.
+    async fn handle_request(&mut self, batch_id: u64, _data: &[u8]) -> QuorumResult {
         if !self.mode.requires_quorum() {
             return QuorumResult::Success;
         }
@@ -87,24 +100,49 @@ impl ReplicationActor {
 
         let mut tracker = QuorumTracker::new(self.quorum_config.clone());
 
+        // Local write is already done (per architecture) — count as first ACK
         tracker.record_ack();
 
+        // Fire all follower replication requests concurrently
+        let mut join_set = JoinSet::new();
+        let timeout_ms = self.quorum_config.timeout_ms;
+
         for follower_id in healthy_followers {
-            let latency = self.simulate_replication(follower_id, data).await;
+            join_set.spawn(async move {
+                let latency = Self::simulate_replication_static(follower_id).await;
+                (follower_id, latency)
+            });
+        }
 
-            if let Some(follower) = self.followers.get_mut(&follower_id) {
-                if let Some(new_status) = follower.record_latency(latency) {
-                    if new_status == FollowerStatus::Evicted {
-                        self.recalculate_quorum();
+        // Collect results as they arrive — return as soon as quorum is reached
+        while let Some(res) = join_set.join_next().await {
+            let (follower_id, latency) = match res {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "lance::replication",
+                        error = %e,
+                        "Replication task panicked"
+                    );
+                    if let Some(result) = tracker.record_nack() {
+                        join_set.abort_all();
+                        return result;
                     }
-                }
-            }
+                    continue;
+                },
+            };
 
-            if latency < Duration::from_millis(self.quorum_config.timeout_ms) {
+            // Update follower health in the actor's local state
+            self.update_follower_health(follower_id, latency);
+
+            if latency < Duration::from_millis(timeout_ms) {
                 if let Some(result) = tracker.record_ack() {
+                    // Quorum reached — abort remaining tasks, no need to wait
+                    join_set.abort_all();
                     return result;
                 }
             } else if let Some(result) = tracker.record_nack() {
+                join_set.abort_all();
                 return result;
             }
         }
@@ -112,7 +150,8 @@ impl ReplicationActor {
         tracker.finalize()
     }
 
-    async fn simulate_replication(&self, _follower_id: u16, _data: &[u8]) -> Duration {
+    /// Static replication simulation (Send + 'static compatible for JoinSet::spawn).
+    async fn simulate_replication_static(_follower_id: u16) -> Duration {
         Duration::from_millis(2)
     }
 
@@ -186,7 +225,7 @@ mod tests {
         tx.send(ReplicationRequest {
             batch_id: 1,
             offset: 0,
-            data: vec![1, 2, 3],
+            data: Bytes::from_static(&[1, 2, 3]),
             quorum_tx,
         })
         .await

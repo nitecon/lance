@@ -345,6 +345,16 @@ pub fn encode_ack_bytes(batch_id: u64) -> [u8; crate::LWP_HEADER_SIZE] {
     frame.header.encode()
 }
 
+/// Encode a Backpressure frame (0x10) directly into a stack-allocated buffer.
+///
+/// **Spec §4.4**: Followers return this when forward_write times out or the
+/// connection pool is exhausted, signaling the client to back off.
+#[inline]
+pub fn encode_backpressure_bytes() -> [u8; crate::LWP_HEADER_SIZE] {
+    let frame = Frame::new_backpressure();
+    frame.header.encode()
+}
+
 pub fn encode_frame(frame: &Frame) -> Vec<u8> {
     let header_bytes = frame.header.encode();
     let payload_len = frame.payload.as_ref().map_or(0, |p| p.len());

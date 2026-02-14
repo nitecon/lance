@@ -67,12 +67,13 @@ spec:
       containers:
       - name: lance
         image: nitecon/lance:latest
+        imagePullPolicy: Always
         securityContext:
-          seccompProfile:
-            type: Unconfined
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
           capabilities:
-            add:
-              - SYS_ADMIN
+            drop:
+              - ALL
         command: ["/bin/sh", "-c"]
         args:
         - |

@@ -113,11 +113,7 @@ impl PeerDiscovery {
     /// suffix (e.g., `lance-3.lance-headless` → node_id 3). This is the
     /// **required** path for Kubernetes StatefulSet deployments where DNS
     /// round-robin ordering is non-deterministic.
-    async fn discover_dns_stateful(
-        &self,
-        peer_hostnames: &[String],
-        port: u16,
-    ) -> Vec<PeerInfo> {
+    async fn discover_dns_stateful(&self, peer_hostnames: &[String], port: u16) -> Vec<PeerInfo> {
         let mut peers = Vec::new();
 
         for hostname in peer_hostnames {
@@ -590,7 +586,9 @@ mod tests {
             std::env::set_var("HOSTNAME", "lance-3");
         }
         assert!(validate_node_id_consistency(3).is_ok());
-        unsafe { std::env::remove_var("HOSTNAME"); }
+        unsafe {
+            std::env::remove_var("HOSTNAME");
+        }
     }
 
     #[test]
@@ -605,7 +603,9 @@ mod tests {
         assert!(msg.contains("Node ID mismatch"));
         assert!(msg.contains("node_id=1"));
         assert!(msg.contains("node_id=3"));
-        unsafe { std::env::remove_var("HOSTNAME"); }
+        unsafe {
+            std::env::remove_var("HOSTNAME");
+        }
     }
 
     #[test]

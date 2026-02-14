@@ -173,8 +173,9 @@ struct ShardedPendingMap {
 
 impl ShardedPendingMap {
     fn new() -> Self {
-        let shards: Vec<RwLock<HashMap<u64, PendingWrite>>> =
-            (0..NUM_SHARDS).map(|_| RwLock::new(HashMap::new())).collect();
+        let shards: Vec<RwLock<HashMap<u64, PendingWrite>>> = (0..NUM_SHARDS)
+            .map(|_| RwLock::new(HashMap::new()))
+            .collect();
         Self {
             shards: shards.into_boxed_slice(),
         }

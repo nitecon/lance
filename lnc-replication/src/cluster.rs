@@ -686,10 +686,7 @@ impl ClusterCoordinator {
                 fail_count,
                 "Data replicated but not yet committed (quorum not reached)"
             );
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Replication quorum not reached",
-            ));
+            return Err(std::io::Error::other("Replication quorum not reached"));
         }
 
         // Signal the Apply Loop to drain newly committed entries.
@@ -837,9 +834,7 @@ impl ClusterCoordinator {
                     // Try enriched format first, fall back to legacy
                     if let Some(enriched) = Self::decode_data_entry_enriched(&entry.data) {
                         Some(ClusterEvent::DataReceivedEnriched(enriched))
-                    } else if let Some((topic_id, payload)) =
-                        Self::decode_data_entry(&entry.data)
-                    {
+                    } else if let Some((topic_id, payload)) = Self::decode_data_entry(&entry.data) {
                         Some(ClusterEvent::DataReceived { topic_id, payload })
                     } else {
                         warn!(

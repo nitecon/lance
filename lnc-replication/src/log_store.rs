@@ -55,10 +55,6 @@ impl Default for CompactionConfig {
     }
 }
 
-/// Header for the log file
-const LOG_MAGIC: &[u8; 4] = b"RAFT";
-const LOG_VERSION: u32 = 1;
-
 /// On-disk format for a log entry (with dual CRC32 checksums for corruption detection)
 /// [term: u64][index: u64][hlc_raw: u64][entry_type: u8][data_len: u32][header_crc: u32][data: bytes][data_crc: u32]
 ///
@@ -93,7 +89,7 @@ pub struct LogStore {
 
 impl LogStore {
     /// Create or open a log store at the given directory
-    /// 
+    ///
     /// **Bootstrap Logic**: Scans directory for .lnc segment files, builds indices,
     /// and handles partial segment recovery after crashes.
     pub fn open(dir: &Path) -> Result<Self> {
@@ -108,11 +104,10 @@ impl LogStore {
         // Initialize segment manager with configuration
         let segment_config = SegmentConfig {
             max_entries_per_segment: 10_000,
-            max_segment_size_bytes: 100 * 1024 * 1024, // 100MB
         };
-        
+
         let mut segments = SegmentManager::open(dir, segment_config)?;
-        
+
         // Build indices for all segments (handles torn writes)
         Self::bootstrap_segments(&mut segments)?;
 
@@ -135,13 +130,13 @@ impl LogStore {
 
         Ok(store)
     }
-    
+
     /// Bootstrap all segments by building their indices
-    /// 
+    ///
     /// **Operational Readiness**: Source of truth for SREs who rsync files and start nodes.
     /// Reconstructs indices from segment files and validates the last entry in the active
     /// segment to detect torn writes from interrupted rsync operations.
-    /// 
+    ///
     /// **Torn Write Recovery**: If the active segment has a corrupted last entry,
     /// automatically truncates it before the node joins the Raft cluster.
     ///
@@ -204,7 +199,7 @@ impl LogStore {
             sealed_parallel = segment_count.saturating_sub(1),
             "Bootstrap complete - node ready for Raft cluster"
         );
-        
+
         Ok(())
     }
 
@@ -291,7 +286,6 @@ impl LogStore {
         Self::decode_entry_from_bytes(Bytes::from(entry_bytes)).ok()
     }
 
-
     /// Decode a log entry from raw bytes with dual checksum validation
     ///
     /// **Security**: Validates header checksum before trusting data_len to prevent allocation attacks.
@@ -307,14 +301,34 @@ impl LogStore {
         }
 
         // Parse header fields
-        let term = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        let index = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        let hlc_raw = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+        let term = u64::from_le_bytes(
+            buf[0..8]
+                .try_into()
+                .map_err(|_| LanceError::Protocol("Invalid term slice".into()))?,
+        );
+        let index = u64::from_le_bytes(
+            buf[8..16]
+                .try_into()
+                .map_err(|_| LanceError::Protocol("Invalid index slice".into()))?,
+        );
+        let hlc_raw = u64::from_le_bytes(
+            buf[16..24]
+                .try_into()
+                .map_err(|_| LanceError::Protocol("Invalid hlc slice".into()))?,
+        );
         let entry_type_byte = buf[24];
-        let data_len = u32::from_le_bytes(buf[25..29].try_into().unwrap()) as usize;
+        let data_len = u32::from_le_bytes(
+            buf[25..29]
+                .try_into()
+                .map_err(|_| LanceError::Protocol("Invalid data_len slice".into()))?,
+        ) as usize;
 
         // Validate header checksum BEFORE trusting data_len
-        let stored_header_crc = u32::from_le_bytes(buf[29..33].try_into().unwrap());
+        let stored_header_crc = u32::from_le_bytes(
+            buf[29..33]
+                .try_into()
+                .map_err(|_| LanceError::Protocol("Invalid header CRC slice".into()))?,
+        );
         let mut hasher = Hasher::new();
         hasher.update(&buf[0..29]); // Hash header only
         let calculated_header_crc = hasher.finalize();
@@ -340,7 +354,11 @@ impl LogStore {
         let data_start = ENTRY_HEADER_SIZE + HEADER_CRC_SIZE;
         let data_end = data_start + data_len;
 
-        let stored_data_crc = u32::from_le_bytes(buf[data_end..data_end + 4].try_into().unwrap());
+        let stored_data_crc = u32::from_le_bytes(
+            buf[data_end..data_end + 4]
+                .try_into()
+                .map_err(|_| LanceError::Protocol("Invalid data CRC slice".into()))?,
+        );
         let mut hasher = Hasher::new();
         hasher.update(&buf[data_start..data_end]);
         let calculated_data_crc = hasher.finalize();
@@ -373,7 +391,7 @@ impl LogStore {
     }
 
     /// Get entries from start_index to end (inclusive)
-    /// 
+    ///
     /// **Segmented Architecture**: Delegates to SegmentManager which handles
     /// contiguous range optimization automatically.
     ///
@@ -398,28 +416,27 @@ impl LogStore {
         entries
     }
 
-
     /// Append entries to the log (batched with single fdatasync)
-    /// 
+    ///
     /// **Batching**: Writes all entries to the active segment, then calls persist()
     /// once for the entire batch. This amortizes fdatasync cost across N entries.
-    /// 
+    ///
     /// **Rotation**: Automatically rotates to new segment when current is full.
     pub fn append(&mut self, entries: Vec<LogEntry>) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        
+
         for entry in &entries {
             // Check for rotation before each append
             self.segments.maybe_rotate(entry.index)?;
-            
+
             // Get active segment
             let active = self.segments.get_or_create_active_segment(entry.index)?;
-            
+
             // Serialize entry with dual checksums
             let entry_bytes = Self::serialize_entry(entry)?;
-            
+
             // Append to segment (buffered, no sync yet)
             active.append(entry, &entry_bytes)?;
         }
@@ -436,35 +453,35 @@ impl LogStore {
 
         Ok(())
     }
-    
+
     /// Serialize a log entry with dual checksums
     fn serialize_entry(entry: &LogEntry) -> Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(
-            ENTRY_HEADER_SIZE + HEADER_CRC_SIZE + entry.data.len() + DATA_CRC_SIZE
+            ENTRY_HEADER_SIZE + HEADER_CRC_SIZE + entry.data.len() + DATA_CRC_SIZE,
         );
-        
+
         // Write header fields
         buf.extend_from_slice(&entry.term.to_le_bytes());
         buf.extend_from_slice(&entry.index.to_le_bytes());
         buf.extend_from_slice(&entry.hlc.as_u64().to_le_bytes());
         buf.push(entry.entry_type.as_u8());
         buf.extend_from_slice(&(entry.data.len() as u32).to_le_bytes());
-        
+
         // Calculate and write header CRC
         let mut hasher = Hasher::new();
         hasher.update(&buf);
         let header_crc = hasher.finalize();
         buf.extend_from_slice(&header_crc.to_le_bytes());
-        
+
         // Write data
         buf.extend_from_slice(&entry.data);
-        
+
         // Calculate and write data CRC
         let mut hasher = Hasher::new();
         hasher.update(&entry.data);
         let data_crc = hasher.finalize();
         buf.extend_from_slice(&data_crc.to_le_bytes());
-        
+
         Ok(buf)
     }
 
@@ -533,7 +550,7 @@ impl LogStore {
 
     /// Check if automatic compaction should be triggered
     pub fn should_compact(&self) -> bool {
-        self.compaction_config.enabled 
+        self.compaction_config.enabled
             && self.segments.total_entry_count() > self.compaction_config.max_entries
     }
 
@@ -544,7 +561,8 @@ impl LogStore {
         }
 
         let total_entries = self.segments.total_entry_count();
-        let entries_to_remove = total_entries.saturating_sub(self.compaction_config.min_entries_retained);
+        let entries_to_remove =
+            total_entries.saturating_sub(self.compaction_config.min_entries_retained);
         if entries_to_remove == 0 {
             return None;
         }
@@ -570,13 +588,13 @@ impl LogStore {
     /// Set snapshot metadata (used when installing snapshot from leader)
     pub fn set_snapshot_meta(&mut self, meta: SnapshotMeta) {
         self.snapshot_meta = meta;
-        
+
         // Compact segments up to snapshot index
         let first_index = self.first_index();
         if meta.last_included_index >= first_index {
             let _ = self.segments.compact_to(meta.last_included_index + 1);
         }
-        
+
         // Persist metadata to disk
         let meta_path = self.dir.join("raft.meta");
         let _ = Self::save_snapshot_meta(&meta_path, &meta);
@@ -636,7 +654,6 @@ impl LogStore {
         }
         self.term_at(index).map(|t| t == term).unwrap_or(false)
     }
-
 }
 
 #[cfg(test)]

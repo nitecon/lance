@@ -50,13 +50,34 @@ pub struct AppendEntriesRequestHeader {
 }
 
 impl AppendEntriesRequestHeader {
-    #[inline] pub fn term(&self) -> u64 { u64::from_le_bytes(self.term) }
-    #[inline] pub fn leader_id(&self) -> u16 { u16::from_le_bytes(self.leader_id) }
-    #[inline] pub fn prev_log_index(&self) -> u64 { u64::from_le_bytes(self.prev_log_index) }
-    #[inline] pub fn prev_log_term(&self) -> u64 { u64::from_le_bytes(self.prev_log_term) }
-    #[inline] pub fn leader_commit(&self) -> u64 { u64::from_le_bytes(self.leader_commit) }
-    #[inline] pub fn leader_hlc(&self) -> u64 { u64::from_le_bytes(self.leader_hlc) }
-    #[inline] pub fn entry_count(&self) -> u32 { u32::from_le_bytes(self.entry_count) }
+    #[inline]
+    pub fn term(&self) -> u64 {
+        u64::from_le_bytes(self.term)
+    }
+    #[inline]
+    pub fn leader_id(&self) -> u16 {
+        u16::from_le_bytes(self.leader_id)
+    }
+    #[inline]
+    pub fn prev_log_index(&self) -> u64 {
+        u64::from_le_bytes(self.prev_log_index)
+    }
+    #[inline]
+    pub fn prev_log_term(&self) -> u64 {
+        u64::from_le_bytes(self.prev_log_term)
+    }
+    #[inline]
+    pub fn leader_commit(&self) -> u64 {
+        u64::from_le_bytes(self.leader_commit)
+    }
+    #[inline]
+    pub fn leader_hlc(&self) -> u64 {
+        u64::from_le_bytes(self.leader_hlc)
+    }
+    #[inline]
+    pub fn entry_count(&self) -> u32 {
+        u32::from_le_bytes(self.entry_count)
+    }
 }
 
 /// Wire header for `AppendEntriesResponse` (27 bytes).
@@ -73,11 +94,26 @@ pub struct AppendEntriesResponseWire {
 }
 
 impl AppendEntriesResponseWire {
-    #[inline] pub fn term(&self) -> u64 { u64::from_le_bytes(self.term) }
-    #[inline] pub fn success(&self) -> bool { self.success != 0 }
-    #[inline] pub fn match_index(&self) -> u64 { u64::from_le_bytes(self.match_index) }
-    #[inline] pub fn follower_hlc(&self) -> u64 { u64::from_le_bytes(self.follower_hlc) }
-    #[inline] pub fn follower_id(&self) -> u16 { u16::from_le_bytes(self.follower_id) }
+    #[inline]
+    pub fn term(&self) -> u64 {
+        u64::from_le_bytes(self.term)
+    }
+    #[inline]
+    pub fn success(&self) -> bool {
+        self.success != 0
+    }
+    #[inline]
+    pub fn match_index(&self) -> u64 {
+        u64::from_le_bytes(self.match_index)
+    }
+    #[inline]
+    pub fn follower_hlc(&self) -> u64 {
+        u64::from_le_bytes(self.follower_hlc)
+    }
+    #[inline]
+    pub fn follower_id(&self) -> u16 {
+        u16::from_le_bytes(self.follower_id)
+    }
 }
 
 /// Wire format for vote/pre-vote requests (26 bytes).
@@ -93,10 +129,22 @@ pub struct VoteRequestWire {
 }
 
 impl VoteRequestWire {
-    #[inline] pub fn term(&self) -> u64 { u64::from_le_bytes(self.term) }
-    #[inline] pub fn candidate_id(&self) -> u16 { u16::from_le_bytes(self.candidate_id) }
-    #[inline] pub fn last_log_index(&self) -> u64 { u64::from_le_bytes(self.last_log_index) }
-    #[inline] pub fn last_log_term(&self) -> u64 { u64::from_le_bytes(self.last_log_term) }
+    #[inline]
+    pub fn term(&self) -> u64 {
+        u64::from_le_bytes(self.term)
+    }
+    #[inline]
+    pub fn candidate_id(&self) -> u16 {
+        u16::from_le_bytes(self.candidate_id)
+    }
+    #[inline]
+    pub fn last_log_index(&self) -> u64 {
+        u64::from_le_bytes(self.last_log_index)
+    }
+    #[inline]
+    pub fn last_log_term(&self) -> u64 {
+        u64::from_le_bytes(self.last_log_term)
+    }
 }
 
 /// Wire format for vote/pre-vote responses (9 bytes).
@@ -110,8 +158,14 @@ pub struct VoteResponseWire {
 }
 
 impl VoteResponseWire {
-    #[inline] pub fn term(&self) -> u64 { u64::from_le_bytes(self.term) }
-    #[inline] pub fn granted(&self) -> bool { self.granted != 0 }
+    #[inline]
+    pub fn term(&self) -> u64 {
+        u64::from_le_bytes(self.term)
+    }
+    #[inline]
+    pub fn granted(&self) -> bool {
+        self.granted != 0
+    }
 }
 
 /// Wire format for `ReplicationAck` (15 bytes).
@@ -127,10 +181,22 @@ pub struct ReplicationAckWire {
 }
 
 impl ReplicationAckWire {
-    #[inline] pub fn topic_id(&self) -> u32 { u32::from_le_bytes(self.topic_id) }
-    #[inline] pub fn confirmed_offset(&self) -> u64 { u64::from_le_bytes(self.confirmed_offset) }
-    #[inline] pub fn status(&self) -> u8 { self.status }
-    #[inline] pub fn node_id(&self) -> u16 { u16::from_le_bytes(self.node_id) }
+    #[inline]
+    pub fn topic_id(&self) -> u32 {
+        u32::from_le_bytes(self.topic_id)
+    }
+    #[inline]
+    pub fn confirmed_offset(&self) -> u64 {
+        u64::from_le_bytes(self.confirmed_offset)
+    }
+    #[inline]
+    pub fn status(&self) -> u8 {
+        self.status
+    }
+    #[inline]
+    pub fn node_id(&self) -> u16 {
+        u16::from_le_bytes(self.node_id)
+    }
 }
 
 /// Wire header for `InstallSnapshotResponse` (16 bytes).
@@ -144,8 +210,14 @@ pub struct InstallSnapshotResponseWire {
 }
 
 impl InstallSnapshotResponseWire {
-    #[inline] pub fn term(&self) -> u64 { u64::from_le_bytes(self.term) }
-    #[inline] pub fn bytes_stored(&self) -> u64 { u64::from_le_bytes(self.bytes_stored) }
+    #[inline]
+    pub fn term(&self) -> u64 {
+        u64::from_le_bytes(self.term)
+    }
+    #[inline]
+    pub fn bytes_stored(&self) -> u64 {
+        u64::from_le_bytes(self.bytes_stored)
+    }
 }
 
 /// Wire header for `TimeoutNowRequest` (10 bytes).
@@ -159,8 +231,14 @@ pub struct TimeoutNowRequestWire {
 }
 
 impl TimeoutNowRequestWire {
-    #[inline] pub fn term(&self) -> u64 { u64::from_le_bytes(self.term) }
-    #[inline] pub fn leader_id(&self) -> u16 { u16::from_le_bytes(self.leader_id) }
+    #[inline]
+    pub fn term(&self) -> u64 {
+        u64::from_le_bytes(self.term)
+    }
+    #[inline]
+    pub fn leader_id(&self) -> u16 {
+        u16::from_le_bytes(self.leader_id)
+    }
 }
 
 /// Entry type for Raft log entries.
@@ -930,7 +1008,9 @@ impl ReplicationCodec {
             MessageType::PreVoteResponse => Self::decode_pre_vote_response(&payload),
             MessageType::VoteRequest => Self::decode_vote_request(&payload),
             MessageType::VoteResponse => Self::decode_vote_response(&payload),
-            MessageType::InstallSnapshotResponse => Self::decode_install_snapshot_response(&payload),
+            MessageType::InstallSnapshotResponse => {
+                Self::decode_install_snapshot_response(&payload)
+            },
             MessageType::TimeoutNowRequest => Self::decode_timeout_now_request(&payload),
             MessageType::TimeoutNowResponse => Self::decode_timeout_now_response(&payload),
         }

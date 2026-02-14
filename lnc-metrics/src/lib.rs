@@ -125,6 +125,13 @@ pub static REPLICATION_LAG_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static REPLICATION_LAST_SYNC_MS: AtomicU64 = AtomicU64::new(0);
 pub static REPLICATION_PENDING_OPS: AtomicU64 = AtomicU64::new(0);
 
+// Resync protocol metrics (§18.8 Follower Resync)
+pub static RESYNC_STARTED: AtomicU64 = AtomicU64::new(0);
+pub static RESYNC_COMPLETED: AtomicU64 = AtomicU64::new(0);
+pub static RESYNC_FAILED: AtomicU64 = AtomicU64::new(0);
+pub static RESYNC_SEGMENTS_TRANSFERRED: AtomicU64 = AtomicU64::new(0);
+pub static RESYNC_BYTES_TRANSFERRED: AtomicU64 = AtomicU64::new(0);
+
 #[inline]
 pub fn increment_records_ingested(count: u64) {
     RECORDS_INGESTED.fetch_add(count, Ordering::Relaxed);
@@ -360,6 +367,38 @@ pub fn decrement_replication_pending_ops() {
     REPLICATION_PENDING_OPS.fetch_sub(1, Ordering::Relaxed);
 }
 
+// Resync protocol metric functions (§18.8)
+
+/// Increment resync sessions started counter.
+#[inline]
+pub fn increment_resync_started() {
+    RESYNC_STARTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment resync sessions completed successfully.
+#[inline]
+pub fn increment_resync_completed() {
+    RESYNC_COMPLETED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment resync sessions that failed.
+#[inline]
+pub fn increment_resync_failed() {
+    RESYNC_FAILED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment segments transferred during resync.
+#[inline]
+pub fn increment_resync_segments_transferred(count: u64) {
+    RESYNC_SEGMENTS_TRANSFERRED.fetch_add(count, Ordering::Relaxed);
+}
+
+/// Increment bytes transferred during resync.
+#[inline]
+pub fn increment_resync_bytes_transferred(bytes: u64) {
+    RESYNC_BYTES_TRANSFERRED.fetch_add(bytes, Ordering::Relaxed);
+}
+
 pub struct MetricsSnapshot {
     pub records_ingested: u64,
     pub bytes_ingested: u64,
@@ -403,6 +442,12 @@ pub struct MetricsSnapshot {
     pub replication_lag_bytes: u64,
     pub replication_last_sync_ms: u64,
     pub replication_pending_ops: u64,
+    // Resync protocol metrics
+    pub resync_started: u64,
+    pub resync_completed: u64,
+    pub resync_failed: u64,
+    pub resync_segments_transferred: u64,
+    pub resync_bytes_transferred: u64,
 }
 
 impl MetricsSnapshot {
@@ -451,6 +496,12 @@ impl MetricsSnapshot {
             replication_lag_bytes: REPLICATION_LAG_BYTES.load(Ordering::Relaxed),
             replication_last_sync_ms: REPLICATION_LAST_SYNC_MS.load(Ordering::Relaxed),
             replication_pending_ops: REPLICATION_PENDING_OPS.load(Ordering::Relaxed),
+            // Resync protocol metrics
+            resync_started: RESYNC_STARTED.load(Ordering::Relaxed),
+            resync_completed: RESYNC_COMPLETED.load(Ordering::Relaxed),
+            resync_failed: RESYNC_FAILED.load(Ordering::Relaxed),
+            resync_segments_transferred: RESYNC_SEGMENTS_TRANSFERRED.load(Ordering::Relaxed),
+            resync_bytes_transferred: RESYNC_BYTES_TRANSFERRED.load(Ordering::Relaxed),
         }
     }
 }
@@ -708,6 +759,15 @@ pub fn export_to_prometheus() {
     metrics::gauge!("lance_replication_lag_bytes").set(snapshot.replication_lag_bytes as f64);
     metrics::gauge!("lance_replication_last_sync_ms").set(snapshot.replication_last_sync_ms as f64);
     metrics::gauge!("lance_replication_pending_ops").set(snapshot.replication_pending_ops as f64);
+
+    // Resync protocol metrics
+    metrics::counter!("lance_resync_started_total").absolute(snapshot.resync_started);
+    metrics::counter!("lance_resync_completed_total").absolute(snapshot.resync_completed);
+    metrics::counter!("lance_resync_failed_total").absolute(snapshot.resync_failed);
+    metrics::counter!("lance_resync_segments_transferred_total")
+        .absolute(snapshot.resync_segments_transferred);
+    metrics::counter!("lance_resync_bytes_transferred_total")
+        .absolute(snapshot.resync_bytes_transferred);
 
     // ==========================================================================
     // 4 GOLDEN SIGNALS EXPORT

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
-use tracing::{debug, info, trace, warn};
+use tracing::{info, trace, warn};
 
 /// Segment file metadata for retention decisions
 #[derive(Debug, Clone)]

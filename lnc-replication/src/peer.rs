@@ -734,9 +734,7 @@ impl PeerManager {
     /// This eliminates the N× compression overhead identified in the 10X
     /// audit (§10.2): with 5 followers, the old path spent 5× CPU cycles
     /// compressing identical bytes. Now we compress once and fan-out.
-    pub fn prepare_wire_frame(
-        msg: &ReplicationMessage,
-    ) -> Result<Arc<[u8]>, std::io::Error> {
+    pub fn prepare_wire_frame(msg: &ReplicationMessage) -> Result<Arc<[u8]>, std::io::Error> {
         let mut codec = ReplicationCodec::new();
         let encoded = codec
             .encode(msg)

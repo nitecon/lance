@@ -18,10 +18,14 @@ use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 
+/// Zero-copy range result: a contiguous `Bytes` buffer paired with `(offset, len)` slices.
+pub type RangeReadResult = (Bytes, Vec<(usize, usize)>);
+
 /// Metadata for a log entry within a segment
 #[derive(Debug, Clone, Copy)]
 pub struct EntryIndex {
     /// Entry term
+    #[allow(dead_code)]
     pub term: u64,
     /// File offset where entry starts (relative to segment file)
     pub offset: u64,
@@ -62,14 +66,13 @@ impl Segment {
 
         let write_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;
 
         // Separate read handle to avoid seeking contention
-        let read_handle = OpenOptions::new()
-            .read(true)
-            .open(&path)?;
+        let read_handle = OpenOptions::new().read(true).open(&path)?;
 
         info!(
             target: "lance::raft::segment",
@@ -185,7 +188,8 @@ impl Segment {
 
             let old_path = self.path.clone();
             let filename = format!("{:06}_{}-{}.lnc", self.start_index, self.start_ts, end_ts);
-            let new_path = old_path.parent()
+            let new_path = old_path
+                .parent()
                 .ok_or_else(|| LanceError::Protocol("Invalid segment path".into()))?
                 .join(filename);
 
@@ -214,7 +218,9 @@ impl Segment {
     /// **Durability**: Does NOT sync to disk. Call persist() to ensure durability.
     pub fn append(&mut self, entry: &LogEntry, entry_bytes: &[u8]) -> Result<()> {
         if !self.is_active {
-            return Err(LanceError::Protocol("Cannot append to sealed segment".into()));
+            return Err(LanceError::Protocol(
+                "Cannot append to sealed segment".into(),
+            ));
         }
 
         let offset = self.file_size;
@@ -274,7 +280,7 @@ impl Segment {
     /// **Zero-Copy Optimization**: Returns Bytes instead of Vec<Vec<u8>> to avoid allocation storm.
     /// For 1000 entries, this eliminates 1000 heap allocations.
     #[cfg(unix)]
-    pub fn read_range(&self, start_offset: usize, end_offset: usize) -> Result<(Bytes, Vec<(usize, usize)>)> {
+    pub fn read_range(&self, start_offset: usize, end_offset: usize) -> Result<RangeReadResult> {
         if start_offset > end_offset || end_offset >= self.index.len() {
             return Err(LanceError::Protocol("Invalid range".into()));
         }
@@ -304,7 +310,7 @@ impl Segment {
     }
 
     #[cfg(windows)]
-    pub fn read_range(&self, start_offset: usize, end_offset: usize) -> Result<(Bytes, Vec<(usize, usize)>)> {
+    pub fn read_range(&self, start_offset: usize, end_offset: usize) -> Result<RangeReadResult> {
         if start_offset > end_offset || end_offset >= self.index.len() {
             return Err(LanceError::Protocol("Invalid range".into()));
         }
@@ -345,12 +351,6 @@ impl Segment {
         Ok(())
     }
 
-    /// Get term at local offset
-    #[inline]
-    pub fn term_at(&self, local_offset: usize) -> Option<u64> {
-        self.index.get(local_offset).map(|meta| meta.term)
-    }
-
     /// Validate the very last entry in an active segment
     ///
     /// **Critical for rsync**: Nodes seeded via rsync may have torn writes.
@@ -385,7 +385,7 @@ impl Segment {
                 self.truncate_at(truncate_offset)?;
                 self.index.pop(); // Remove corrupted entry from index
                 Ok(())
-            }
+            },
         }
     }
 
@@ -402,7 +402,11 @@ impl Segment {
         }
 
         // Validate header CRC
-        let stored_header_crc = u32::from_le_bytes(buf[29..33].try_into().unwrap());
+        let stored_header_crc = u32::from_le_bytes(
+            buf[29..33]
+                .try_into()
+                .map_err(|_| LanceError::Protocol("Invalid header CRC slice".into()))?,
+        );
         let mut hasher = Hasher::new();
         hasher.update(&buf[0..29]);
         let calculated_header_crc = hasher.finalize();
@@ -412,7 +416,11 @@ impl Segment {
         }
 
         // Parse data_len from validated header
-        let data_len = u32::from_le_bytes(buf[25..29].try_into().unwrap()) as usize;
+        let data_len = u32::from_le_bytes(
+            buf[25..29]
+                .try_into()
+                .map_err(|_| LanceError::Protocol("Invalid data_len slice".into()))?,
+        ) as usize;
         let expected_len = ENTRY_HEADER_SIZE + HEADER_CRC_SIZE + data_len + DATA_CRC_SIZE;
 
         if buf.len() != expected_len {
@@ -424,7 +432,11 @@ impl Segment {
         let data_end = data_start + data_len;
         let data = &buf[data_start..data_end];
 
-        let stored_data_crc = u32::from_le_bytes(buf[data_end..data_end + 4].try_into().unwrap());
+        let stored_data_crc = u32::from_le_bytes(
+            buf[data_end..data_end + 4]
+                .try_into()
+                .map_err(|_| LanceError::Protocol("Invalid data CRC slice".into()))?,
+        );
         let mut hasher = Hasher::new();
         hasher.update(data);
         let calculated_data_crc = hasher.finalize();
@@ -463,13 +475,8 @@ impl Segment {
             }
 
             // Parse header to get data_len
-            let term = u64::from_le_bytes([
-                header[0], header[1], header[2], header[3],
-                header[4], header[5], header[6], header[7],
-            ]);
-            let data_len = u32::from_le_bytes([
-                header[25], header[26], header[27], header[28]
-            ]) as usize;
+            let data_len =
+                u32::from_le_bytes([header[25], header[26], header[27], header[28]]) as usize;
 
             // Read header CRC
             let mut header_crc_bytes = [0u8; 4];
@@ -509,6 +516,12 @@ impl Segment {
                 self.truncate_at(current_offset)?;
                 break;
             }
+
+            // Extract term from header (first 8 bytes)
+            let term = u64::from_le_bytes([
+                header[0], header[1], header[2], header[3], header[4], header[5], header[6],
+                header[7],
+            ]);
 
             // Skip data + data CRC (we don't need to validate data during index rebuild)
             let skip_len = data_len + 4; // data + data_crc
@@ -565,15 +578,12 @@ impl Segment {
 pub struct SegmentConfig {
     /// Maximum entries per segment before creating a new one
     pub max_entries_per_segment: usize,
-    /// Maximum segment size in bytes
-    pub max_segment_size_bytes: usize,
 }
 
 impl Default for SegmentConfig {
     fn default() -> Self {
         Self {
             max_entries_per_segment: 10_000,
-            max_segment_size_bytes: 100 * 1024 * 1024, // 100MB
         }
     }
 }
@@ -611,7 +621,7 @@ impl SegmentManager {
                                 error = %e,
                                 "Failed to open segment file"
                             );
-                        }
+                        },
                     }
                 }
             }
@@ -653,7 +663,10 @@ impl SegmentManager {
             self.active_segment_idx = Some(self.segments.len() - 1);
         }
 
-        Ok(&mut self.segments[self.active_segment_idx.unwrap()])
+        let idx = self
+            .active_segment_idx
+            .ok_or_else(|| LanceError::Protocol("No active segment index".into()))?;
+        Ok(&mut self.segments[idx])
     }
 
     /// Rotate to a new segment if the current one is full
@@ -714,7 +727,7 @@ impl SegmentManager {
     /// Get range of entries (returns single buffer with slice offsets)
     ///
     /// **Zero-Copy**: Returns Bytes buffer with slice offsets to avoid allocation storm.
-    pub fn get_range(&self, start_index: u64, end_index: u64) -> Result<Vec<(Bytes, Vec<(usize, usize)>)>> {
+    pub fn get_range(&self, start_index: u64, end_index: u64) -> Result<Vec<RangeReadResult>> {
         if start_index > end_index {
             return Ok(Vec::new());
         }
@@ -900,6 +913,7 @@ impl SegmentManager {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
@@ -957,7 +971,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = SegmentConfig {
             max_entries_per_segment: 5,
-            max_segment_size_bytes: 100 * 1024 * 1024,
         };
         let mut manager = SegmentManager::open(dir.path(), config).unwrap();
 
@@ -973,7 +986,7 @@ mod tests {
         if let Some(idx) = manager.active_segment_idx {
             for i in 0..5 {
                 manager.segments[idx].index.push(EntryIndex {
-                    term: 1,
+                    term: 0,
                     offset: i * 100,
                     len: 100,
                 });
@@ -1011,21 +1024,21 @@ mod tests {
         // Add mock index entries
         for i in 0..10 {
             manager.segments[0].index.push(EntryIndex {
-                term: 1,
+                term: 0,
                 offset: i * 100,
                 len: 100,
             });
         }
         for i in 0..10 {
             manager.segments[1].index.push(EntryIndex {
-                term: 1,
+                term: 0,
                 offset: i * 100,
                 len: 100,
             });
         }
         for i in 0..10 {
             manager.segments[2].index.push(EntryIndex {
-                term: 1,
+                term: 0,
                 offset: i * 100,
                 len: 100,
             });
@@ -1061,21 +1074,21 @@ mod tests {
         // Add mock entries
         for i in 0..10 {
             manager.segments[0].index.push(EntryIndex {
-                term: 1,
+                term: 0,
                 offset: i * 100,
                 len: 100,
             });
         }
         for i in 0..10 {
             manager.segments[1].index.push(EntryIndex {
-                term: 1,
+                term: 0,
                 offset: i * 100,
                 len: 100,
             });
         }
         for i in 0..10 {
             manager.segments[2].index.push(EntryIndex {
-                term: 1,
+                term: 0,
                 offset: i * 100,
                 len: 100,
             });
@@ -1111,7 +1124,7 @@ mod tests {
         // Add entries to first segment (indices 1-10)
         for i in 0..10 {
             manager.segments[0].index.push(EntryIndex {
-                term: 1,
+                term: 0,
                 offset: i * 100,
                 len: 100,
             });
@@ -1120,7 +1133,7 @@ mod tests {
         // Add entries to second segment (indices 100-109)
         for i in 0..10 {
             manager.segments[1].index.push(EntryIndex {
-                term: 1,
+                term: 0,
                 offset: i * 100,
                 len: 100,
             });

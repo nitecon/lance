@@ -61,6 +61,7 @@ opentelemetry-otlp = "0.27"
 tonic = "0.12"
 tempfile = "3.10"
 rayon = "1.10"
+socket2 = "0.5"
 io-uring = "0.7"
 
 [profile.release]

@@ -309,7 +309,7 @@ impl Config {
             } else {
                 // Try hostname-based ID resolution per Architecture §10.7
                 // e.g., "lance-1.lance-headless:1993" → node_id 1
-                let host = peer_str.rsplit(':').last().unwrap_or(peer_str);
+                let host = peer_str.rsplit(':').next_back().unwrap_or(peer_str);
                 let id = parse_node_id_from_hostname(host).unwrap_or(idx as u16);
                 (id, peer_str.to_string())
             };
@@ -438,7 +438,7 @@ impl Config {
                 // node_id@host:port format — already has explicit ID
                 return false;
             } else {
-                p.rsplit(':').last().unwrap_or(p)
+                p.rsplit(':').next_back().unwrap_or(p)
             };
             // Check if it's NOT a raw IP and HAS a parseable hostname ID
             host.parse::<std::net::IpAddr>().is_err() && parse_node_id_from_hostname(host).is_some()

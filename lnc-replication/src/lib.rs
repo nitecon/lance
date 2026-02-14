@@ -14,6 +14,7 @@ mod mode;
 mod peer;
 mod quorum;
 mod raft;
+mod resync;
 mod segment;
 
 pub mod schema;
@@ -42,3 +43,7 @@ pub use mode::ReplicationMode;
 pub use peer::{PeerConfig, PeerConnection, PeerManager, PeerState};
 pub use quorum::{AsyncQuorumManager, QuorumConfig, QuorumResult};
 pub use raft::{FencingToken, RaftConfig, RaftNode, RaftState};
+pub use resync::{
+    GapAnalysis, ResyncActor, ResyncConfig, ResyncMessageType, ResyncProgress, ResyncServer,
+    ResyncState, SegmentChunk, SegmentDescriptor, SegmentManifest, detect_gap,
+};

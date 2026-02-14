@@ -3,13 +3,13 @@
 //! This module implements server-side write forwarding to support load-balancer
 //! deployments where clients cannot directly connect to the leader.
 
+use crossbeam::queue::ArrayQueue;
+use lnc_network::LwpHeader;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use crossbeam::queue::ArrayQueue;
-use lnc_network::LwpHeader;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock};
@@ -328,13 +328,11 @@ impl LeaderConnectionPool {
                 },
             };
 
-        stream
-            .set_nodelay(true)
-            .map_err(|e| {
-                // set_nodelay failed — release the reserved slot
-                self.total_connections.fetch_sub(1, Ordering::Relaxed);
-                ForwardError::ConnectionFailed(e)
-            })?;
+        stream.set_nodelay(true).map_err(|e| {
+            // set_nodelay failed — release the reserved slot
+            self.total_connections.fetch_sub(1, Ordering::Relaxed);
+            ForwardError::ConnectionFailed(e)
+        })?;
 
         Ok(PooledConnection {
             stream: Some(stream),
@@ -375,7 +373,9 @@ impl LeaderConnectionPool {
     pub fn pool_saturation(&self) -> f64 {
         let current = self.total_connections.load(Ordering::Relaxed) as f64;
         let max = self.config.max_connections as f64;
-        if max == 0.0 { return 0.0; }
+        if max == 0.0 {
+            return 0.0;
+        }
         current / max
     }
 
@@ -546,9 +546,10 @@ impl ForwardBufferPool {
     /// will grow (one-time cost, retained for future uses).
     #[inline]
     pub fn acquire(&self, min_capacity: usize) -> PooledForwardBuffer {
-        let mut buf = self.free_list.pop().unwrap_or_else(|| {
-            Vec::with_capacity(min_capacity.max(self.default_capacity))
-        });
+        let mut buf = self
+            .free_list
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(min_capacity.max(self.default_capacity)));
         buf.clear();
         if buf.capacity() < min_capacity {
             buf.reserve(min_capacity - buf.capacity());
@@ -931,14 +932,17 @@ mod tests {
 
     #[test]
     fn test_forward_config_pool_size_bounds() {
-        let mut config = ForwardConfig::default();
+        let config = ForwardConfig::default();
 
         // Verify reasonable defaults
         assert!(config.pool_size > 0, "Pool size must be positive");
         assert!(config.pool_size <= 64, "Pool size should be reasonable");
 
         // Custom pool size
-        config.pool_size = 16;
+        let config = ForwardConfig {
+            pool_size: 16,
+            ..ForwardConfig::default()
+        };
         let pool = LeaderConnectionPool::new(config);
         assert!(!pool.is_tee_enabled()); // Sanity check
     }
@@ -953,8 +957,10 @@ mod tests {
 
     #[test]
     fn test_pool_saturation_zero_max() {
-        let mut config = ForwardConfig::default();
-        config.max_connections = 0;
+        let config = ForwardConfig {
+            max_connections: 0,
+            ..ForwardConfig::default()
+        };
         let pool = LeaderConnectionPool::new(config);
         // Division by zero guard
         assert_eq!(pool.pool_saturation(), 0.0);

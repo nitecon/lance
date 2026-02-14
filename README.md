@@ -11,6 +11,27 @@
 
 ---
 
+## Why LANCE?
+Lance was born from the limitations of traditional streaming systems (Kafka, NATS, Redpanda) in high-throughput, low-latency environments like HFT, network forensics, and robotics.
+
+While these platforms excel at general-purpose pub/sub, they often falter in three critical areas:
+
+- **Deterministic Replay & Pre-warming:** Standard offset management is often too cumbersome for training statistical models (LSTMs, NNEs) or pre-warming stateful applications. Lance treats stream rewinding as a first-class citizen, ensuring "cold starts" are backed by reliable, precise data baselines.
+- **Client-Side Intelligence:** By offloading offset tracking and state management from the server to the workers, Lance eliminates unnecessary broker overhead and grants consumers more granular control over their data velocity.
+- **Physical Portability:** Built with disaster recovery and multi-region warm-spares in mind, Lance’s storage architecture is file-system friendly. In a catastrophic failure, "warming" a new cluster is as simple as a reliable rsync of the underlying data files.
+
+Modern stream processing systems face a fundamental tension: **throughput vs. latency**. Kafka and its alternatives make trade-offs that become bottlenecks at scale:
+
+| System | Language | Allocation Model | I/O Model | Latency Profile |
+|--------|----------|------------------|-----------|-----------------|
+| Kafka | JVM | GC-managed | epoll + threads | P99 spikes during GC |
+| Redpanda | C++ | Manual | io_uring | Good, but C++ complexity |
+| NATS | Go | GC-managed | goroutines | P99 spikes during GC |
+| **LANCE** | **Rust** | **Zero-copy pools** | **io_uring** | **Deterministic** |
+
+LANCE is designed from the ground up for **100Gbps sustained ingestion** with **sub-microsecond P99 latency**.
+---
+
 ## The Modern Streaming Platform for Cloud-Native Infrastructure
 
 LANCE is built for the realities of modern compute platforms. Whether you're running on **Kubernetes**, bare metal, or hybrid environments, LANCE delivers:
@@ -39,21 +60,6 @@ LANCE clients aren't dumb pipes—they're intelligent participants:
 - **Backpressure-aware** — Clients respond to server signals, preventing cascade failures
 
 The result? **Your servers do less work** while clients self-organize for optimal throughput.
-
----
-
-## Why LANCE?
-
-Modern stream processing systems face a fundamental tension: **throughput vs. latency**. Kafka and its alternatives make trade-offs that become bottlenecks at scale:
-
-| System | Language | Allocation Model | I/O Model | Latency Profile |
-|--------|----------|------------------|-----------|-----------------|
-| Kafka | JVM | GC-managed | epoll + threads | P99 spikes during GC |
-| Redpanda | C++ | Manual | io_uring | Good, but C++ complexity |
-| NATS | Go | GC-managed | goroutines | P99 spikes during GC |
-| **LANCE** | **Rust** | **Zero-copy pools** | **io_uring** | **Deterministic** |
-
-LANCE is designed from the ground up for **100Gbps sustained ingestion** with **sub-microsecond P99 latency**.
 
 ---
 

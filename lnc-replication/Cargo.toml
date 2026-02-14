@@ -21,8 +21,10 @@ flatbuffers = { workspace = true }
 bytes = { workspace = true }
 crossbeam = { workspace = true }
 crc32fast = "1.4"
+lnc-recovery = { workspace = true }
 rayon = { workspace = true }
 zerocopy = { workspace = true }
+socket2 = { workspace = true }
 tokio-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", optional = true }
 

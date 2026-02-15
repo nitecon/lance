@@ -743,15 +743,17 @@ async fn run_endpoint_test(cfg: EndpointTestConfig) -> EndpointReport {
     ));
 
     // Spawn K8s roller if statefulset is configured
-    let roller_handle = cfg.statefulset.clone().map(|ss| {
-        tokio::spawn(k8s_roller_task(
-            label_owned.clone(),
-            cfg.namespace,
-            ss,
-            cfg.warmup_secs,
-            stats.clone(),
-        ))
-    });
+    // DISABLED: User will manually perform k8s restarts for testing
+    // let roller_handle = cfg.statefulset.clone().map(|ss| {
+    //     tokio::spawn(k8s_roller_task(
+    //         label_owned.clone(),
+    //         cfg.namespace,
+    //         ss,
+    //         cfg.warmup_secs,
+    //         stats.clone(),
+    //     ))
+    // });
+    let roller_handle: Option<tokio::task::JoinHandle<String>> = None;
 
     // Two-phase shutdown:
     //   Phase 1: stop the producer (no more new messages)

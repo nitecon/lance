@@ -6,6 +6,7 @@ use crate::topic::TopicRegistry;
 use bytes::Bytes;
 use lnc_core::{BatchPool, LanceError, Result, SortKey};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
@@ -381,12 +382,10 @@ pub fn write_replicated_data_enriched(
         );
     }
 
-    // Get the writer for this topic (must exist after NEW_SEGMENT or prior init)
-    let topic_writer = match topic_writers.get_mut(&topic_id) {
-        Some(tw) => tw,
-        None => {
-            // No writer and no NEW_SEGMENT flag — the follower may be behind.
-            // Create a writer with the leader-dictated segment name
+    // Use Entry API to handle initialization atomically without double-lookup
+    let topic_writer = match topic_writers.entry(topic_id) {
+        Entry::Occupied(o) => o.into_mut(),
+        Entry::Vacant(v) => {
             tracing::warn!(
                 target: "lance::ingestion",
                 topic_id,
@@ -394,9 +393,8 @@ pub fn write_replicated_data_enriched(
                 "No active writer for topic, opening or creating segment from leader name"
             );
 
-            // Try to open existing segment first, create only if it doesn't exist
             let segment_path = topic_dir.join(&entry.segment_name);
-            let writer = if segment_path.exists() {
+            let mut writer = if segment_path.exists() {
                 tracing::debug!(
                     target: "lance::ingestion",
                     topic_id,
@@ -414,17 +412,28 @@ pub fn write_replicated_data_enriched(
                 lnc_io::SegmentWriter::create_named(&topic_dir, &entry.segment_name)?
             };
 
+            // ── CRITICAL FIX ──────────────────────────────────────────────
+            // Truncate BEFORE insertion to prevent the "append-error-retry" loop.
+            // This ensures the writer is in a valid state before being cached.
+            let current_offset = writer.write_offset();
+            if !entry.payload.is_empty() && entry.write_offset < current_offset {
+                tracing::warn!(
+                    target: "lance::ingestion",
+                    topic_id,
+                    segment = %entry.segment_name,
+                    current_offset,
+                    leader_offset = entry.write_offset,
+                    "Raft conflict detected on segment open, rewinding to match Raft log"
+                );
+                writer.truncate_to_offset(entry.write_offset)?;
+            }
+            // ──────────────────────────────────────────────────────────────
+
             let index_builder = lnc_index::IndexBuilder::with_defaults();
-            topic_writers.insert(
-                topic_id,
-                TopicWriter {
-                    writer,
-                    index_builder,
-                },
-            );
-            topic_writers
-                .get_mut(&topic_id)
-                .ok_or_else(|| LanceError::Protocol("Failed to get topic writer".into()))?
+            v.insert(TopicWriter {
+                writer,
+                index_builder,
+            })
         },
     };
 

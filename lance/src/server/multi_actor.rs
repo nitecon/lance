@@ -463,7 +463,9 @@ fn flush_and_signal_sync(
         }
 
         if let Some(tx) = replication_tx {
-            let _ = tx.try_send(DataReplicationRequest {
+            // Block thread until space available in replication channel
+            // This prevents silent drops that cause quorum timeouts
+            if let Err(_e) = tx.blocking_send(DataReplicationRequest {
                 topic_id: s.topic_id,
                 payload: s.payload,
                 segment_name: s.meta.segment_name,
@@ -472,7 +474,9 @@ fn flush_and_signal_sync(
                 is_new_segment: s.meta.is_new_segment,
                 rotated_after: s.meta.rotated_after,
                 write_id: s.write_id,
-            });
+            }) {
+                tracing::error!(target: "lance::ingestion", "Replication channel closed");
+            }
         }
     }
 }

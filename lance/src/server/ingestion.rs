@@ -128,7 +128,8 @@ pub async fn run_ingestion_actor(
                         &mut pending_signals,
                         &replication_tx,
                         &mut wal,
-                    );
+                    )
+                    .await;
                     if let Some(ref mut w) = wal {
                         if let Err(e) = w.reset() {
                             tracing::error!(
@@ -223,7 +224,8 @@ pub async fn run_ingestion_actor(
                 &mut pending_signals,
                 &replication_tx,
                 &mut wal,
-            );
+            )
+            .await;
             // Recycle WAL after segments are durable
             if let Some(ref mut w) = wal {
                 if let Err(e) = w.reset() {
@@ -246,7 +248,8 @@ pub async fn run_ingestion_actor(
             &mut pending_signals,
             &replication_tx,
             &mut wal,
-        );
+        )
+        .await;
         if let Some(ref mut w) = wal {
             if let Err(e) = w.reset() {
                 tracing::error!(
@@ -536,7 +539,7 @@ struct BatchSuccess {
 /// This is the single point where data becomes durable and ACKs are
 /// released.  Called when the flush threshold is reached, the timeout
 /// fires, or the actor is shutting down.
-fn flush_and_signal(
+async fn flush_and_signal(
     topic_writers: &mut HashMap<u32, TopicWriter>,
     dirty_topics: &mut std::collections::HashSet<u32>,
     pending_signals: &mut Vec<BatchSuccess>,
@@ -575,16 +578,23 @@ fn flush_and_signal(
         }
 
         if let Some(tx) = replication_tx {
-            let _ = tx.try_send(DataReplicationRequest {
-                topic_id: s.topic_id,
-                payload: s.payload,
-                segment_name: s.meta.segment_name,
-                write_offset: s.meta.write_offset,
-                global_offset: s.meta.write_offset + s.payload_len as u64,
-                is_new_segment: s.meta.is_new_segment,
-                rotated_after: s.meta.rotated_after,
-                write_id: s.write_id,
-            });
+            // Apply backpressure if replication channel is full
+            // This prevents silent drops that cause quorum timeouts
+            if let Err(_e) = tx
+                .send(DataReplicationRequest {
+                    topic_id: s.topic_id,
+                    payload: s.payload,
+                    segment_name: s.meta.segment_name,
+                    write_offset: s.meta.write_offset,
+                    global_offset: s.meta.write_offset + s.payload_len as u64,
+                    is_new_segment: s.meta.is_new_segment,
+                    rotated_after: s.meta.rotated_after,
+                    write_id: s.write_id,
+                })
+                .await
+            {
+                tracing::error!(target: "lance::ingestion", "Replication channel closed");
+            }
         }
     }
 }

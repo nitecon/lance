@@ -163,14 +163,23 @@ impl ClusterCoordinator {
 
         let mut raft = RaftNode::new(config.node_id, raft_cluster_config, raft_config);
 
-        // Restore persistent state if available
+        // Restore persistent state if available, including log position from LogStore
         if persistent_state.current_term > 0 {
-            raft.restore_state(persistent_state.current_term, persistent_state.voted_for);
+            let last_log_index = log_store.last_index();
+            let last_log_term = log_store.last_term();
+            raft.restore_state(
+                persistent_state.current_term,
+                persistent_state.voted_for,
+                last_log_index,
+                last_log_term,
+            );
             info!(
                 target: "lance::cluster",
                 term = persistent_state.current_term,
                 voted_for = ?persistent_state.voted_for,
-                "Restored Raft state from disk"
+                last_log_index,
+                last_log_term,
+                "Restored Raft state from disk with log position"
             );
         }
 
@@ -1606,7 +1615,13 @@ async fn handle_peer_connection(
                 // Update term if needed
                 if req.term > current_term {
                     let mut raft_guard = raft.write().await;
-                    raft_guard.restore_state(req.term, None);
+                    // Use snapshot's last_included_index/term as the log position
+                    raft_guard.restore_state(
+                        req.term,
+                        None,
+                        req.last_included_index,
+                        req.last_included_term,
+                    );
                 }
 
                 // Apply snapshot to log store

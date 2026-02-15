@@ -1819,7 +1819,7 @@ impl AsyncIoBackend for AsyncIoUringBackend {
                 self.in_flight.remove(&batch_id);
                 return Err(LanceError::Io(std::io::Error::other("SQ full")));
             }
-            
+
             // OPTIMIZATION: Only syscall if the SQPOLL thread needs waking up
             // Most of the time this branch is NOT taken (zero-syscall fast path)
             if ring.submission().need_wakeup() {

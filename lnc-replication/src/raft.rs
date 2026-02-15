@@ -184,9 +184,22 @@ impl RaftNode {
     /// Restore persistent state after crash recovery (Raft §5.2)
     ///
     /// This must be called before the node participates in elections.
-    pub fn restore_state(&mut self, term: u64, voted_for: Option<u16>) {
+    ///
+    /// **Best Practice**: Query the LogStore for `last_log_index` and `last_log_term`
+    /// on startup to initialize the node with the correct log position. Without this,
+    /// the node starts at index 0 and relies on the first heartbeat to catch up,
+    /// which can cause temporary inconsistencies during leader election.
+    pub fn restore_state(
+        &mut self,
+        term: u64,
+        voted_for: Option<u16>,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) {
         self.current_term = term;
         self.voted_for = voted_for;
+        self.last_log_index = last_log_index;
+        self.last_log_term = last_log_term;
     }
 
     /// Get the current state.
@@ -517,16 +530,19 @@ impl RaftNode {
             self.state = RaftState::Follower;
         }
 
-        // Advance log index for data entries received from leader.
-        // This tracks replication progress so elections (§5.4.1) pick
-        // the follower with the most up-to-date log.
-        let data_entries = req
-            .entries
-            .iter()
-            .filter(|e| e.entry_type == crate::codec::EntryType::Data)
-            .count() as u64;
-        if data_entries > 0 {
-            self.advance_log(data_entries);
+        // Advance log index based on the actual entries received.
+        // CRITICAL FIX: We must update last_log_index for ALL entry types (NoOp, TopicOp,
+        // ConfigChange, Data), not just Data. The previous filter caused followers to ignore
+        // NoOp entries (sent by leaders on election to seal the term), making match_index
+        // permanently stuck at 1. This caused the leader to believe followers were behind,
+        // triggering infinite retries and memory leaks in AsyncQuorumManager.
+        //
+        // The LogStore has already persisted these entries, so the in-memory state must
+        // reflect reality. Elections (§5.4.1) require accurate log indices to pick the
+        // follower with the most up-to-date log.
+        if let Some(last_entry) = req.entries.last() {
+            self.last_log_index = last_entry.index;
+            self.last_log_term = last_entry.term;
         }
 
         let success = true;
@@ -1212,5 +1228,68 @@ mod tests {
         assert!(!resp.vote_granted);
         // Term should NOT be updated (pre-vote protection)
         assert_eq!(node.current_term, 0);
+    }
+
+    /// Regression test for the "NoOp visibility" bug.
+    ///
+    /// **Bug**: Followers were filtering `handle_append_entries` to only advance
+    /// `last_log_index` for `EntryType::Data`, ignoring NoOp/TopicOp/ConfigChange.
+    /// This caused `match_index` to stay stuck at 1 after the leader sent a NoOp
+    /// entry on election (to seal the term), triggering infinite retries and
+    /// memory leaks in `AsyncQuorumManager`.
+    ///
+    /// **Fix**: `handle_append_entries` now advances `last_log_index` based on
+    /// the last entry in the batch, regardless of entry type.
+    ///
+    /// This test ensures the bug never recurs by simulating a Leader sending a
+    /// NoOp entry and asserting that the Follower correctly advances its index.
+    #[test]
+    fn test_follower_advances_index_on_noop() {
+        let config = test_config();
+        let mut node = RaftNode::new(1, config, RaftConfig::default());
+
+        // 1. Establish baseline: Follower at term 1, log index 10
+        node.current_term = 1;
+        node.state = RaftState::Follower;
+        node.last_log_index = 10;
+        node.last_log_term = 1;
+
+        // 2. Simulate Leader (ID 2) sending a NoOp entry (EntryType::Noop)
+        // Leader is at index 10, sending entry 11 to seal the term.
+        let noop_entry = crate::codec::LogEntry {
+            term: 1,
+            index: 11,
+            hlc: lnc_core::HlcTimestamp::new(1000, 0),
+            entry_type: crate::codec::EntryType::Noop, // <--- The crucial part
+            data: bytes::Bytes::new(),
+        };
+
+        let req = AppendEntriesRequest {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 10, // Matching previous index
+            prev_log_term: 1,
+            leader_commit: 10,
+            leader_hlc: lnc_core::HlcTimestamp::new(1000, 0),
+            entries: vec![noop_entry],
+        };
+
+        // 3. Handle request
+        let resp = node.handle_append_entries(&req);
+
+        // 4. Assertions
+        assert!(resp.success, "Follower should accept valid NoOp");
+        assert_eq!(
+            resp.match_index, 11,
+            "match_index must advance for NoOp (was stuck at 1 in the bug)"
+        );
+        assert_eq!(
+            node.last_log_index, 11,
+            "Internal log index must advance for NoOp"
+        );
+        assert_eq!(
+            node.last_log_term, 1,
+            "Last log term should be updated from NoOp entry"
+        );
     }
 }

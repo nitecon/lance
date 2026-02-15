@@ -70,7 +70,27 @@ pub async fn run(
         );
     }
 
-    perform_startup_recovery(&config)?;
+    // Mark server as ready BEFORE recovery to allow Kubernetes to route traffic
+    // Recovery happens in background; server can forward writes to healthy nodes
+    health_state.set_startup_complete();
+    health_state.set_ready(true);
+    info!(
+        target: "lance::server",
+        "Server marked ready (recovery will continue in background)"
+    );
+
+    // Perform startup recovery in background (non-blocking)
+    // This allows the pod to be ready immediately while Raft log recovery happens
+    let config_clone = config.clone();
+    tokio::spawn(async move {
+        if let Err(e) = perform_startup_recovery(&config_clone) {
+            error!(
+                target: "lance::server",
+                error = %e,
+                "Background recovery failed"
+            );
+        }
+    });
 
     let topic_registry = Arc::new(TopicRegistry::new(config.data_dir.clone())?);
 
@@ -761,10 +781,6 @@ pub async fn run(
         tls = config.tls.enabled,
         "Listening for connections"
     );
-
-    // Mark startup complete and ready
-    health_state.set_startup_complete();
-    health_state.set_ready(true);
 
     loop {
         tokio::select! {

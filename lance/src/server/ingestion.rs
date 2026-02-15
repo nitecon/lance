@@ -450,6 +450,28 @@ pub fn write_replicated_data_enriched(
         }
     }
 
+    // Check for Raft conflict even with cached writer (leader may have rolled back)
+    if !entry.payload.is_empty() {
+        let current_offset = topic_writer.writer.write_offset();
+        if entry.write_offset < current_offset {
+            tracing::warn!(
+                target: "lance::ingestion",
+                topic_id,
+                segment = %entry.segment_name,
+                current_offset,
+                leader_offset = entry.write_offset,
+                "Raft conflict detected on cached writer, rewinding to match Raft log"
+            );
+            // Truncate segment file to match leader's offset
+            topic_writer.writer.truncate_to_offset(entry.write_offset)?;
+
+            // SAFETY: Clear in-memory index to prevent corruption from ghost entries
+            // The index builder may contain entries for offsets we just truncated.
+            // Clearing ensures the .idx file won't have invalid pointers on rotation.
+            topic_writer.index_builder.clear();
+        }
+    }
+
     // Write at the exact offset the leader specifies
     if !entry.payload.is_empty() {
         topic_writer

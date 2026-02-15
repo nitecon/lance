@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 
 /// Health state shared across the server
 #[derive(Debug)]
@@ -187,13 +187,25 @@ async fn handle_request(
         _ => json_response(StatusCode::NOT_FOUND, r#"{"error":"not_found"}"#),
     };
 
-    debug!(
-        target: "lance::health",
-        method = %req.method(),
-        path = %req.uri().path(),
-        status = %response.status(),
-        "Health check"
-    );
+    // Log /health/live and /health/ready at trace level to reduce noise from k8s probes
+    let path = req.uri().path();
+    if path == "/health/live" || path == "/health/ready" {
+        trace!(
+            target: "lance::health",
+            method = %req.method(),
+            path = %path,
+            status = %response.status(),
+            "Health check"
+        );
+    } else {
+        debug!(
+            target: "lance::health",
+            method = %req.method(),
+            path = %path,
+            status = %response.status(),
+            "Health check"
+        );
+    }
 
     Ok(response)
 }

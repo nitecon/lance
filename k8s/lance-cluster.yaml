@@ -93,21 +93,25 @@ spec:
         - containerPort: 8080
           name: health
         livenessProbe:
-          tcpSocket:
-            port: 1992
-          initialDelaySeconds: 15
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 5
           periodSeconds: 10
+          failureThreshold: 3
         readinessProbe:
-          tcpSocket:
-            port: 1992
-          initialDelaySeconds: 10
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 3
           periodSeconds: 5
+          failureThreshold: 2
         resources:
           requests:
             memory: "512Mi"
             cpu: "100m"
           limits:
-            memory: "2Gi"
+            memory: "16Gi"
             cpu: "500m"
         volumeMounts:
         - name: data

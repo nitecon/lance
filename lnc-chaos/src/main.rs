@@ -581,19 +581,23 @@ async fn reporter_task(label: String, report_interval: u64, stats: Arc<Stats>) {
 struct EndpointTestConfig {
     label: String,
     endpoint: String,
+    #[allow(dead_code)]
     statefulset: Option<String>,
+    #[allow(dead_code)]
     namespace: String,
     topic: String,
     rate: u64,
     payload_size: usize,
     max_fetch_bytes: u32,
     report_interval: u64,
+    #[allow(dead_code)]
     warmup_secs: u64,
     clean: bool,
     total_duration: u64,
 }
 
 /// K8s roller task: waits for warmup, then executes kubectl rollout restart.
+#[allow(dead_code)]
 async fn k8s_roller_task(
     label: String,
     namespace: String,
@@ -854,6 +858,7 @@ async fn run_endpoint_test(cfg: EndpointTestConfig) -> EndpointReport {
 
 /// Tear down all K8s infrastructure (statefulsets + PVCs), then recreate from manifests.
 /// Guarantees fresh PVCs with no stale segment data between test runs.
+#[allow(dead_code)]
 async fn reset_infrastructure(
     namespace: &str,
     statefulsets: &[String],
@@ -1153,13 +1158,17 @@ async fn main() {
     }
 
     // Infrastructure reset: when --clean + manifests provided, tear down and recreate
+    // DISABLED: User will manually manage k8s infrastructure
+    // if args.clean && !args.manifest.is_empty() {
+    //     if let Err(e) =
+    //         reset_infrastructure(&args.namespace, &args.statefulset, &args.manifest).await
+    //     {
+    //         error!("Infrastructure reset failed: {e}");
+    //         std::process::exit(1);
+    //     }
+    // }
     if args.clean && !args.manifest.is_empty() {
-        if let Err(e) =
-            reset_infrastructure(&args.namespace, &args.statefulset, &args.manifest).await
-        {
-            error!("Infrastructure reset failed: {e}");
-            std::process::exit(1);
-        }
+        info!("Note: --clean and --manifest flags are ignored (k8s operations disabled)");
     }
 
     // Compute total duration per endpoint

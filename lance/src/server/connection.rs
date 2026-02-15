@@ -12,6 +12,7 @@ use crate::shutdown::{begin_operation, end_operation, is_shutdown_requested};
 use crate::subscription::SubscriptionManager;
 use crate::topic::TopicRegistry;
 use bytes::Bytes;
+use futures::future::try_join_all;
 use lnc_core::{BatchPool, LanceError, Result};
 use lnc_network::{ControlCommand, FrameType, LWP_HEADER_SIZE, parse_frame};
 use lnc_replication::{AsyncQuorumManager, ClusterCoordinator, LeaderConnectionPool, QuorumResult};
@@ -91,6 +92,10 @@ where
     // Track authentication state for this connection
     let mut authenticated = !token_validator.is_enabled();
 
+    // Hoisted allocation for ACKs (reused across all batches)
+    // Size = 64 pipeline depth * 12 bytes per ACK ~= 768 bytes
+    let mut ack_buffer = Vec::with_capacity(1024);
+
     loop {
         if is_shutdown_requested() {
             debug!(target: "lance::server", "Shutdown requested, closing connection");
@@ -125,7 +130,7 @@ where
             node_id,
         };
 
-        read_offset = process_frames(ctx, &mut buffer, read_offset).await?;
+        read_offset = process_frames(ctx, &mut buffer, &mut read_offset, &mut ack_buffer).await?;
     }
 }
 
@@ -181,11 +186,12 @@ fn extract_payload_length(buffer: &[u8]) -> usize {
     u32::from_le_bytes([buffer[32], buffer[33], buffer[34], buffer[35]]) as usize
 }
 
-/// Process all complete frames in buffer
+/// Process all complete frames in buffer with zero-copy cursor logic
 async fn process_frames<S>(
     mut ctx: ConnectionContext<'_, S>,
     buffer: &mut Vec<u8>,
-    mut read_offset: usize,
+    read_offset: &mut usize,
+    ack_buffer: &mut Vec<u8>,
 ) -> Result<usize>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -195,26 +201,23 @@ where
     // into a single fsync, and we send all ACKs in one write.
     let mut pending: Vec<PendingIngest> = Vec::new();
 
-    while read_offset >= LWP_HEADER_SIZE {
-        match parse_frame(&buffer[..read_offset])? {
-            Some((frame, consumed)) => {
-                let action = dispatch_frame(&mut ctx, &frame, buffer, consumed, read_offset).await;
+    // Cursor-based parsing: eliminates O(N²) copy_within per frame
+    let mut cursor = 0;
+
+    while *read_offset - cursor >= LWP_HEADER_SIZE {
+        match parse_frame(&buffer[cursor..*read_offset])? {
+            Some((frame, frame_len)) => {
+                let action =
+                    dispatch_frame(&mut ctx, &frame, buffer, frame_len, *read_offset).await;
 
                 match action {
-                    FrameAction::Continue => {
-                        buffer.copy_within(consumed..read_offset, 0);
-                        read_offset -= consumed;
-                        maybe_shrink_buffer(buffer, read_offset);
+                    FrameAction::Continue | FrameAction::Forwarded => {
+                        // Just advance cursor, don't shift data yet
+                        cursor += frame_len;
                     },
                     FrameAction::Pending(p) => {
                         pending.push(p);
-                        buffer.copy_within(consumed..read_offset, 0);
-                        read_offset -= consumed;
-                        maybe_shrink_buffer(buffer, read_offset);
-                    },
-                    FrameAction::Forwarded => {
-                        // Buffer already adjusted by forwarding logic
-                        read_offset -= consumed;
+                        cursor += frame_len;
                     },
                     FrameAction::Error(e) => return Err(e),
                 }
@@ -223,51 +226,82 @@ where
         }
     }
 
+    // Perform ONE shift for all processed frames (O(1) per batch read)
+    if cursor > 0 {
+        buffer.copy_within(cursor..*read_offset, 0);
+        *read_offset -= cursor;
+        maybe_shrink_buffer(buffer, *read_offset);
+    }
+
     // ── Batch-complete all deferred ingests ─────────────────────────────
+    // FIX: Concurrent future resolution to eliminate Head-of-Line blocking.
+    // Instead of awaiting each write/quorum sequentially (Total_Wait = Sum(RTT)),
+    // we await all concurrently (Total_Wait = Max(RTT)), allowing the pipeline
+    // to function as intended.
+    //
+    // CRITICAL: We use try_join_all instead of JoinSet to preserve ACK ordering.
+    // TCP pipelined clients expect ACKs in request order. try_join_all polls all
+    // futures concurrently but returns results in input order, maintaining FIFO.
     if !pending.is_empty() {
         let count = pending.len();
-        let mut ack_buf = Vec::with_capacity(count * LWP_HEADER_SIZE);
+        let qm = ctx.quorum_manager.as_ref().map(Arc::clone);
 
-        for p in pending {
-            // Await write completion (all fire together after one fsync)
-            if p.write_done_rx.await.is_err() {
-                return Err(LanceError::Io(std::io::Error::other(
-                    "Ingestion write failed",
-                )));
-            }
+        // 1. Map pending items to futures (no spawning, just future construction)
+        let futures = pending.into_iter().map(|p| {
+            let qm_clone = qm.clone();
+            async move {
+                // Await write completion
+                if p.write_done_rx.await.is_err() {
+                    return Err(LanceError::Io(std::io::Error::other(
+                        "Ingestion write failed",
+                    )));
+                }
 
-            // Await quorum for L3 writes
-            if let Some((write_id, rx)) = p.quorum_rx {
-                if let Some(qm) = ctx.quorum_manager {
-                    let result = qm.wait_for_quorum(write_id, rx).await;
-                    match result {
-                        QuorumResult::Success => {},
-                        QuorumResult::Timeout => {
-                            warn!(
-                                target: "lance::server",
-                                batch_id = p.batch_id,
-                                write_id,
-                                "Quorum timeout — ACKing client anyway (data is locally durable)"
-                            );
-                        },
-                        QuorumResult::Failed | QuorumResult::Partial { .. } => {
-                            warn!(
-                                target: "lance::server",
-                                batch_id = p.batch_id,
-                                write_id,
-                                result = ?result,
-                                "Quorum failed — ACKing client anyway (data is locally durable)"
-                            );
-                        },
+                // Await quorum for L3 writes (concurrently!)
+                if let Some((write_id, rx)) = p.quorum_rx {
+                    if let Some(ref qm) = qm_clone {
+                        let result = qm.wait_for_quorum(write_id, rx).await;
+                        match result {
+                            QuorumResult::Success => {},
+                            QuorumResult::Timeout => {
+                                warn!(
+                                    target: "lance::server",
+                                    batch_id = p.batch_id,
+                                    write_id,
+                                    "Quorum timeout — ACKing client anyway (data is locally durable)"
+                                );
+                            },
+                            QuorumResult::Failed | QuorumResult::Partial { .. } => {
+                                warn!(
+                                    target: "lance::server",
+                                    batch_id = p.batch_id,
+                                    write_id,
+                                    result = ?result,
+                                    "Quorum failed — ACKing client anyway (data is locally durable)"
+                                );
+                            },
+                        }
                     }
                 }
-            }
 
-            ack_buf.extend_from_slice(&lnc_network::encode_ack_bytes(p.batch_id));
+                // Return batch_id on success
+                Ok(p.batch_id)
+            }
+        });
+
+        // 2. Await ALL concurrently, preserving input order
+        // This solves HoL blocking (Max(RTT) instead of Sum(RTT))
+        // while ensuring ACK[i] corresponds to pending[i]
+        let completed_batches = try_join_all(futures).await?;
+
+        // 3. Use reusable buffer (zero allocation per batch)
+        ack_buffer.clear(); // Reset length, keep capacity
+        for batch_id in completed_batches {
+            ack_buffer.extend_from_slice(&lnc_network::encode_ack_bytes(batch_id));
         }
 
         // Batch-write all ACKs in one syscall
-        if ctx.stream.write_all(&ack_buf).await.is_err() {
+        if ctx.stream.write_all(ack_buffer).await.is_err() {
             return Err(LanceError::Io(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "Failed to send batch ack",
@@ -280,7 +314,7 @@ where
         }
     }
 
-    Ok(read_offset)
+    Ok(*read_offset)
 }
 
 /// Dispatch frame to appropriate handler

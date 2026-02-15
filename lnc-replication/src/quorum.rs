@@ -16,7 +16,10 @@ impl QuorumConfig {
         Self {
             total_nodes,
             required_acks,
-            timeout_ms: 100,
+            // Increased from 100ms to 1000ms for production stability.
+            // 100ms was causing OOMKilled cascades under benchmark load due to
+            // quorum timeouts triggering retries and memory pressure.
+            timeout_ms: 1000,
         }
     }
 

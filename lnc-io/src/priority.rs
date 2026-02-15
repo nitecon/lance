@@ -50,6 +50,35 @@ impl IoPriority {
             IoPriority::Background => 1,
         }
     }
+
+    /// Maps to Linux ioprio_set() values for io_uring SQEs.
+    /// Format: (CLASS << 13) | (DATA & 7)
+    ///
+    /// Per <linux/ioprio.h>:
+    /// - IOPRIO_CLASS_RT (1): Real-time, preempts all other I/O
+    /// - IOPRIO_CLASS_BE (2): Best-effort with priority levels 0-7
+    /// - IOPRIO_CLASS_IDLE (3): Only runs when disk is idle
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub fn to_linux_ioprio(&self) -> u16 {
+        const IOPRIO_CLASS_RT: u16 = 1;
+        const IOPRIO_CLASS_BE: u16 = 2;
+        const IOPRIO_CLASS_IDLE: u16 = 3;
+
+        match self {
+            Self::Critical => IOPRIO_CLASS_RT << 13,
+            Self::High => (IOPRIO_CLASS_BE << 13) | 0,
+            Self::Normal => (IOPRIO_CLASS_BE << 13) | 4,
+            Self::Low | Self::Background => (IOPRIO_CLASS_IDLE << 13) | 7,
+        }
+    }
+
+    /// Stub for non-Linux platforms (priority not propagated to kernel)
+    #[cfg(not(target_os = "linux"))]
+    #[inline]
+    pub fn to_linux_ioprio(&self) -> u16 {
+        0
+    }
 }
 
 /// An I/O request with priority

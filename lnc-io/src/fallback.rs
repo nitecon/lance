@@ -1,16 +1,17 @@
-use crate::backend::{IoBackend, IoBackendType};
-use lnc_core::Result;
+use crate::backend::{AsyncIoBackend, IoBackend, IoBackendType, WriteFuture};
+use crate::priority::IoPriority;
+use lnc_core::{LanceError, LoanableBatch, Result};
 use std::fs::File;
 use std::path::Path;
 
-#[cfg(not(target_os = "linux"))]
-use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(all(unix, not(target_os = "linux")))]
+use std::os::unix::fs::FileExt; // for write_at
+
+#[cfg(windows)]
+use std::os::windows::fs::FileExt; // for seek_write
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
-
-#[cfg(target_os = "linux")]
-use lnc_core::LanceError;
 
 pub struct Pwritev2Backend {
     file: File,
@@ -31,6 +32,13 @@ impl Pwritev2Backend {
                 .write(true)
                 .open(path)?
         };
+
+        tracing::info!(
+            target: "lance::io",
+            path = ?path,
+            backend = "Pwritev2Backend",
+            "Fallback I/O backend initialized (using spawn_blocking for async operations)"
+        );
 
         Ok(Self { file })
     }
@@ -92,10 +100,16 @@ impl IoBackend for Pwritev2Backend {
         {
             self.pwritev2(data, offset)
         }
+
+        // Portable fallback using FileExt for positional writes
         #[cfg(not(target_os = "linux"))]
         {
-            self.file.seek(SeekFrom::Start(offset))?;
-            self.file.write_all(data)?;
+            #[cfg(unix)]
+            self.file.write_at(data, offset)?;
+
+            #[cfg(windows)]
+            self.file.seek_write(data, offset)?;
+
             self.file.sync_data()?;
             Ok(data.len())
         }
@@ -108,6 +122,7 @@ impl IoBackend for Pwritev2Backend {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            use std::io::{Read, Seek, SeekFrom};
             self.file.seek(SeekFrom::Start(offset))?;
             let n = self.file.read(buf)?;
             Ok(n)
@@ -121,6 +136,100 @@ impl IoBackend for Pwritev2Backend {
 
     fn backend_type(&self) -> IoBackendType {
         IoBackendType::Pwritev2
+    }
+}
+
+/// Async implementation for fallback using spawn_blocking.
+///
+/// This enables the high-performance `IngestionHandler` to run on systems
+/// without io_uring support. It offloads blocking disk I/O to Tokio's
+/// blocking thread pool to prevent executor thread starvation.
+///
+/// Performance Impact: Uses spawn_blocking to avoid blocking Tokio worker
+/// threads. This is critical for maintaining low latency under load.
+impl AsyncIoBackend for Pwritev2Backend {
+    fn submit_write(
+        &self,
+        batch: LoanableBatch,
+        offset: u64,
+        _priority: IoPriority,
+    ) -> Result<WriteFuture> {
+        // Clone the file handle (File is just a wrapper around an FD/Handle, cheap to clone)
+        let file = self.file.try_clone().map_err(LanceError::Io)?;
+
+        // Return a pinned boxed future that offloads blocking I/O
+        Ok(Box::pin(async move {
+            // Offload the blocking I/O to Tokio's blocking thread pool
+            let result = tokio::task::spawn_blocking(move || {
+                // --- BLOCKING CONTEXT START ---
+                let io_result = {
+                    #[cfg(target_os = "linux")]
+                    {
+                        use std::io::IoSlice;
+                        use std::os::unix::io::AsRawFd;
+
+                        let iov = [IoSlice::new(batch.as_slice())];
+                        let fd = file.as_raw_fd();
+
+                        // SAFETY: We're calling pwritev2 with valid file descriptor and buffer
+                        let result = unsafe {
+                            libc::pwritev2(
+                                fd,
+                                iov.as_ptr() as *const libc::iovec,
+                                1,
+                                offset as i64,
+                                libc::RWF_DSYNC,
+                            )
+                        };
+
+                        if result < 0 {
+                            Err(LanceError::Io(std::io::Error::last_os_error()))
+                        } else {
+                            Ok(result as usize)
+                        }
+                    }
+
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        // Portable implementation
+                        #[cfg(unix)]
+                        let res =
+                            std::os::unix::fs::FileExt::write_at(&file, batch.as_slice(), offset)
+                                .map_err(LanceError::Io);
+
+                        #[cfg(windows)]
+                        let res = std::os::windows::fs::FileExt::seek_write(
+                            &file,
+                            batch.as_slice(),
+                            offset,
+                        )
+                        .map_err(LanceError::Io);
+
+                        res.and_then(|_| {
+                            file.sync_data().map_err(LanceError::Io)?;
+                            Ok(batch.len())
+                        })
+                    }
+                };
+                // --- BLOCKING CONTEXT END ---
+
+                // Return both batch and result
+                (batch, io_result)
+            })
+            .await;
+
+            match result {
+                Ok((batch, io_result)) => {
+                    // Return batch with the I/O result
+                    (batch, io_result)
+                },
+                Err(join_err) => {
+                    // Task panicked - we've lost the batch, this is a critical error
+                    // We can't return the batch, so we have to panic or create a dummy error
+                    panic!("Blocking I/O task panicked: {}", join_err)
+                },
+            }
+        }))
     }
 }
 

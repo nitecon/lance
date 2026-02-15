@@ -212,7 +212,7 @@ impl IoUringPoller {
         }
 
         let mut builder = IoUring::builder();
-        builder.setup_coop_taskrun().setup_single_issuer();
+        builder.setup_coop_taskrun();
 
         // Enable SQPOLL for busy polling if configured
         if config.busy_poll {
@@ -1703,5 +1703,287 @@ impl TeeForwarder {
     #[inline]
     pub fn pending_ops(&self) -> u32 {
         self.pending_ops
+    }
+}
+
+// ============================================================================
+// Async I/O Backend (Zero-Copy Ferrari Engine)
+// ============================================================================
+
+use crate::backend::{AsyncIoBackend, WriteFuture};
+use crate::priority::IoPriority;
+use dashmap::DashMap;
+use lnc_core::LoanableBatch;
+use parking_lot::Mutex;
+use std::sync::Arc;
+use tokio::sync::oneshot;
+
+type CompletionSender = oneshot::Sender<(LoanableBatch, i32)>;
+
+/// Async-capable io_uring backend for zero-copy I/O.
+///
+/// This implementation enforces the Ferrari contract:
+/// 1. Takes ownership of `LoanableBatch` (pins memory)
+/// 2. Submits to io_uring with priority
+/// 3. Returns batch via future when kernel completes
+/// 4. Caller recycles batch to `BatchPool`
+///
+/// # Memory Safety
+/// The batch is stored in `in_flight` map to keep it alive while
+/// the kernel performs DMA. Dropping the future does NOT cancel
+/// the I/O - the batch remains pinned until CQE arrives.
+pub struct AsyncIoUringBackend {
+    /// Shared io_uring instance (submission requires mutex)
+    /// In production, use lock-free handoff to dedicated poller thread
+    ring: Arc<Mutex<IoUring>>,
+
+    /// File descriptor (must be opened with O_DIRECT)
+    fd: RawFd,
+
+    /// In-flight writes: batch_id → (batch, completion_sender)
+    /// The batch is kept alive here to prevent use-after-free
+    in_flight: Arc<DashMap<u64, (LoanableBatch, CompletionSender)>>,
+}
+
+impl AsyncIoUringBackend {
+    /// Create a new async io_uring backend.
+    ///
+    /// # Arguments
+    /// * `fd` - File descriptor opened with O_DIRECT
+    /// * `ring_size` - Size of the io_uring submission/completion queues
+    pub fn new(fd: RawFd, ring_size: u32) -> Result<Self> {
+        let ring = IoUring::builder()
+            .setup_coop_taskrun()
+            .setup_sqpoll(2000) // Kernel thread sleeps after 2ms idle
+            .build(ring_size)
+            .map_err(|_| LanceError::UnsupportedKernel("io_uring setup failed"))?;
+
+        tracing::info!(
+            target: "lance::io",
+            fd,
+            ring_size,
+            backend = "AsyncIoUringBackend",
+            "Zero-copy io_uring initialized (SQPOLL enabled - No syscalls on write path)"
+        );
+
+        Ok(Self {
+            ring: Arc::new(Mutex::new(ring)),
+            fd,
+            in_flight: Arc::new(DashMap::new()),
+        })
+    }
+
+    /// Get a handle to the in-flight map for the poller thread.
+    /// The poller uses this to reclaim batches and notify futures.
+    pub fn in_flight_map(&self) -> Arc<DashMap<u64, (LoanableBatch, CompletionSender)>> {
+        Arc::clone(&self.in_flight)
+    }
+
+    /// Get a handle to the ring for the poller thread.
+    pub fn ring(&self) -> Arc<Mutex<IoUring>> {
+        Arc::clone(&self.ring)
+    }
+}
+
+impl AsyncIoBackend for AsyncIoUringBackend {
+    fn submit_write(
+        &self,
+        batch: LoanableBatch,
+        offset: u64,
+        priority: IoPriority,
+    ) -> Result<WriteFuture> {
+        let batch_id = batch.batch_id;
+        let ptr = batch.as_ptr();
+        let len = batch.len();
+
+        let (tx, rx) = oneshot::channel();
+
+        self.in_flight.insert(batch_id, (batch, tx));
+
+        let sqe = opcode::Write::new(types::Fd(self.fd), ptr, len as u32)
+            .offset(offset)
+            .ioprio(priority.to_linux_ioprio())
+            .build()
+            .user_data(batch_id);
+
+        // Push SQE to submission queue + conditional wakeup (single lock)
+        // With SQPOLL enabled, we usually skip the submit() syscall entirely
+        {
+            let mut ring = self.ring.lock();
+
+            // Attempt to push SQE to submission queue
+            let push_result = unsafe { ring.submission().push(&sqe) };
+
+            if let Err(_) = push_result {
+                // CRITICAL: Rollback in_flight insertion to prevent memory leak
+                self.in_flight.remove(&batch_id);
+                return Err(LanceError::Io(std::io::Error::other("SQ full")));
+            }
+            
+            // OPTIMIZATION: Only syscall if the SQPOLL thread needs waking up
+            // Most of the time this branch is NOT taken (zero-syscall fast path)
+            if ring.submission().need_wakeup() {
+                if let Err(e) = ring.submit() {
+                    // CRITICAL: Rollback in_flight insertion to prevent memory leak
+                    self.in_flight.remove(&batch_id);
+                    return Err(e.into());
+                }
+            }
+        }
+
+        lnc_metrics::increment_io_submitted();
+
+        Ok(Box::pin(async move {
+            match rx.await {
+                Ok((batch, result_code)) => {
+                    let result = if result_code >= 0 {
+                        Ok(result_code as usize)
+                    } else {
+                        Err(LanceError::Io(std::io::Error::from_raw_os_error(
+                            -result_code,
+                        )))
+                    };
+                    (batch, result)
+                },
+                Err(_) => {
+                    panic!(
+                        "IoUringPoller dropped completion channel for batch_id {}",
+                        batch_id
+                    );
+                },
+            }
+        }))
+    }
+}
+
+/// Helper function to poll completions for AsyncIoUringBackend.
+/// This should be called from a dedicated poller thread.
+///
+/// # Performance
+/// CQEs are copied into a local buffer while holding the ring lock,
+/// then the lock is dropped before processing. This minimizes the
+/// critical section and allows submitters to continue writing while
+/// the poller processes completions (DashMap lookups + channel sends).
+pub fn poll_async_completions(
+    ring: &Arc<Mutex<IoUring>>,
+    in_flight: &Arc<DashMap<u64, (LoanableBatch, CompletionSender)>>,
+) -> Result<u32> {
+    // Pre-allocate buffer for CQEs (reused across calls in production)
+    let mut cqes = Vec::with_capacity(64);
+
+    // CRITICAL SECTION: Reap CQEs as fast as possible
+    {
+        let mut ring = ring.lock();
+        for cqe in ring.completion() {
+            cqes.push((cqe.user_data(), cqe.result()));
+        }
+    } // Lock drops here -> Submitters can write again
+
+    if cqes.is_empty() {
+        return Ok(0);
+    }
+
+    let count = cqes.len() as u32;
+
+    // PROCESSING SECTION: Slow map/channel ops (parallel with submissions)
+    for (batch_id, result_code) in cqes {
+        if let Some((_, (batch, tx))) = in_flight.remove(&batch_id) {
+            let _ = tx.send((batch, result_code));
+            lnc_metrics::increment_io_completed();
+        } else {
+            tracing::warn!(
+                target: "lance::io",
+                batch_id,
+                "Received CQE for unknown batch_id"
+            );
+        }
+    }
+
+    Ok(count)
+}
+
+/// Dedicated poller thread for AsyncIoUringBackend.
+///
+/// Continuously polls for completions and notifies awaiting futures.
+/// This thread should be pinned to the same NUMA node as the NVMe device.
+pub struct AsyncIoPoller {
+    ring: Arc<Mutex<IoUring>>,
+    in_flight: Arc<DashMap<u64, (LoanableBatch, CompletionSender)>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AsyncIoPoller {
+    /// Create a new poller from an AsyncIoUringBackend.
+    pub fn new(backend: &AsyncIoUringBackend) -> Self {
+        Self {
+            ring: backend.ring(),
+            in_flight: backend.in_flight_map(),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Get a shutdown handle for graceful termination.
+    pub fn shutdown_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.shutdown)
+    }
+
+    /// Run the poller loop (blocking, call from dedicated thread).
+    ///
+    /// # Arguments
+    /// * `poll_interval_us` - Microseconds to wait between polls (0 = busy spin)
+    pub fn run(&self, poll_interval_us: u64) {
+        tracing::info!(
+            target: "lance::io",
+            poll_interval_us,
+            "AsyncIoPoller started"
+        );
+
+        while !self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            match poll_async_completions(&self.ring, &self.in_flight) {
+                Ok(completed) => {
+                    if completed == 0 && poll_interval_us > 0 {
+                        std::thread::sleep(std::time::Duration::from_micros(poll_interval_us));
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(
+                        target: "lance::io",
+                        error = %e,
+                        "AsyncIoPoller error"
+                    );
+                },
+            }
+        }
+
+        tracing::info!(
+            target: "lance::io",
+            "AsyncIoPoller shutting down"
+        );
+    }
+
+    /// Spawn the poller on a dedicated thread.
+    ///
+    /// # Arguments
+    /// * `poll_interval_us` - Microseconds between polls (0 = busy spin)
+    /// * `cpu_affinity` - Optional CPU core to pin thread to
+    pub fn spawn(
+        self,
+        poll_interval_us: u64,
+        cpu_affinity: Option<usize>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            if let Some(cpu) = cpu_affinity {
+                if let Err(e) = lnc_core::pin_thread_to_cpu(cpu) {
+                    tracing::warn!(
+                        target: "lance::io",
+                        cpu,
+                        error = %e,
+                        "Failed to pin poller thread to CPU"
+                    );
+                }
+            }
+
+            self.run(poll_interval_us);
+        })
     }
 }

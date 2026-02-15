@@ -511,7 +511,7 @@ pub async fn run(
             // total_nodes = peers + self
             let total_nodes = peer_count + 1;
             let qm_config = QuorumConfig::new(total_nodes)
-                .with_timeout(config.replication_quorum_timeout_ms.unwrap_or(100));
+                .with_timeout(config.replication_quorum_timeout_ms.unwrap_or(1000));
             info!(
                 target: "lance::server",
                 total_nodes,

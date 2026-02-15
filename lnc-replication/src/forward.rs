@@ -92,7 +92,9 @@ impl Default for ForwardConfig {
             forward_timeout: Duration::from_secs(30),
             enable_tee_forwarding: false,
             enable_local_ack: false,
-            forward_buffer_pool_size: 64,
+            // Increased from 64 to 256 to reduce fallback allocations under benchmark load.
+            // Pool exhaustion was contributing to OOM by creating unbounded heap allocations.
+            forward_buffer_pool_size: 256,
             forward_buffer_capacity: 4096,
         }
     }
@@ -1050,7 +1052,7 @@ mod tests {
     #[test]
     fn test_forward_config_buffer_pool_defaults() {
         let config = ForwardConfig::default();
-        assert_eq!(config.forward_buffer_pool_size, 64);
+        assert_eq!(config.forward_buffer_pool_size, 256);
         assert_eq!(config.forward_buffer_capacity, 4096);
     }
 }

@@ -15,6 +15,52 @@ pub trait IoBackend: Send {
     fn backend_type(&self) -> IoBackendType;
 }
 
+use crate::priority::IoPriority;
+use lnc_core::LoanableBatch;
+use std::future::Future;
+use std::pin::Pin;
+
+/// The result of an async write operation:
+/// 1. The original batch (returned for recycling to BatchPool)
+/// 2. The result (bytes written or error)
+pub type AsyncWriteResult = (LoanableBatch, Result<usize>);
+
+/// A future that resolves when the hardware acknowledges the write.
+pub type WriteFuture = Pin<Box<dyn Future<Output = AsyncWriteResult> + Send>>;
+
+/// High-Performance Asynchronous I/O Interface.
+///
+/// Unlike `IoBackend` (synchronous, copying), this trait enforces:
+/// 1. Zero-copy (ownership transfer of aligned buffers)
+/// 2. Priority propagation to the kernel
+/// 3. Asynchronous completion (compatible with tokio reactor)
+///
+/// # Memory Safety
+/// The implementation MUST keep the `LoanableBatch` alive until the kernel
+/// completes the I/O operation. Dropping the batch while I/O is in-flight
+/// causes undefined behavior (kernel writes to freed memory).
+pub trait AsyncIoBackend: Send + Sync {
+    /// Submit a write batch to the kernel.
+    ///
+    /// # Arguments
+    /// * `batch` - The aligned data buffer. Ownership is transferred.
+    /// * `offset` - The file offset to write to.
+    /// * `priority` - The I/O priority level (propagated to kernel on Linux).
+    ///
+    /// # Returns
+    /// A future that resolves to `(batch, result)` when the kernel completes the I/O.
+    /// The batch is returned for recycling to the `BatchPool`.
+    ///
+    /// # Errors
+    /// Returns an error if the submission queue is full or the operation cannot be queued.
+    fn submit_write(
+        &self,
+        batch: LoanableBatch,
+        offset: u64,
+        priority: IoPriority,
+    ) -> Result<WriteFuture>;
+}
+
 #[cfg(target_os = "linux")]
 pub fn probe_io_uring() -> bool {
     use tracing::info;

@@ -8,7 +8,9 @@ mod segment;
 mod tier;
 mod wal;
 
-pub use backend::{IoBackend, IoBackendType, probe_io_uring};
+pub use backend::{
+    AsyncIoBackend, AsyncWriteResult, IoBackend, IoBackendType, WriteFuture, probe_io_uring,
+};
 pub use priority::{IoPriority, IoPriorityQueue, IoPriorityStats, PrioritizedIoRequest};
 pub use segment::{
     BorrowedSlice, CompactionConfig, CompactionResult, DirectBackend, SegmentCompactor,
@@ -26,8 +28,9 @@ pub mod uring;
 
 #[cfg(target_os = "linux")]
 pub use uring::{
-    SendZcSupport, SpliceForwarder, SplicePipe, SpliceSupport, TeeForwarder, TeeSupport,
-    ZeroCopySender, probe_send_zc, probe_splice, probe_tee,
+    AsyncIoPoller, AsyncIoUringBackend, SendZcSupport, SpliceForwarder, SplicePipe, SpliceSupport,
+    TeeForwarder, TeeSupport, ZeroCopySender, poll_async_completions, probe_send_zc, probe_splice,
+    probe_tee,
 };
 
 pub mod fallback;

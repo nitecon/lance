@@ -9,6 +9,8 @@ mod codec;
 mod discovery;
 mod follower;
 mod forward;
+#[cfg(target_os = "linux")]
+mod ingestion;
 mod log_store;
 mod mode;
 mod peer;
@@ -38,6 +40,8 @@ pub use forward::{
     LocalWriteProcessor, NoOpLocalProcessor, PooledForwardBuffer, TeeForwardingStatus,
     check_tee_support, create_leader_pool,
 };
+#[cfg(target_os = "linux")]
+pub use ingestion::IngestionHandler;
 pub use log_store::{LogStore, PersistentState};
 pub use mode::ReplicationMode;
 pub use peer::{PeerConfig, PeerConnection, PeerManager, PeerState};

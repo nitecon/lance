@@ -92,9 +92,12 @@ pub struct RaftConfig {
 impl Default for RaftConfig {
     fn default() -> Self {
         Self {
-            election_timeout_min: Duration::from_millis(150),
-            election_timeout_max: Duration::from_millis(300),
-            heartbeat_interval: Duration::from_millis(50),
+            // Increased from 150/300ms to 1000/2000ms for production stability
+            // 50ms was suicidal for a persistent storage cluster with network/disk latency
+            election_timeout_min: Duration::from_millis(1000),
+            election_timeout_max: Duration::from_millis(2000),
+            // Heartbeat must be significantly faster than min timeout (usually 1/4th)
+            heartbeat_interval: Duration::from_millis(250),
             pre_vote_enabled: true,
             leader_lease: Duration::from_millis(100),
         }
@@ -148,13 +151,20 @@ impl RaftNode {
     pub fn new(node_id: u16, config: ClusterConfig, raft_config: RaftConfig) -> Self {
         let election_timeout = Self::random_election_timeout(&raft_config);
 
+        // CRITICAL FIX: Initialize last_leader_contact to the past.
+        // If we initialize to Instant::now(), we implicitly claim we just saw a leader,
+        // which causes us to deny PreVotes from valid candidates during a restart storm.
+        let last_leader_contact = Instant::now()
+            .checked_sub(raft_config.election_timeout_max * 2)
+            .unwrap_or_else(Instant::now);
+
         Self {
             node_id,
             state: RaftState::Follower,
             current_term: 0,
             voted_for: None,
             leader_id: None,
-            last_leader_contact: Instant::now(),
+            last_leader_contact,
             election_timeout,
             config,
             raft_config,
@@ -312,10 +322,16 @@ impl RaftNode {
             };
         }
 
-        // Check if we've heard from a leader recently
-        // (prevents disruption if there's a working leader)
-        let leader_active = self.last_leader_contact.elapsed() < self.election_timeout;
-        if leader_active && self.leader_id.is_some() {
+        // FIX: Simplified disruption check.
+        // If we haven't heard from a leader within the minimum election timeout,
+        // we should entertain the pre-vote. The leader is likely dead or partitioned.
+        // We removed the `&& self.leader_id.is_some()` check because a node might
+        // have a stale leader_id from disk but no active connection.
+        let within_election_window =
+            self.last_leader_contact.elapsed() < self.raft_config.election_timeout_min;
+
+        if within_election_window {
+            // We have a healthy leader (or think we do), so we deny disruption.
             return PreVoteResponse {
                 term: self.current_term,
                 vote_granted: false,
@@ -1039,18 +1055,19 @@ mod tests {
     fn test_election_timeout_triggers_new_election() {
         let config = test_config();
         let raft_config = RaftConfig {
-            election_timeout_min: Duration::from_millis(10),
-            election_timeout_max: Duration::from_millis(20),
+            election_timeout_min: Duration::from_millis(100),
+            election_timeout_max: Duration::from_millis(200),
             ..RaftConfig::default()
         };
         let mut node = RaftNode::new(1, config, raft_config);
 
         // Initially follower
         assert_eq!(node.state, RaftState::Follower);
-        assert!(!node.election_timeout_elapsed());
 
-        // Simulate timeout by setting last_leader_contact to past
-        node.last_leader_contact = Instant::now() - Duration::from_secs(1);
+        // After the cold-start deadlock fix, new nodes start with
+        // last_leader_contact in the past (2× election_timeout_max ago).
+        // This is intentional to prevent nodes from denying pre-votes during
+        // cluster restarts. The election timeout should be elapsed on startup.
         assert!(node.election_timeout_elapsed());
 
         // Starting election should transition to candidate

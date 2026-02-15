@@ -1,7 +1,7 @@
 use crate::backend::IoBackend;
 use crate::fallback::Pwritev2Backend;
 use bytes::Bytes;
-use lnc_core::{LanceError, Result};
+use lnc_core::{LanceError, LoanableBatch, Result};
 use lnc_metrics::time_io_sampled;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -171,6 +171,20 @@ impl SegmentWriter {
         }
         self.write_offset += data.len() as u64;
         Ok(offset)
+    }
+
+    /// Append a LoanableBatch to the segment.
+    ///
+    /// This is a compatibility helper for the synchronous buffered path.
+    /// Unlike `submit_write` in `AsyncIoBackend`, this does NOT take ownership
+    /// of the batch, as `BufWriter` copies the data anyway.
+    ///
+    /// Useful when the system is running in L1/Buffered mode but still
+    /// using the BatchPool for memory management.
+    pub fn append_batch(&mut self, batch: &LoanableBatch) -> Result<u64> {
+        // We use batch.as_slice() which is cheap
+        // The internal BufWriter will perform the memcpy
+        self.append(batch.as_slice())
     }
 
     pub fn write_batch(&mut self, data: &[u8]) -> Result<u64> {

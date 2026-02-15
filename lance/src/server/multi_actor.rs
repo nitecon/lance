@@ -1,26 +1,24 @@
 //! Multi-actor ingestion scaling
 //!
 //! Implements N ingestion actors with client hash partitioning per Architecture §5.2.
-//! Uses crossbeam::ArrayQueue for lock-free MPMC communication per CodingGuidelines §3.3.
+//! Uses flume bounded channels for async backpressure without busy-spinning.
 
 use super::ingestion::{DataReplicationRequest, IngestionRequest, WriteMetadata};
 use super::writer::{TopicWriter, create_topic_writer, rotate_topic_segment};
 use crate::config::Config;
 use crate::topic::TopicRegistry;
 use bytes::Bytes;
-use crossbeam::queue::ArrayQueue;
 use lnc_core::{LanceError, Result, SortKey, pin_thread_to_cpu};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Unified ingestion sender that works with both single-actor (flume) and multi-actor modes
 #[derive(Clone)]
 pub enum IngestionSender {
-    /// Single-actor mode using flume channel
-    Single(flume::Sender<IngestionRequest>),
     /// Multi-actor mode using crossbeam ArrayQueue
     Multi(MultiActorSender),
 }
@@ -29,11 +27,7 @@ impl IngestionSender {
     /// Send an ingestion request
     pub async fn send(&self, request: IngestionRequest) -> Result<()> {
         match self {
-            Self::Single(tx) => tx
-                .send_async(request)
-                .await
-                .map_err(|_| LanceError::ChannelDisconnected("ingestion")),
-            Self::Multi(sender) => sender.send(request),
+            Self::Multi(sender) => sender.send(request).await,
         }
     }
 }
@@ -43,8 +37,8 @@ static SEQUENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Multi-actor ingestion system with hash partitioning
 pub struct MultiActorIngestion {
-    /// Request queues - one per actor
-    queues: Vec<Arc<ArrayQueue<IngestionRequest>>>,
+    /// Request queues - one per actor (flume senders for async backpressure)
+    queues: Vec<flume::Sender<IngestionRequest>>,
     /// Actor thread handles
     handles: Vec<thread::JoinHandle<()>>,
     /// Number of actors
@@ -79,8 +73,9 @@ impl MultiActorIngestion {
         let mut handles = Vec::with_capacity(actor_count);
 
         for actor_id in 0..actor_count {
-            let queue = Arc::new(ArrayQueue::new(queue_capacity));
-            queues.push(Arc::clone(&queue));
+            // Use flume bounded channel for async backpressure
+            let (tx, rx) = flume::bounded(queue_capacity);
+            queues.push(tx);
 
             let config_clone = config.clone();
             let registry_clone = Arc::clone(&topic_registry);
@@ -114,7 +109,7 @@ impl MultiActorIngestion {
                     run_ingestion_actor_sync(
                         actor_id,
                         config_clone,
-                        queue,
+                        rx,
                         registry_clone,
                         repl_tx_clone,
                     );
@@ -156,32 +151,24 @@ impl MultiActorIngestion {
 /// Cloneable sender handle for multi-actor ingestion
 #[derive(Clone)]
 pub struct MultiActorSender {
-    queues: Vec<Arc<ArrayQueue<IngestionRequest>>>,
+    queues: Vec<flume::Sender<IngestionRequest>>,
     actor_count: usize,
 }
 
 impl MultiActorSender {
     /// Send a request to the appropriate actor based on topic_id hash partitioning
-    pub fn send(&self, request: IngestionRequest) -> Result<()> {
+    ///
+    /// This is async and yields to the Tokio runtime when the channel is full,
+    /// providing true backpressure without busy-spinning.
+    pub async fn send(&self, request: IngestionRequest) -> Result<()> {
         let actor_id = (request.topic_id as usize) % self.actor_count;
-        let queue = &self.queues[actor_id];
 
-        // Try to push, spinning briefly if full (lock-free backpressure)
-        let mut attempts = 0;
-        let mut req = request;
-        loop {
-            match queue.push(req) {
-                Ok(()) => return Ok(()),
-                Err(returned) => {
-                    req = returned;
-                    attempts += 1;
-                    if attempts > 1000 {
-                        return Err(LanceError::Protocol("Ingestion queue full".into()));
-                    }
-                    std::hint::spin_loop();
-                },
-            }
-        }
+        // send_async yields to the Tokio runtime if the channel is full.
+        // No more busy-spinning!
+        self.queues[actor_id]
+            .send_async(request)
+            .await
+            .map_err(|_| LanceError::ChannelDisconnected("ingestion_actor"))
     }
 }
 
@@ -189,7 +176,7 @@ impl MultiActorSender {
 fn run_ingestion_actor_sync(
     actor_id: usize,
     config: Config,
-    queue: Arc<ArrayQueue<IngestionRequest>>,
+    rx: flume::Receiver<IngestionRequest>,
     topic_registry: Arc<TopicRegistry>,
     replication_tx: Option<tokio::sync::mpsc::Sender<DataReplicationRequest>>,
 ) {
@@ -239,19 +226,32 @@ fn run_ingestion_actor_sync(
     let mut pending_signals: Vec<BatchSuccess> = Vec::new();
     let mut dirty_topics: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut dirty_bytes: usize = 0;
-    let mut last_write = std::time::Instant::now();
+    let mut last_write = Instant::now();
 
-    // Spin-wait loop (per CodingGuidelines §3.1 - ingestion actors never park)
     loop {
-        match queue.pop() {
-            Some(first) => {
+        // Calculate timeout based on pending data
+        let timeout = if !pending_signals.is_empty() {
+            let elapsed = last_write.elapsed();
+            if elapsed >= FLUSH_TIMEOUT {
+                Duration::ZERO // Flush immediately
+            } else {
+                FLUSH_TIMEOUT - elapsed
+            }
+        } else {
+            Duration::from_secs(3600) // Wait up to 1 hour if idle
+        };
+
+        let recv_result = rx.recv_timeout(timeout);
+
+        match recv_result {
+            Ok(first) => {
                 // ── Phase 1: Collect a batch ──────────────────────────
                 let mut batch: Vec<IngestionRequest> = Vec::with_capacity(MAX_BATCH);
                 batch.push(first);
                 while batch.len() < MAX_BATCH {
-                    match queue.pop() {
-                        Some(r) => batch.push(r),
-                        None => break,
+                    match rx.try_recv() {
+                        Ok(r) => batch.push(r),
+                        Err(_) => break,
                     }
                 }
 
@@ -310,7 +310,7 @@ fn run_ingestion_actor_sync(
                         },
                     }
                 }
-                last_write = std::time::Instant::now();
+                last_write = Instant::now();
 
                 // ── Phase 3: Flush if threshold crossed ──────────────
                 if dirty_bytes >= FLUSH_THRESHOLD {
@@ -325,16 +325,12 @@ fn run_ingestion_actor_sync(
                         let _ = w.reset();
                     }
                     dirty_bytes = 0;
+                    last_write = Instant::now();
                 }
             },
-            None => {
-                // No work — check shutdown
-                if Arc::strong_count(&queue) == 1 {
-                    break;
-                }
-
-                // Flush on timeout if we have pending data
-                if !pending_signals.is_empty() && last_write.elapsed() >= FLUSH_TIMEOUT {
+            Err(flume::RecvTimeoutError::Timeout) => {
+                // Flush pending data on timeout
+                if !pending_signals.is_empty() {
                     flush_and_signal_sync(
                         &mut topic_writers,
                         &mut dirty_topics,
@@ -346,9 +342,12 @@ fn run_ingestion_actor_sync(
                         let _ = w.reset();
                     }
                     dirty_bytes = 0;
+                    last_write = Instant::now();
                 }
-
-                std::hint::spin_loop();
+            },
+            Err(flume::RecvTimeoutError::Disconnected) => {
+                // Channel disconnected - shutdown
+                break;
             },
         }
     }
@@ -547,12 +546,11 @@ mod tests {
 
     #[test]
     fn test_partition_key_via_sender() {
-        let queues = vec![
-            Arc::new(ArrayQueue::<IngestionRequest>::new(1)),
-            Arc::new(ArrayQueue::<IngestionRequest>::new(1)),
-            Arc::new(ArrayQueue::<IngestionRequest>::new(1)),
-            Arc::new(ArrayQueue::<IngestionRequest>::new(1)),
-        ];
+        let mut queues = Vec::new();
+        for _ in 0..4 {
+            let (tx, _rx) = flume::bounded::<IngestionRequest>(1);
+            queues.push(tx);
+        }
 
         let sender = MultiActorSender {
             queues,

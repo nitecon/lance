@@ -318,10 +318,18 @@ impl TopicRegistry {
     }
 
     pub fn topic_exists(&self, id: u32) -> bool {
-        self.topics_by_id
-            .read()
-            .map(|guard| guard.contains_key(&id))
-            .unwrap_or(false)
+        match self.topics_by_id.read() {
+            Ok(guard) => guard.contains_key(&id),
+            Err(e) => {
+                tracing::error!(
+                    target: "lance::topic",
+                    topic_id = id,
+                    error = %e,
+                    "RwLock poisoned in topic_exists - returning false"
+                );
+                false
+            },
+        }
     }
 
     pub fn get_topic_dir(&self, topic_id: u32) -> PathBuf {

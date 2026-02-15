@@ -48,6 +48,7 @@ impl HealthState {
     }
 
     /// Mark startup as complete
+    #[allow(dead_code)]
     pub fn set_startup_complete(&self) {
         self.startup_complete.store(true, Ordering::Release);
         info!(target: "lance::health", "Startup complete");

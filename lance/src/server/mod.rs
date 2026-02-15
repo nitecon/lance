@@ -13,7 +13,7 @@ pub mod retention;
 mod writer;
 
 pub use connection::handle_connection;
-pub use ingestion::{DataReplicationRequest, IngestionRequest, run_ingestion_actor};
+pub use ingestion::{DataReplicationRequest, IngestionRequest};
 pub use multi_actor::{IngestionSender, MultiActorIngestion};
 pub use recovery::perform_startup_recovery;
 pub use retention::{RetentionServiceConfig, run_retention_service};
@@ -70,27 +70,17 @@ pub async fn run(
         );
     }
 
-    // Mark server as ready BEFORE recovery to allow Kubernetes to route traffic
-    // Recovery happens in background; server can forward writes to healthy nodes
-    health_state.set_startup_complete();
+    // BLOCKING RECOVERY (Required for data safety)
+    // We cannot open TopicRegistry until we confirm segments are clean.
+    // Race condition: Recovery truncates files while Registry reads them = corruption.
+    perform_startup_recovery(&config)?;
+
+    // Mark server as ready after recovery completes
     health_state.set_ready(true);
     info!(
         target: "lance::server",
-        "Server marked ready (recovery will continue in background)"
+        "Server marked ready after recovery"
     );
-
-    // Perform startup recovery in background (non-blocking)
-    // This allows the pod to be ready immediately while Raft log recovery happens
-    let config_clone = config.clone();
-    tokio::spawn(async move {
-        if let Err(e) = perform_startup_recovery(&config_clone) {
-            error!(
-                target: "lance::server",
-                error = %e,
-                "Background recovery failed"
-            );
-        }
-    });
 
     let topic_registry = Arc::new(TopicRegistry::new(config.data_dir.clone())?);
 
@@ -113,23 +103,27 @@ pub async fn run(
         (None, None)
     };
 
-    // Create ingestion system - multi-actor when actor_count > 1, single-actor otherwise
-    let (ingestion_sender, ingestion_rx, multi_actor_system) = if config.ingestion.actor_count > 1 {
-        // Multi-actor mode with crossbeam ArrayQueue (per Architecture §5.2)
-        let multi = MultiActorIngestion::new(
-            config.clone(),
-            Arc::clone(&topic_registry),
-            config.ingestion.channel_capacity,
-            data_repl_tx.clone(),
-        )?;
-        let sender = IngestionSender::Multi(multi.sender());
-        (sender, None, Some(multi))
-    } else {
-        // Single-actor mode with flume channel
-        let (tx, rx) = flume::bounded::<IngestionRequest>(config.ingestion.channel_capacity);
-        let sender = IngestionSender::Single(tx);
-        (sender, Some(rx), None)
-    };
+    // ALWAYS use MultiActorIngestion (threaded) to prevent blocking fsync in async runtime.
+    // Even with actor_count=1, we use the multi-actor path because it runs on dedicated
+    // OS threads, ensuring fsync() never blocks the Tokio reactor.
+    let actor_count = config.ingestion.actor_count.max(1);
+
+    info!(
+        target: "lance::server",
+        actor_count,
+        "Initializing threaded ingestion actors"
+    );
+
+    let multi = MultiActorIngestion::new(
+        config.clone(),
+        Arc::clone(&topic_registry),
+        config.ingestion.channel_capacity,
+        data_repl_tx.clone(),
+    )?;
+
+    let ingestion_sender = IngestionSender::Multi(multi.sender());
+    let _ingestion_rx: Option<flume::Receiver<IngestionRequest>> = None;
+    let multi_actor_system = Some(multi);
 
     let (_replication_tx, replication_rx) = create_replication_channel(8192);
 
@@ -260,20 +254,15 @@ pub async fn run(
             }
         });
 
-        // Start cluster coordination loop
-        let coord_clone = Arc::clone(&coordinator);
-        let shutdown_for_cluster = shutdown_rx.resubscribe();
-        tokio::spawn(async move {
-            coord_clone.run(shutdown_for_cluster).await;
-        });
-
-        // Start cluster event handler for topic replication, data replication, and leader changes
+        // Subscribe to event channel and start handler BEFORE cluster loop to ensure receiver is active
         let mut event_rx = coordinator.subscribe();
         let event_registry = Arc::clone(&topic_registry);
         let event_config = config.clone();
         let event_coord = Arc::clone(&coordinator);
         let resync_data_dir = config.data_dir.clone();
         let resync_node_id = config.node_id;
+
+        // Start cluster event handler for topic replication, data replication, and leader changes
         tokio::spawn(async move {
             // Track last known leader for change detection
             let mut last_leader = event_coord.leader_addr();
@@ -387,6 +376,34 @@ pub async fn run(
                             writers = follower_writers.len(),
                             "BecameLeader — closing follower writer segments"
                         );
+
+                        // Sync all local topics to followers to ensure cluster-wide consistency
+                        // This is critical because each pod has its own persistent volume
+                        let local_topics = event_registry.list_topics();
+                        if !local_topics.is_empty() {
+                            info!(
+                                target: "lance::server",
+                                topic_count = local_topics.len(),
+                                "Syncing local topics to followers after becoming leader"
+                            );
+                            for topic in local_topics {
+                                let op = TopicOperation::Create {
+                                    topic_id: topic.id,
+                                    name: topic.name.clone(),
+                                    created_at: topic.created_at,
+                                };
+                                if let Err(e) = event_coord.replicate_topic_op(op).await {
+                                    warn!(
+                                        target: "lance::server",
+                                        topic_id = topic.id,
+                                        topic_name = %topic.name,
+                                        error = %e,
+                                        "Failed to sync topic to followers"
+                                    );
+                                }
+                            }
+                        }
+
                         let end_ts = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_nanos() as u64)
@@ -503,6 +520,13 @@ pub async fn run(
                     },
                 }
             }
+        });
+
+        // Now start cluster coordination loop (after event handler is ready to receive)
+        let coord_clone = Arc::clone(&coordinator);
+        let shutdown_for_cluster = shutdown_rx.resubscribe();
+        tokio::spawn(async move {
+            coord_clone.run(shutdown_for_cluster).await;
         });
 
         info!(
@@ -647,30 +671,8 @@ pub async fn run(
         None
     };
 
-    // Start single-actor ingestion only if not using multi-actor mode
-    let ingestion_handle = if let Some(rx) = ingestion_rx {
-        let ingestion_config = config.clone();
-        let ingestion_pool = Arc::clone(&batch_pool);
-        let ingestion_registry = Arc::clone(&topic_registry);
-        let ingestion_repl_tx = data_repl_tx.clone();
-        Some(tokio::spawn(async move {
-            run_ingestion_actor(
-                ingestion_config,
-                rx,
-                ingestion_pool,
-                ingestion_registry,
-                ingestion_repl_tx,
-            )
-            .await
-        }))
-    } else {
-        info!(
-            target: "lance::server",
-            actor_count = config.ingestion.actor_count,
-            "Using multi-actor ingestion"
-        );
-        None
-    };
+    // Multi-actor ingestion is always used (managed by multi_actor_system)
+    let ingestion_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     // Start retention service for background segment cleanup
     let retention_shutdown_rx = shutdown_rx.resubscribe();

@@ -189,8 +189,14 @@ pub async fn handle_create_topic(ctx: &CommandContext<'_>, payload: Option<&Byte
                         target: "lance::server",
                         topic_id = metadata.id,
                         error = %e,
-                        "Failed to replicate topic creation (topic created locally)"
+                        "Failed to replicate topic creation - returning error to client"
                     );
+                    // Delete the locally created topic since replication failed
+                    let _ = ctx.topic_registry.delete_topic(metadata.id);
+                    return Frame::new_error_response(&format!(
+                        "Failed to replicate topic creation: {}",
+                        e
+                    ));
                 }
             }
 
@@ -504,8 +510,14 @@ pub async fn handle_create_topic_with_retention(
                                 target: "lance::server",
                                 topic_id = metadata.id,
                                 error = %e,
-                                "Failed to replicate topic creation"
+                                "Failed to replicate topic creation - returning error to client"
                             );
+                            // Delete the locally created topic since replication failed
+                            let _ = ctx.topic_registry.delete_topic(metadata.id);
+                            return Frame::new_error_response(&format!(
+                                "Failed to replicate topic creation: {}",
+                                e
+                            ));
                         }
                     }
 

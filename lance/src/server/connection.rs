@@ -236,10 +236,11 @@ where
     }
 
     // ── Batch-complete all deferred ingests ─────────────────────────────
-    // FIX: Concurrent future resolution to eliminate Head-of-Line blocking.
-    // Instead of awaiting each write/quorum sequentially (Total_Wait = Sum(RTT)),
-    // we await all concurrently (Total_Wait = Max(RTT)), allowing the pipeline
-    // to function as intended.
+    // ACK path is intentionally decoupled from quorum waits:
+    // - Client ACK is gated only on local durability (write_done_rx)
+    // - Quorum completion is observed in background tasks for logging/metrics
+    // This keeps control-plane quorum latency from backpressuring the ingest
+    // data path response latency.
     //
     // CRITICAL: We use try_join_all instead of JoinSet to preserve ACK ordering.
     // TCP pipelined clients expect ACKs in request order. try_join_all polls all
@@ -259,35 +260,40 @@ where
                     )));
                 }
 
-                // Await quorum for L3 writes (concurrently!)
+                let batch_id = p.batch_id;
+
+                // Quorum wait is tracked off-path (do not block client ACK).
                 if let Some((write_id, rx)) = p.quorum_rx {
                     if let Some(ref qm) = qm_clone {
-                        let result = qm.wait_for_quorum(write_id, rx).await;
-                        match result {
-                            QuorumResult::Success => {},
-                            QuorumResult::Timeout => {
-                                warn!(
-                                    target: "lance::server",
-                                    batch_id = p.batch_id,
-                                    write_id,
-                                    "Quorum timeout — ACKing client anyway (data is locally durable)"
-                                );
-                            },
-                            QuorumResult::Failed | QuorumResult::Partial { .. } => {
-                                warn!(
-                                    target: "lance::server",
-                                    batch_id = p.batch_id,
-                                    write_id,
-                                    result = ?result,
-                                    "Quorum failed — ACKing client anyway (data is locally durable)"
-                                );
-                            },
-                        }
+                        let qm = Arc::clone(qm);
+                        tokio::spawn(async move {
+                            let result = qm.wait_for_quorum(write_id, rx).await;
+                            match result {
+                                QuorumResult::Success => {},
+                                QuorumResult::Timeout => {
+                                    warn!(
+                                        target: "lance::server",
+                                        batch_id,
+                                        write_id,
+                                        "Quorum timeout after client ACK (locally durable)"
+                                    );
+                                },
+                                QuorumResult::Failed | QuorumResult::Partial { .. } => {
+                                    warn!(
+                                        target: "lance::server",
+                                        batch_id,
+                                        write_id,
+                                        result = ?result,
+                                        "Quorum failed after client ACK (locally durable)"
+                                    );
+                                },
+                            }
+                        });
                     }
                 }
 
-                // Return batch_id on success
-                Ok(p.batch_id)
+                // Return batch_id on local durability success
+                Ok(batch_id)
             }
         });
 

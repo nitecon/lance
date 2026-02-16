@@ -28,9 +28,12 @@ impl FollowerHealth {
             latencies: VecDeque::with_capacity(LATENCY_WINDOW_SIZE),
             consecutive_slow: 0,
             status: FollowerStatus::Healthy,
-            p99_threshold: Duration::from_millis(10),
-            eviction_threshold: 3,
-            recovery_window: 10,
+            // Defaults tuned for cross-node Kubernetes deployments.
+            // 10ms/3-samples was too aggressive and evicted healthy followers
+            // during normal replication jitter, causing avoidable quorum loss.
+            p99_threshold: Duration::from_millis(250),
+            eviction_threshold: 5,
+            recovery_window: 5,
         }
     }
 

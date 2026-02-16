@@ -97,8 +97,10 @@ impl Default for PeerConfig {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(1),
-            read_timeout: Duration::from_secs(2),
-            write_timeout: Duration::from_secs(1),
+            // 2s was too aggressive under benchmark/chaos load and caused
+            // repeated disconnect/reconnect churn during legitimate follower stalls.
+            read_timeout: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(2),
             reconnect_delay: Duration::from_millis(250),
             max_reconnect_attempts: 10,
         }
@@ -1003,8 +1005,8 @@ mod tests {
     fn test_peer_config_default() {
         let config = PeerConfig::default();
         assert_eq!(config.connect_timeout, Duration::from_secs(1));
-        assert_eq!(config.read_timeout, Duration::from_secs(2));
-        assert_eq!(config.write_timeout, Duration::from_secs(1));
+        assert_eq!(config.read_timeout, Duration::from_secs(10));
+        assert_eq!(config.write_timeout, Duration::from_secs(2));
         assert_eq!(config.reconnect_delay, Duration::from_millis(250));
         assert_eq!(config.max_reconnect_attempts, 10);
     }
@@ -1057,21 +1059,23 @@ mod tests {
 
         // Record slow latencies - should become degraded then evicted
         manager
-            .record_peer_latency(1, Duration::from_millis(20))
+            .record_peer_latency(1, Duration::from_millis(300))
             .await;
         manager
-            .record_peer_latency(1, Duration::from_millis(20))
+            .record_peer_latency(1, Duration::from_millis(300))
             .await;
-        // After 2 slow, should be degraded
+        // After 2 slow samples, should be degraded (not yet evicted)
         assert_eq!(
             manager.get_peer_health(1).await,
             Some(FollowerStatus::Degraded)
         );
 
-        manager
-            .record_peer_latency(1, Duration::from_millis(20))
-            .await;
-        // After 3 slow, should be evicted
+        for _ in 0..3 {
+            manager
+                .record_peer_latency(1, Duration::from_millis(300))
+                .await;
+        }
+        // After 5 slow samples, should be evicted
         assert_eq!(
             manager.get_peer_health(1).await,
             Some(FollowerStatus::Evicted)
@@ -1090,9 +1094,9 @@ mod tests {
         assert_eq!(manager.healthy_peer_count().await, 3);
 
         // Evict peer 1
-        for _ in 0..3 {
+        for _ in 0..5 {
             manager
-                .record_peer_latency(1, Duration::from_millis(20))
+                .record_peer_latency(1, Duration::from_millis(300))
                 .await;
         }
 
@@ -1111,9 +1115,9 @@ mod tests {
         manager.add_peer(1, "127.0.0.1:1998".parse().unwrap()).await;
 
         // Evict peer
-        for _ in 0..3 {
+        for _ in 0..5 {
             manager
-                .record_peer_latency(1, Duration::from_millis(20))
+                .record_peer_latency(1, Duration::from_millis(300))
                 .await;
         }
         assert_eq!(
@@ -1122,7 +1126,7 @@ mod tests {
         );
 
         // Recover with fast latencies (need recovery_window consecutive fast responses)
-        for _ in 0..10 {
+        for _ in 0..5 {
             manager
                 .record_peer_latency(1, Duration::from_millis(5))
                 .await;

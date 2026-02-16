@@ -42,6 +42,8 @@
 - [Coordinator Runtime Isolation (Step 2)](#coordinator-runtime-isolation-step-2)
 - [Data Forwarder Runtime Isolation (Step 3)](#data-forwarder-runtime-isolation-step-3)
 - [Replication Transport Concurrency (PeerManager)](#replication-transport-concurrency-peermanager)
+- [Ingest ACK Semantics (Local Durability vs Quorum)](#ingest-ack-semantics-local-durability-vs-quorum)
+- [Ingest ACK Semantics (Local Durability vs Quorum)](#ingest-ack-semantics-local-durability-vs-quorum)
 
 ---
 
@@ -5635,6 +5637,23 @@ This removes replication-forwarding CPU and async scheduling pressure from the m
 - Raft RPC request/response (`AppendEntries`, `PreVote`, `Vote`) remains serialized per peer to preserve protocol correctness without message IDs
 
 This design ensures one slow/unreachable follower cannot delay heartbeats or control RPCs to other followers, reducing election churn under load while keeping existing wire protocol semantics.
+## Ingest ACK Semantics (Local Durability vs Quorum)
+
+## Ingest ACK Semantics (Local Durability vs Quorum)
+
+For high-throughput ingest, client ACKs are now gated on **local durability only** (ingestion actor write completion / fsync boundary) and are **not blocked** on quorum wait completion.
+
+- Connection handler waits for `write_done` before returning ACK to client.
+- Quorum wait (`AsyncQuorumManager::wait_for_quorum`) runs off-path in background tasks.
+- Quorum failures/timeouts remain observable via logs/metrics and still impact replication health, but they no longer directly stall the ingest response path.
+
+Rationale:
+- Prevent control-plane replication latency from backpressuring data-plane ACK latency.
+- Preserve local durability guarantees while isolating Raft jitter/elections from client write RTT.
+
+Trade-off:
+- ACK now means "durable on leader" rather than "quorum-committed".
+- Operators should monitor quorum failure metrics and logs as first-class SLO signals for replication health.
 ---
 
 [↑ Back to Top](#technical-design-project-lance) | [← Back to Docs Index](./README.md)

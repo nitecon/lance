@@ -503,6 +503,7 @@ impl ClusterCoordinator {
         };
 
         let peer_ids = self.peers.peer_ids().await;
+        let expected_follower_count = peer_ids.len();
         let connected_follower_count = self
             .peers
             .peer_states()
@@ -564,7 +565,7 @@ impl ClusterCoordinator {
                 let raft = self.raft.read().await;
                 raft.commit_index() >= new_log_index
             };
-            if committed && (!sync_quorum || success_count >= connected_follower_count) {
+            if committed && (!sync_quorum || success_count >= expected_follower_count) {
                 break;
             }
 
@@ -602,11 +603,13 @@ impl ClusterCoordinator {
             ));
         }
 
-        // For client-facing topic metadata operations, require full follower convergence
-        // to avoid serving divergent topic registries behind a load-balanced endpoint.
-        if sync_quorum && success_count < connected_follower_count {
+        // For client-facing topic metadata operations, require full convergence to
+        // all configured followers (not just currently connected). Treating
+        // disconnected peers as optional can return false success and create
+        // divergent topic registries behind a load-balanced endpoint.
+        if sync_quorum && success_count < expected_follower_count {
             return Err(std::io::Error::other(format!(
-                "Topic operation not replicated to all connected followers (acked={success_count}, connected={connected_follower_count})"
+                "Topic operation not replicated to all followers (acked={success_count}, expected={expected_follower_count}, connected_now={connected_follower_count})"
             )));
         }
 

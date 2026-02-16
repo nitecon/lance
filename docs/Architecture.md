@@ -16,7 +16,11 @@
 - [10. Container Deployment & Ephemeral Integrity](#10-container-deployment-ephemeral-integrity)
 - [11. Chaos Testing & Failure Mode Design](#11-chaos-testing-failure-mode-design)
 - [12. Observability & Telemetry](#12-observability-telemetry)
+- [5.4 Revised Write Path: End-to-End Flow](#54-revised-write-path-end-to-end-flow)
 - [13. Memory Layout & Zero-Copy Primitives](#13-memory-layout-zero-copy-primitives)
+- [13.10 Bit-Packing: node_actor_seq Implementation](#1310-bit-packing-node_actor_seq-implementation)
+- [13.11 io_uring Probe & Fallback Strategy](#1311-io_uring-probe-fallback-strategy)
+- [13.12 SIMD-Accelerated Checksumming](#1312-simd-accelerated-checksumming)
 - [14. Thread Pinning & NUMA Awareness](#14-thread-pinning-numa-awareness)
 - [15. Buffer Ownership & Lifecycle (The Loaner Pattern)](#15-buffer-ownership-lifecycle-the-loaner-pattern)
 - [16. The LANCE Wire Protocol (LWP)](#16-the-lance-wire-protocol-lwp)
@@ -28,6 +32,15 @@
 - [22. Write Buffering & Deferred Sync Architecture](#22-write-buffering-deferred-sync-architecture)
 - [23. CATCHING_UP Protocol](#23-catching_up-protocol)
 - [24. Recursive Segment Recovery](#24-recursive-segment-recovery)
+- [25. Segment Compaction](#25-segment-compaction)
+- [26. Circuit Breaker](#26-circuit-breaker)
+- [27. Retention Service](#27-retention-service)
+- [28. Token Authentication](#28-token-authentication)
+- [29. Hybrid Logical Clock (HLC)](#29-hybrid-logical-clock-hlc)
+- [30. Subscription Management](#30-subscription-management)
+- [Raft Persistence Execution Isolation (Step 1)](#raft-persistence-execution-isolation-step-1)
+- [Coordinator Runtime Isolation (Step 2)](#coordinator-runtime-isolation-step-2)
+- [Data Forwarder Runtime Isolation (Step 3)](#data-forwarder-runtime-isolation-step-3)
 
 ---
 
@@ -5561,7 +5574,56 @@ The `SubscriptionManager` provides **server-assisted** offset tracking that comp
 ### 30.5 Concurrency
 
 The `SubscriptionManager` uses `RwLock<HashMap<...>>` for both maps. This is acceptable because subscription operations are infrequent control-plane events (not hot-path data-plane). The `RwLock` allows concurrent reads (e.g., multiple `get_committed_offset` calls) while serialising writes.
+## Raft Persistence Execution Isolation (Step 1)
 
+### Raft Persistence Execution Isolation (Step 1)
+
+To prevent Raft durability operations from blocking async executor workers, persistence-heavy operations in the cluster control plane are offloaded to blocking workers.
+
+Implemented in `lnc-replication/src/cluster.rs`:
+
+- Follower `AppendEntries` persistence (`truncate_from` + `append`) runs via `tokio::task::spawn_blocking`.
+- Leader-side log persistence for `replicate_data_enriched` runs via `spawn_blocking`.
+- Leader No-Op entry persistence runs via `spawn_blocking`.
+- Raft term/vote state persistence before elections runs via `spawn_blocking`.
+- Snapshot log compaction (`compact_to`) runs via `spawn_blocking`.
+
+This preserves Raft durability ordering while reducing risk of Tokio worker starvation under disk contention.
+
+## Coordinator Runtime Isolation (Step 2)
+
+### Coordinator Runtime Isolation (Step 2)
+
+To isolate Raft/control-plane scheduling from the main server async runtime, coordinator bootstrap was moved onto a dedicated OS thread that owns its own Tokio runtime.
+
+Implemented in `lance/src/server/mod.rs`:
+
+- Cluster coordinator initialization (`start_listener`, `initialize`, `run`, `graceful_shutdown`) now runs inside a dedicated thread named `lance-coordinator-{node_id}`.
+- The dedicated thread uses a bounded `tokio::runtime::Builder::new_current_thread().enable_all()` runtime for coordinator work.
+- Optional CPU affinity can be configured via `coordinator_pin_core` to pin the coordinator thread before runtime startup.
+- Server shutdown now joins the dedicated coordinator thread via `tokio::task::spawn_blocking` to avoid blocking async workers during thread join.
+- The cluster startup log now records whether the dedicated coordinator runtime was successfully started.
+
+This separation keeps client accept/forwarding and other server-runtime tasks isolated from coordinator loop scheduling pressure, making runtime contention easier to reason about during failure and chaos scenarios.
+
+## Data Forwarder Runtime Isolation (Step 3)
+
+### Data Forwarder Runtime Isolation (Step 3)
+
+To prevent data replication forwarding work from contending with the main server runtime, the data forwarder loop now runs on its own dedicated OS thread with a dedicated Tokio runtime.
+
+Implemented in `lance/src/server/mod.rs`:
+
+- The `repl_rx` receive loop and `replicate_data_enriched` forwarding path are executed on a dedicated thread named `lance-forwarder-{node_id}`.
+- The forwarder thread uses `tokio::runtime::Builder::new_current_thread().enable_all()` to isolate scheduling from connection accept/dispatch.
+- Optional CPU affinity can be configured via `forwarder_pin_core` to pin the forwarder thread before runtime startup.
+- Forwarder channel capacity is configurable via `data_replication_channel_capacity` (default: `65536`) to absorb bursty replication traffic.
+- Forwarder pipelining is configurable via `replication_max_inflight` (default: `1`). Values `>1` enable bounded in-flight replication via `JoinSet` to hide network RTT.
+- The forwarder loop applies natural backpressure by pausing receive when the in-flight set reaches `replication_max_inflight`.
+- Forwarder shutdown is coordinated via `shutdown_rx` and channel closure (`data_repl_tx` drop), then joined using `tokio::task::spawn_blocking`.
+- Forwarder lifecycle logs now clearly indicate dedicated-runtime startup and shutdown.
+
+This removes replication-forwarding CPU and async scheduling pressure from the main runtime while preserving existing quorum ACK accounting semantics.
 ---
 
 [↑ Back to Top](#technical-design-project-lance) | [← Back to Docs Index](./README.md)

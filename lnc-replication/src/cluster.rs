@@ -51,6 +51,39 @@ pub enum ClusterEvent {
     DataReceivedEnriched(crate::codec::DataReplicationEntry),
 }
 
+/// Persist follower AppendEntries state transition without blocking async workers.
+async fn persist_append_entries_blocking(
+    log_store: Option<Arc<std::sync::Mutex<LogStore>>>,
+    prev_log_index: u64,
+    prev_log_term: u64,
+    entries: Vec<crate::codec::LogEntry>,
+) -> Result<(), std::io::Error> {
+    let Some(store) = log_store else {
+        return Ok(());
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let mut guard = store
+            .lock()
+            .map_err(|e| std::io::Error::other(format!("Raft log store lock poisoned: {e}")))?;
+
+        if prev_log_index > 0 {
+            let matches = guard.matches(prev_log_index, prev_log_term);
+            if !matches {
+                guard
+                    .truncate_from(prev_log_index + 1)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
+        }
+
+        guard
+            .append(entries)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("Append persistence task failed: {e}")))?
+}
+
 /// Cluster coordinator state
 pub struct ClusterCoordinator {
     config: ClusterConfig,
@@ -352,6 +385,27 @@ impl ClusterCoordinator {
         self.peers.peer_states().await
     }
 
+    /// Persist a single log entry without blocking async executor workers.
+    async fn persist_log_entry_blocking(
+        &self,
+        entry: crate::codec::LogEntry,
+    ) -> Result<(), std::io::Error> {
+        let Some(store) = self.log_store.clone() else {
+            return Ok(());
+        };
+
+        tokio::task::spawn_blocking(move || {
+            let mut guard = store
+                .lock()
+                .map_err(|e| std::io::Error::other(format!("Raft log store lock poisoned: {e}")))?;
+            guard
+                .append(vec![entry])
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("Raft log persistence task failed: {e}")))?
+    }
+
     /// Replicate a topic operation to followers (leader only)
     /// Uses L3 quorum replication - waits for quorum ACKs before returning
     pub async fn replicate_topic_op(
@@ -370,8 +424,9 @@ impl ClusterCoordinator {
         self.replicate_topic_op_internal(op, true).await
     }
 
-    /// Internal replication implementation
-    /// sync_quorum: if true, wait for ACKs from M/2+1 nodes before returning
+    /// Internal replication implementation.
+    /// `sync_quorum`: when true, require ACKs from all currently connected followers
+    /// before returning success to client-facing metadata operations.
     async fn replicate_topic_op_internal(
         &self,
         op: crate::codec::TopicOperation,
@@ -390,14 +445,27 @@ impl ClusterCoordinator {
 
         let op_bytes = op.to_bytes();
 
-        // Create log entry for the topic operation
-        let entry = crate::codec::LogEntry {
-            term: self.current_term().await,
-            index: 0, // Will be assigned by Raft
+        // Advance leader log first so prev_log_index/term are coherent for followers.
+        let (term, prev_log_index, prev_log_term, new_log_index) = {
+            let mut raft = self.raft.write().await;
+            let prev_idx = raft.last_log_index();
+            let prev_term = raft.current_term();
+            raft.advance_log(1);
+            (
+                raft.current_term(),
+                prev_idx,
+                prev_term,
+                raft.last_log_index(),
+            )
+        };
+
+        let log_entry = crate::codec::LogEntry {
+            term,
+            index: new_log_index,
             hlc: lnc_core::HlcTimestamp::new(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
+                    .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0),
                 0,
             ),
@@ -405,134 +473,174 @@ impl ClusterCoordinator {
             data: op_bytes,
         };
 
-        // For sync quorum, register the write before broadcasting
-        let quorum_handle = if sync_quorum {
-            Some(self.quorum_manager.register_write().await)
-        } else {
-            None
+        // Leader durability before replication.
+        if let Err(e) = self.persist_log_entry_blocking(log_entry.clone()).await {
+            error!(
+                target: "lance::cluster",
+                error = %e,
+                topic_op = ?op,
+                "Leader failed to persist topic operation"
+            );
+            return Err(std::io::Error::other(format!(
+                "Leader log persistence failed: {}",
+                e
+            )));
+        }
+
+        let leader_commit = {
+            let raft = self.raft.read().await;
+            raft.commit_index()
         };
 
-        // Create AppendEntries request with the topic operation
         let request = crate::codec::AppendEntriesRequest {
-            term: entry.term,
+            term,
             leader_id: self.config.node_id,
-            prev_log_index: 0,
-            prev_log_term: 0,
-            leader_commit: 0,
-            leader_hlc: entry.hlc,
-            entries: vec![entry],
+            prev_log_index,
+            prev_log_term,
+            leader_commit,
+            leader_hlc: log_entry.hlc,
+            entries: vec![log_entry],
         };
 
-        let msg = ReplicationMessage::AppendEntriesRequest(request);
+        let peer_ids = self.peers.peer_ids().await;
+        let connected_follower_count = self
+            .peers
+            .peer_states()
+            .await
+            .values()
+            .filter(|state| **state == PeerState::Connected)
+            .count();
+        let mut success_count: usize = 0;
+        let mut fail_count: usize = 0;
+        let mut pending_peers = peer_ids;
+        let max_attempts = 3usize;
 
-        // Broadcast to all peers
-        let results = self.peers.broadcast(&msg).await;
+        for attempt in 1..=max_attempts {
+            if pending_peers.is_empty() {
+                break;
+            }
 
-        // Count successful sends
-        let success_count = results.iter().filter(|(_, r)| r.is_ok()).count();
-        let total_peers = results.len();
+            let mut join_set = tokio::task::JoinSet::new();
+            let current_batch = std::mem::take(&mut pending_peers);
 
-        // For sync quorum mode, wait for ACKs
-        if let Some((write_id, rx)) = quorum_handle {
-            // Record immediate ACKs from successful sends
-            // (In a full implementation, we'd wait for actual AppendEntriesResponse)
-            for (node_id, result) in &results {
-                if result.is_ok() {
-                    self.quorum_manager.record_ack(write_id, *node_id).await;
+            for peer_id in current_batch {
+                let peers = Arc::clone(&self.peers);
+                let req = request.clone();
+                join_set.spawn(async move {
+                    let result = match tokio::time::timeout(
+                        Duration::from_secs(3),
+                        peers.send_append_entries(peer_id, req),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Topic operation AppendEntries RPC timed out",
+                        )),
+                    };
+                    (peer_id, result)
+                });
+            }
+
+            while let Some(join_result) = join_set.join_next().await {
+                if let Ok((peer_id, result)) = join_result {
+                    match result {
+                        Ok(resp) if resp.success => {
+                            success_count += 1;
+                            let mut raft = self.raft.write().await;
+                            let _ = raft.update_match_index(peer_id, resp.match_index);
+                        },
+                        Ok(_) | Err(_) => {
+                            pending_peers.push(peer_id);
+                        },
+                    }
                 } else {
-                    self.quorum_manager.record_nack(write_id, *node_id).await;
+                    fail_count += 1;
                 }
             }
 
-            // Wait for quorum with timeout
-            let quorum_result = self.quorum_manager.wait_for_quorum(write_id, rx).await;
-
-            match quorum_result {
-                crate::quorum::QuorumResult::Success => {
-                    // Record replication latency on success
-                    lnc_metrics::record_replication_latency(replication_start.elapsed());
-                    // Update last sync time for lag tracking
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    self.last_sync_time
-                        .store(now_ms, std::sync::atomic::Ordering::Relaxed);
-                    info!(
-                        target: "lance::cluster",
-                        write_id,
-                        success_count,
-                        total_peers,
-                        latency_us = replication_start.elapsed().as_micros(),
-                        "Topic operation replicated with sync quorum"
-                    );
-                    Ok(())
-                },
-                crate::quorum::QuorumResult::Timeout => {
-                    lnc_metrics::increment_quorum_timeouts();
-                    warn!(
-                        target: "lance::cluster",
-                        write_id,
-                        success_count,
-                        total_peers,
-                        "Sync quorum timeout for topic operation"
-                    );
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Sync quorum timeout for topic replication",
-                    ))
-                },
-                crate::quorum::QuorumResult::Failed
-                | crate::quorum::QuorumResult::Partial { .. } => {
-                    lnc_metrics::increment_quorum_failures();
-                    warn!(
-                        target: "lance::cluster",
-                        write_id,
-                        success_count,
-                        total_peers,
-                        "Failed to reach sync quorum for topic operation"
-                    );
-                    Err(std::io::Error::other(
-                        "Failed to reach sync quorum for topic replication",
-                    ))
-                },
+            let committed = {
+                let raft = self.raft.read().await;
+                raft.commit_index() >= new_log_index
+            };
+            if committed && (!sync_quorum || success_count >= connected_follower_count) {
+                break;
             }
-        } else {
-            // Quorum mode (L3) - check broadcast success
-            let quorum = (total_peers / 2) + 1;
 
-            if success_count >= quorum || total_peers == 0 {
-                // Record replication latency on success
-                lnc_metrics::record_replication_latency(replication_start.elapsed());
-                // Update last sync time for lag tracking
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                self.last_sync_time
-                    .store(now_ms, std::sync::atomic::Ordering::Relaxed);
-                info!(
-                    target: "lance::cluster",
-                    success_count,
-                    total_peers,
-                    latency_us = replication_start.elapsed().as_micros(),
-                    "Topic operation replicated (async)"
-                );
-                Ok(())
-            } else {
-                lnc_metrics::increment_quorum_failures();
+            if !pending_peers.is_empty() {
                 warn!(
                     target: "lance::cluster",
-                    success_count,
-                    total_peers,
-                    quorum,
-                    "Failed to reach quorum for topic operation"
+                    log_index = new_log_index,
+                    attempt,
+                    pending = pending_peers.len(),
+                    "Retrying topic operation replication for pending peers"
                 );
-                Err(std::io::Error::other(
-                    "Failed to reach quorum for topic replication",
-                ))
+                tokio::time::sleep(Duration::from_millis(40)).await;
             }
         }
+
+        fail_count += pending_peers.len();
+
+        let committed = {
+            let raft = self.raft.read().await;
+            raft.commit_index() >= new_log_index
+        };
+
+        if !committed {
+            lnc_metrics::increment_quorum_failures();
+            warn!(
+                target: "lance::cluster",
+                log_index = new_log_index,
+                success_count,
+                fail_count,
+                sync_quorum,
+                "Topic operation replicated but not committed (quorum not reached)"
+            );
+            return Err(std::io::Error::other(
+                "Topic operation replication quorum not reached",
+            ));
+        }
+
+        // For client-facing topic metadata operations, require full follower convergence
+        // to avoid serving divergent topic registries behind a load-balanced endpoint.
+        if sync_quorum && success_count < connected_follower_count {
+            return Err(std::io::Error::other(format!(
+                "Topic operation not replicated to all connected followers (acked={success_count}, connected={connected_follower_count})"
+            )));
+        }
+
+        self.commit_notify.notify_one();
+
+        // Best-effort commit-index heartbeat so followers that appended the entry can
+        // apply it immediately instead of waiting for the next periodic heartbeat.
+        if let Some(commit_req) = {
+            let raft = self.raft.read().await;
+            raft.create_append_entries(Vec::new())
+        } {
+            let msg = crate::codec::ReplicationMessage::AppendEntriesRequest(commit_req);
+            let _ = self.peers.broadcast(&msg).await;
+        }
+
+        // Record replication latency on success
+        lnc_metrics::record_replication_latency(replication_start.elapsed());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_sync_time
+            .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+
+        info!(
+            target: "lance::cluster",
+            log_index = new_log_index,
+            success_count,
+            fail_count,
+            sync_quorum,
+            latency_us = replication_start.elapsed().as_micros(),
+            "Topic operation replicated and committed"
+        );
+        Ok(())
     }
 
     /// Replicate ingested data to followers using the enriched wire format (L3 quorum).
@@ -582,21 +690,17 @@ impl ClusterCoordinator {
         };
 
         // Persist to leader's own log store BEFORE sending to followers (Raft durability)
-        if let Some(ref store) = self.log_store {
-            if let Ok(mut guard) = store.lock() {
-                if let Err(e) = guard.append(vec![log_entry.clone()]) {
-                    error!(
-                        target: "lance::cluster",
-                        topic_id = entry.topic_id,
-                        error = %e,
-                        "Leader failed to persist log entry"
-                    );
-                    return Err(std::io::Error::other(format!(
-                        "Leader log persistence failed: {}",
-                        e
-                    )));
-                }
-            }
+        if let Err(e) = self.persist_log_entry_blocking(log_entry.clone()).await {
+            error!(
+                target: "lance::cluster",
+                topic_id = entry.topic_id,
+                error = %e,
+                "Leader failed to persist log entry"
+            );
+            return Err(std::io::Error::other(format!(
+                "Leader log persistence failed: {}",
+                e
+            )));
         }
 
         // Get current commit_index to send to followers
@@ -917,17 +1021,13 @@ impl ClusterCoordinator {
         );
 
         // Persist to leader's log store
-        if let Some(ref store) = self.log_store {
-            if let Ok(mut guard) = store.lock() {
-                if let Err(e) = guard.append(vec![entry.clone()]) {
-                    error!(
-                        target: "lance::cluster",
-                        error = %e,
-                        "Failed to persist No-Op entry"
-                    );
-                    return;
-                }
-            }
+        if let Err(e) = self.persist_log_entry_blocking(entry.clone()).await {
+            error!(
+                target: "lance::cluster",
+                error = %e,
+                "Failed to persist No-Op entry"
+            );
+            return;
         }
 
         // Replicate to followers
@@ -1212,16 +1312,18 @@ impl ClusterCoordinator {
     }
 
     async fn on_election_check(&self) {
-        let (should_start_election, is_leader) = {
+        let (should_start_election, is_leader, pre_vote_in_progress) = {
             let raft = self.raft.read().await;
             (
                 raft.election_timeout_elapsed(),
                 raft.state() == RaftState::Leader,
+                raft.pre_vote_in_progress(),
             )
         };
 
-        // Leaders send heartbeats, they don't start elections
-        if is_leader {
+        // Leaders send heartbeats, they don't start elections.
+        // Also avoid kicking off overlapping election rounds while pre-vote is active.
+        if is_leader || pre_vote_in_progress {
             return;
         }
 
@@ -1353,6 +1455,10 @@ impl ClusterCoordinator {
             };
 
             if !has_quorum {
+                {
+                    let mut raft = self.raft.write().await;
+                    raft.finish_failed_pre_vote_round();
+                }
                 info!(
                     target: "lance::cluster",
                     "Pre-vote failed, not enough votes"
@@ -1361,23 +1467,45 @@ impl ClusterCoordinator {
         }
     }
 
-    /// Persist Raft state (term, voted_for) to durable storage
-    fn persist_state(&self, term: u64, voted_for: Option<u16>) {
-        if let Some(ref log_store) = self.log_store {
-            if let Ok(store) = log_store.lock() {
-                let state = crate::log_store::PersistentState {
-                    current_term: term,
-                    voted_for,
-                };
-                if let Err(e) = store.save_state(&state) {
-                    error!(
-                        target: "lance::cluster",
-                        error = %e,
-                        term,
-                        "Failed to persist Raft state"
-                    );
-                }
-            }
+    /// Persist Raft state (term, voted_for) to durable storage without blocking
+    /// async executor workers.
+    async fn persist_state_blocking(&self, term: u64, voted_for: Option<u16>) {
+        let Some(log_store) = self.log_store.clone() else {
+            return;
+        };
+
+        let result = tokio::task::spawn_blocking(move || {
+            let store = log_store
+                .lock()
+                .map_err(|e| std::io::Error::other(format!("Raft log store lock poisoned: {e}")))?;
+            let state = crate::log_store::PersistentState {
+                current_term: term,
+                voted_for,
+            };
+            store
+                .save_state(&state)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => {
+                error!(
+                    target: "lance::cluster",
+                    error = %e,
+                    term,
+                    "Failed to persist Raft state"
+                );
+            },
+            Err(e) => {
+                error!(
+                    target: "lance::cluster",
+                    error = %e,
+                    term,
+                    "Raft state persistence task failed"
+                );
+            },
         }
     }
 
@@ -1385,15 +1513,16 @@ impl ClusterCoordinator {
         // CRITICAL: Persist state BEFORE sending vote requests to prevent split-brain
         // If we crash after sending requests but before persisting, we could reboot
         // and vote for a different candidate in the same term (Raft safety violation)
-        let vote_request = {
+        let (vote_request, term, voted_for) = {
             let mut raft = self.raft.write().await;
             let req = raft.start_election();
-
-            // Persist immediately while holding the lock to ensure atomicity
-            self.persist_state(raft.current_term(), raft.voted_for);
-
-            req
+            let term = raft.current_term();
+            let voted_for = raft.voted_for;
+            (req, term, voted_for)
         };
+
+        // Persist immediately before sending vote requests.
+        self.persist_state_blocking(term, voted_for).await;
 
         // Send VoteRequest to all peers CONCURRENTLY
         let peer_ids: Vec<u16> = self.peers.peer_states().await.keys().copied().collect();
@@ -1544,32 +1673,19 @@ async fn handle_peer_connection(
                 // Persist log entries before acknowledging (Raft durability guarantee).
                 // NO event emission here — the Apply Loop handles that after commit.
                 if !req.entries.is_empty() {
-                    if let Some(ref store) = log_store {
-                        if let Ok(mut guard) = store.lock() {
-                            // Check if we need to truncate conflicting entries
-                            if req.prev_log_index > 0 {
-                                let matches = guard.matches(req.prev_log_index, req.prev_log_term);
-                                if !matches {
-                                    // Truncate from the conflict point
-                                    if let Err(e) = guard.truncate_from(req.prev_log_index + 1) {
-                                        warn!(
-                                            target: "lance::cluster",
-                                            error = %e,
-                                            "Failed to truncate log"
-                                        );
-                                    }
-                                }
-                            }
-
-                            // Append new entries
-                            if let Err(e) = guard.append(req.entries.clone()) {
-                                warn!(
-                                    target: "lance::cluster",
-                                    error = %e,
-                                    "Failed to append log entries"
-                                );
-                            }
-                        }
+                    if let Err(e) = persist_append_entries_blocking(
+                        log_store.clone(),
+                        req.prev_log_index,
+                        req.prev_log_term,
+                        req.entries.clone(),
+                    )
+                    .await
+                    {
+                        warn!(
+                            target: "lance::cluster",
+                            error = %e,
+                            "Failed to persist append entries"
+                        );
                     }
                 }
 
@@ -1624,20 +1740,38 @@ async fn handle_peer_connection(
                     );
                 }
 
-                // Apply snapshot to log store
-                let bytes_stored = if let Some(ref store) = log_store {
-                    if let Ok(mut guard) = store.lock() {
-                        // Compact log up to snapshot index
-                        if let Err(e) = guard.compact_to(req.last_included_index) {
+                // Apply snapshot to log store without blocking async workers.
+                let bytes_stored = if let Some(store) = log_store.clone() {
+                    let snapshot_index = req.last_included_index;
+                    let snapshot_bytes = req.data.len() as u64;
+                    match tokio::task::spawn_blocking(move || {
+                        let mut guard = store.lock().map_err(|e| {
+                            std::io::Error::other(format!("Raft log store lock poisoned: {e}"))
+                        })?;
+                        guard
+                            .compact_to(snapshot_index)
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        Ok::<u64, std::io::Error>(snapshot_bytes)
+                    })
+                    .await
+                    {
+                        Ok(Ok(bytes)) => bytes,
+                        Ok(Err(e)) => {
                             warn!(
                                 target: "lance::cluster",
                                 error = %e,
                                 "Failed to compact log for snapshot"
                             );
-                        }
-                        req.data.len() as u64
-                    } else {
-                        0
+                            0
+                        },
+                        Err(e) => {
+                            warn!(
+                                target: "lance::cluster",
+                                error = %e,
+                                "Snapshot compaction task failed"
+                            );
+                            0
+                        },
                     }
                 } else {
                     req.data.len() as u64
@@ -1695,6 +1829,21 @@ async fn handle_peer_connection(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use lnc_core::HlcTimestamp;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn make_log_entry(term: u64, index: u64, payload: &[u8]) -> crate::codec::LogEntry {
+        crate::codec::LogEntry {
+            term,
+            index,
+            hlc: HlcTimestamp::new(1_000, 0),
+            entry_type: crate::codec::EntryType::Data,
+            data: bytes::Bytes::copy_from_slice(payload),
+        }
+    }
 
     #[test]
     fn test_cluster_coordinator_new() {
@@ -1716,5 +1865,75 @@ mod tests {
         let coordinator = ClusterCoordinator::new(config);
         let _rx = coordinator.subscribe();
         // Should not panic
+    }
+
+    #[tokio::test]
+    async fn test_persist_append_entries_blocking_persists_new_entries() {
+        let dir = tempdir().unwrap();
+        let mut store = LogStore::open(dir.path()).unwrap();
+        store
+            .append(vec![make_log_entry(1, 1, b"a"), make_log_entry(1, 2, b"b")])
+            .unwrap();
+
+        let log_store = Arc::new(std::sync::Mutex::new(store));
+
+        // Matching prev_log_index/term should append next entry durably.
+        persist_append_entries_blocking(
+            Some(Arc::clone(&log_store)),
+            2,
+            1,
+            vec![make_log_entry(2, 3, b"c")],
+        )
+        .await
+        .unwrap();
+
+        let guard = log_store.lock().unwrap();
+        assert!(guard.matches(2, 1));
+        assert!(guard.matches(3, 2));
+        assert_eq!(guard.last_index(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_persist_append_entries_blocking_does_not_block_async_runtime() {
+        let dir = tempdir().unwrap();
+        let store = LogStore::open(dir.path()).unwrap();
+        let log_store = Arc::new(std::sync::Mutex::new(store));
+
+        // Hold lock from a plain thread to force persistence helper to wait.
+        let held_store = Arc::clone(&log_store);
+        let lock_holder = std::thread::spawn(move || {
+            let _guard = held_store.lock().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        // Give lock_holder a chance to acquire the lock first.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Heartbeat task should keep ticking while persistence awaits lock release.
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticks_clone = Arc::clone(&ticks);
+        let heartbeat = tokio::spawn(async move {
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                ticks_clone.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        persist_append_entries_blocking(
+            Some(Arc::clone(&log_store)),
+            0,
+            0,
+            vec![make_log_entry(1, 1, b"x")],
+        )
+        .await
+        .unwrap();
+
+        lock_holder.join().unwrap();
+        heartbeat.await.unwrap();
+
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "heartbeat task should make progress while append persistence waits"
+        );
     }
 }

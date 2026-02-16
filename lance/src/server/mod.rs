@@ -70,6 +70,22 @@ pub async fn run(
         );
     }
 
+    if let Some(core_id) = config.coordinator_pin_core {
+        info!(
+            target: "lance::server",
+            core_id,
+            "Thread pinning enabled for coordinator runtime"
+        );
+    }
+
+    if let Some(core_id) = config.forwarder_pin_core {
+        info!(
+            target: "lance::server",
+            core_id,
+            "Thread pinning enabled for forwarder runtime"
+        );
+    }
+
     // BLOCKING RECOVERY (Required for data safety)
     // We cannot open TopicRegistry until we confirm segments are clean.
     // Race condition: Recovery truncates files while Registry reads them = corruption.
@@ -97,7 +113,9 @@ pub async fn run(
         Option<tokio::sync::mpsc::Sender<DataReplicationRequest>>,
         Option<tokio::sync::mpsc::Receiver<DataReplicationRequest>>,
     ) = if config.replication_mode().is_replicated() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<DataReplicationRequest>(8192);
+        let (tx, rx) = tokio::sync::mpsc::channel::<DataReplicationRequest>(
+            config.data_replication_channel_capacity,
+        );
         (Some(tx), Some(rx))
     } else {
         (None, None)
@@ -138,8 +156,10 @@ pub async fn run(
         replication_actor.run().await;
     });
 
-    // Start cluster coordinator for multi-node replication
-    let cluster_coordinator = if config.replication_mode().is_replicated() {
+    // Start cluster coordinator for multi-node replication.
+    // Step 2: run coordinator control-plane on a dedicated OS thread + Tokio runtime.
+    let (cluster_coordinator, cluster_runtime_handle) = if config.replication_mode().is_replicated()
+    {
         let cluster_config = config.cluster_config_async().await;
 
         // Use persistent log storage for durable Raft state (term, voted_for, log entries).
@@ -164,23 +184,84 @@ pub async fn run(
                 },
             };
 
-        // Start replication listener first (so peers can connect to us)
-        if let Err(e) = coordinator.start_listener().await {
-            warn!(
-                target: "lance::server",
-                error = %e,
-                "Failed to start replication listener"
-            );
-        }
+        // Bootstrap the control-plane runtime on its own dedicated OS thread.
+        let runtime_coord = Arc::clone(&coordinator);
+        let runtime_shutdown = shutdown_rx.resubscribe();
+        let runtime_name = format!("lance-coordinator-{}", config.node_id);
+        let coordinator_pin_core = config.coordinator_pin_core;
+        let runtime_thread = match std::thread::Builder::new()
+            .name(runtime_name.clone())
+            .spawn(move || {
+                if let Some(core_id) = coordinator_pin_core {
+                    match lnc_core::pin_thread_to_cpu(core_id) {
+                        Ok(()) => {
+                            info!(
+                                target: "lance::server",
+                                core_id,
+                                thread_name = %runtime_name,
+                                "Pinned coordinator runtime thread to CPU core"
+                            );
+                        },
+                        Err(e) => {
+                            warn!(
+                                target: "lance::server",
+                                core_id,
+                                thread_name = %runtime_name,
+                                error = %e,
+                                "Failed to pin coordinator runtime thread to CPU core"
+                            );
+                        },
+                    }
+                }
 
-        // Initialize cluster - discover and connect to peers
-        if let Err(e) = coordinator.initialize().await {
-            warn!(
-                target: "lance::server",
-                error = %e,
-                "Failed to initialize cluster coordinator, continuing in standalone mode"
-            );
-        }
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        error!(
+                            target: "lance::server",
+                            error = %e,
+                            thread_name = %runtime_name,
+                            "Failed to build dedicated coordinator runtime"
+                        );
+                        return;
+                    },
+                };
+
+                runtime.block_on(async move {
+                    // Start replication listener first (so peers can connect to us)
+                    if let Err(e) = runtime_coord.start_listener().await {
+                        warn!(
+                            target: "lance::server",
+                            error = %e,
+                            "Failed to start replication listener on dedicated runtime"
+                        );
+                    }
+
+                    // Initialize cluster - discover and connect to peers
+                    if let Err(e) = runtime_coord.initialize().await {
+                        warn!(
+                            target: "lance::server",
+                            error = %e,
+                            "Failed to initialize cluster coordinator on dedicated runtime"
+                        );
+                    }
+
+                    runtime_coord.run(runtime_shutdown).await;
+                });
+            }) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                warn!(
+                    target: "lance::server",
+                    error = %e,
+                    "Failed to spawn dedicated coordinator runtime thread"
+                );
+                None
+            },
+        };
 
         // Start ResyncServer on leader side (dedicated port for bulk segment transfer).
         // The server listens on replication_port + port_offset (default: +1) and handles
@@ -522,28 +603,22 @@ pub async fn run(
             }
         });
 
-        // Now start cluster coordination loop (after event handler is ready to receive)
-        let coord_clone = Arc::clone(&coordinator);
-        let shutdown_for_cluster = shutdown_rx.resubscribe();
-        tokio::spawn(async move {
-            coord_clone.run(shutdown_for_cluster).await;
-        });
-
         info!(
             target: "lance::server",
             node_id = config.node_id,
             replication_addr = %config.replication_addr,
             peers = ?config.peers,
+            dedicated_runtime = runtime_thread.is_some(),
             "Cluster coordinator started"
         );
 
-        Some(coordinator)
+        (Some(coordinator), runtime_thread)
     } else {
         info!(
             target: "lance::server",
             "Running in standalone mode (L1), cluster coordinator disabled"
         );
-        None
+        (None, None)
     };
 
     let cluster = cluster_coordinator;
@@ -568,62 +643,192 @@ pub async fn run(
             None
         };
 
-    // Start data replication forwarder task (leader sends data to followers).
-    // Placed after quorum_manager creation so the forwarder can record ACKs.
-    let forwarder_handle = if let (Some(coord), Some(mut repl_rx)) = (&cluster, data_repl_rx) {
+    // Start data replication forwarder on a dedicated runtime thread.
+    // Step 3: isolate data-forwarding execution from the main server runtime.
+    let forwarder_runtime_handle = if let (Some(coord), Some(mut repl_rx)) =
+        (&cluster, data_repl_rx)
+    {
         let repl_coord = Arc::clone(coord);
         let repl_qm = quorum_manager.clone();
-        Some(tokio::spawn(async move {
-            info!(
-                target: "lance::server",
-                "Data replication forwarder task started (enriched)"
-            );
-            while let Some(req) = repl_rx.recv().await {
-                // Build enriched replication entry from the write metadata
-                let mut flags = lnc_replication::ReplicationFlags::empty();
-                if req.is_new_segment {
-                    flags = flags.with_new_segment();
-                }
-                if req.rotated_after {
-                    flags = flags.with_rotate_after();
-                }
+        let forwarder_shutdown = shutdown_rx.resubscribe();
+        let runtime_name = format!("lance-forwarder-{}", config.node_id);
+        let forwarder_pin_core = config.forwarder_pin_core;
+        let max_inflight = config.replication_max_inflight.max(1);
 
-                let write_id = req.write_id;
-                let topic_id = req.topic_id;
-                let entry = lnc_replication::DataReplicationEntry {
-                    topic_id,
-                    global_offset: req.global_offset,
-                    segment_name: req.segment_name,
-                    write_offset: req.write_offset,
-                    flags,
-                    payload_crc: lnc_core::crc32c(&req.payload),
-                    payload: req.payload,
-                };
+        match std::thread::Builder::new()
+                .name(runtime_name.clone())
+                .spawn(move || {
+                    if let Some(core_id) = forwarder_pin_core {
+                        match lnc_core::pin_thread_to_cpu(core_id) {
+                            Ok(()) => {
+                                info!(
+                                    target: "lance::server",
+                                    core_id,
+                                    thread_name = %runtime_name,
+                                    "Pinned forwarder runtime thread to CPU core"
+                                );
+                            },
+                            Err(e) => {
+                                warn!(
+                                    target: "lance::server",
+                                    core_id,
+                                    thread_name = %runtime_name,
+                                    error = %e,
+                                    "Failed to pin forwarder runtime thread to CPU core"
+                                );
+                            },
+                        }
+                    }
 
-                match repl_coord.replicate_data_enriched(entry).await {
-                    Ok(successful_peers) => {
-                        // Record quorum ACKs for each peer that confirmed
-                        if let (Some(wid), Some(qm)) = (write_id, &repl_qm) {
-                            for peer_id in &successful_peers {
-                                qm.record_ack(wid, *peer_id).await;
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            error!(
+                                target: "lance::server",
+                                error = %e,
+                                thread_name = %runtime_name,
+                                "Failed to build dedicated forwarder runtime"
+                            );
+                            return;
+                        },
+                    };
+
+                    runtime.block_on(async move {
+                        let mut shutdown = forwarder_shutdown;
+                        let mut channel_closed = false;
+                        let mut inflight = tokio::task::JoinSet::new();
+                        info!(
+                            target: "lance::server",
+                            max_inflight,
+                            "Data replication forwarder started on dedicated runtime (enriched)"
+                        );
+
+                        loop {
+                            tokio::select! {
+                                maybe_req = repl_rx.recv(), if !channel_closed && inflight.len() < max_inflight => {
+                                    match maybe_req {
+                                        Some(req) => {
+                                            let mut flags = lnc_replication::ReplicationFlags::empty();
+                                            if req.is_new_segment {
+                                                flags = flags.with_new_segment();
+                                            }
+                                            if req.rotated_after {
+                                                flags = flags.with_rotate_after();
+                                            }
+
+                                            let write_id = req.write_id;
+                                            let topic_id = req.topic_id;
+                                            let entry = lnc_replication::DataReplicationEntry {
+                                                topic_id,
+                                                global_offset: req.global_offset,
+                                                segment_name: req.segment_name,
+                                                write_offset: req.write_offset,
+                                                flags,
+                                                payload_crc: lnc_core::crc32c(&req.payload),
+                                                payload: req.payload,
+                                            };
+
+                                            let coord = Arc::clone(&repl_coord);
+                                            inflight.spawn(async move {
+                                                (write_id, topic_id, coord.replicate_data_enriched(entry).await)
+                                            });
+                                        }
+                                        None => {
+                                            channel_closed = true;
+                                        }
+                                    }
+                                }
+                                Some(join_result) = inflight.join_next(), if !inflight.is_empty() => {
+                                    match join_result {
+                                        Ok((write_id, topic_id, replication_result)) => {
+                                            match replication_result {
+                                                Ok(successful_peers) => {
+                                                    if let (Some(wid), Some(qm)) = (write_id, &repl_qm) {
+                                                        for peer_id in successful_peers {
+                                                            qm.record_ack(wid, peer_id).await;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    debug!(
+                                                        target: "lance::server",
+                                                        topic_id,
+                                                        error = %e,
+                                                        "Pipelined replication failed"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                target: "lance::server",
+                                            error = %e,
+                                            "Forwarder in-flight task panicked"
+                                        );
+                                        }
+                                    }
+                                }
+                                _ = shutdown.recv() => {
+                                    break;
+                                }
+                            }
+
+                            if channel_closed && inflight.is_empty() {
+                                break;
                             }
                         }
-                    },
-                    Err(e) => {
-                        debug!(
+
+                        // Best-effort drain already-started in-flight tasks during clean channel close.
+                        while let Some(join_result) = inflight.join_next().await {
+                            match join_result {
+                                Ok((write_id, topic_id, replication_result)) => {
+                                    match replication_result {
+                                        Ok(successful_peers) => {
+                                            if let (Some(wid), Some(qm)) = (write_id, &repl_qm) {
+                                                for peer_id in successful_peers {
+                                                    qm.record_ack(wid, peer_id).await;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            debug!(
+                                                target: "lance::server",
+                                                topic_id,
+                                                error = %e,
+                                                "Pipelined replication failed during drain"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        target: "lance::server",
+                                        error = %e,
+                                        "Forwarder in-flight task panicked during drain"
+                                    );
+                                }
+                            }
+                        }
+
+                        info!(
                             target: "lance::server",
-                            topic_id,
-                            error = %e,
-                            "Data replication broadcast error (non-fatal)"
+                            "Data replication forwarder stopped"
                         );
-                    },
-                }
+                    });
+                }) {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    warn!(
+                        target: "lance::server",
+                        error = %e,
+                        "Failed to spawn dedicated forwarder runtime thread"
+                    );
+                    None
+                },
             }
-            info!(
-                target: "lance::server",
-                "Data replication forwarder task stopped"
-            );
-        }))
     } else {
         None
     };
@@ -847,11 +1052,49 @@ pub async fn run(
 
     // Drop replication channel sender so the forwarder sees channel closed.
     drop(data_repl_tx);
-    // Abort the forwarder — we cannot drain it because send_append_entries()
-    // blocks waiting for peer responses, and peers may be down during rolling
-    // restart. Draining would delay shutdown and cause K8s to force-kill the pod.
-    if let Some(fwd) = forwarder_handle {
-        fwd.abort();
+
+    // Join dedicated forwarder runtime thread after shutdown signal propagation.
+    if let Some(handle) = forwarder_runtime_handle {
+        match tokio::task::spawn_blocking(move || handle.join()).await {
+            Ok(Ok(())) => {
+                debug!(target: "lance::server", "Dedicated forwarder runtime thread joined");
+            },
+            Ok(Err(_)) => {
+                warn!(
+                    target: "lance::server",
+                    "Dedicated forwarder runtime thread panicked during shutdown"
+                );
+            },
+            Err(e) => {
+                warn!(
+                    target: "lance::server",
+                    error = %e,
+                    "Failed to join dedicated forwarder runtime thread"
+                );
+            },
+        }
+    }
+
+    // Join dedicated coordinator runtime thread after shutdown signal propagation.
+    if let Some(handle) = cluster_runtime_handle {
+        match tokio::task::spawn_blocking(move || handle.join()).await {
+            Ok(Ok(())) => {
+                debug!(target: "lance::server", "Dedicated coordinator runtime thread joined");
+            },
+            Ok(Err(_)) => {
+                warn!(
+                    target: "lance::server",
+                    "Dedicated coordinator runtime thread panicked during shutdown"
+                );
+            },
+            Err(e) => {
+                warn!(
+                    target: "lance::server",
+                    error = %e,
+                    "Failed to join dedicated coordinator runtime thread"
+                );
+            },
+        }
     }
 
     replication_handle.abort();

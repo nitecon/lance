@@ -130,5 +130,5 @@ echo "=============================================="
 echo "  Build complete!"
 echo "==============================================" 
 
-kubectl rollout restart statefulset/lance
-kubectl rollout status statefulset/lance
+#kubectl rollout restart statefulset/lance
+#kubectl rollout status statefulset/lance

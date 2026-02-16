@@ -565,7 +565,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let coord = ctx.cluster.as_ref()?;
-    if coord.is_leader() {
+    if coord.is_leader_authoritative().await {
         return None;
     }
 
@@ -609,7 +609,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let coord = ctx.cluster.as_ref()?;
-    if coord.is_leader() {
+    if coord.is_leader_authoritative().await {
         return None;
     }
 

@@ -293,8 +293,8 @@ impl RaftNode {
             return None;
         }
 
-        if self.state == RaftState::Leader {
-            // Leaders don't start pre-votes
+        if self.state != RaftState::Follower || self.pre_vote_in_progress {
+            // Only followers start pre-votes, and only one round at a time.
             return None;
         }
 
@@ -377,7 +377,12 @@ impl RaftNode {
         }
 
         // Check if we have enough pre-votes for quorum
-        self.votes_received.len() >= self.quorum_size()
+        if self.votes_received.len() >= self.quorum_size() {
+            self.pre_vote_in_progress = false;
+            true
+        } else {
+            false
+        }
     }
 
     // =========================================================================
@@ -825,6 +830,19 @@ impl RaftNode {
     /// Check if election timeout has elapsed.
     pub fn election_timeout_elapsed(&self) -> bool {
         self.last_leader_contact.elapsed() > self.election_timeout
+    }
+
+    /// Whether a pre-vote round is currently in progress.
+    #[must_use]
+    pub const fn pre_vote_in_progress(&self) -> bool {
+        self.pre_vote_in_progress
+    }
+
+    /// Finish a pre-vote round that did not reach quorum and back off before retrying.
+    pub fn finish_failed_pre_vote_round(&mut self) {
+        self.pre_vote_in_progress = false;
+        self.votes_received.clear();
+        self.reset_election_timeout();
     }
 
     /// Reset the election timeout with a new random value.

@@ -184,7 +184,7 @@ pub async fn handle_create_topic(ctx: &CommandContext<'_>, payload: Option<&Byte
                     name: metadata.name.clone(),
                     created_at: metadata.created_at,
                 };
-                if let Err(e) = coord.replicate_topic_op(op).await {
+                if let Err(e) = coord.replicate_topic_op_sync(op).await {
                     warn!(
                         target: "lance::server",
                         topic_id = metadata.id,
@@ -250,7 +250,7 @@ pub async fn handle_delete_topic(ctx: &CommandContext<'_>, payload: Option<&Byte
             // Replicate topic deletion to followers (if in cluster mode)
             if let Some(coord) = ctx.cluster {
                 let op = TopicOperation::Delete { topic_id };
-                if let Err(e) = coord.replicate_topic_op(op).await {
+                if let Err(e) = coord.replicate_topic_op_sync(op).await {
                     warn!(
                         target: "lance::server",
                         topic_id,
@@ -505,7 +505,7 @@ pub async fn handle_create_topic_with_retention(
                             name: metadata.name.clone(),
                             created_at: metadata.created_at,
                         };
-                        if let Err(e) = coord.replicate_topic_op(op).await {
+                        if let Err(e) = coord.replicate_topic_op_sync(op).await {
                             warn!(
                                 target: "lance::server",
                                 topic_id = metadata.id,

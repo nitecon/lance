@@ -41,6 +41,21 @@ pub struct Config {
     /// Set to cap how fast any single consumer can read, e.g. `104857600` for 100 MB/s.
     #[serde(default)]
     pub consumer_rate_limit_bytes_per_sec: Option<u64>,
+    /// Capacity of the data replication forwarder channel.
+    /// Higher values absorb network micro-bursts without backpressuring ingestion.
+    #[serde(default = "default_data_replication_channel_capacity")]
+    pub data_replication_channel_capacity: usize,
+    /// Maximum number of concurrent replication batches in flight.
+    /// `1` preserves strict sequential forwarding.
+    /// Values `>1` enable bounded pipelining for higher throughput.
+    #[serde(default = "default_replication_max_inflight")]
+    pub replication_max_inflight: usize,
+    /// Pin the dedicated coordinator runtime thread to a specific CPU core (optional).
+    #[serde(default)]
+    pub coordinator_pin_core: Option<usize>,
+    /// Pin the dedicated forwarder runtime thread to a specific CPU core (optional).
+    #[serde(default)]
+    pub forwarder_pin_core: Option<usize>,
 }
 
 /// Authentication configuration for the server
@@ -74,6 +89,14 @@ pub struct TlsSettings {
 
 fn default_retention_cleanup_interval() -> u64 {
     60
+}
+
+fn default_data_replication_channel_capacity() -> usize {
+    65_536
+}
+
+fn default_replication_max_inflight() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +178,10 @@ impl Default for Config {
             tls: TlsSettings::default(),
             replication_quorum_timeout_ms: None,
             consumer_rate_limit_bytes_per_sec: None,
+            data_replication_channel_capacity: default_data_replication_channel_capacity(),
+            replication_max_inflight: default_replication_max_inflight(),
+            coordinator_pin_core: None,
+            forwarder_pin_core: None,
         }
     }
 }
@@ -501,6 +528,10 @@ mod tests {
         assert_eq!(config.health_addr.port(), 8080);
         assert_eq!(config.replication_mode, "l1");
         assert!(config.peers.is_empty());
+        assert_eq!(config.data_replication_channel_capacity, 65_536);
+        assert_eq!(config.replication_max_inflight, 1);
+        assert_eq!(config.coordinator_pin_core, None);
+        assert_eq!(config.forwarder_pin_core, None);
     }
 
     #[test]
@@ -542,6 +573,10 @@ health_addr = "127.0.0.1:8081"
 data_dir = "/tmp/lance-test"
 replication_mode = "l3"
 peers = ["127.0.0.1:1994", "127.0.0.1:1995"]
+data_replication_channel_capacity = 32768
+replication_max_inflight = 8
+coordinator_pin_core = 6
+forwarder_pin_core = 7
 
 [wal]
 enabled = true
@@ -569,6 +604,10 @@ segment_max_size = 2147483648
         assert!(config.wal.enabled);
         assert_eq!(config.ingestion.batch_pool_size, 128);
         assert_eq!(config.io.ring_size, 512);
+        assert_eq!(config.data_replication_channel_capacity, 32768);
+        assert_eq!(config.replication_max_inflight, 8);
+        assert_eq!(config.coordinator_pin_core, Some(6));
+        assert_eq!(config.forwarder_pin_core, Some(7));
     }
 
     #[test]

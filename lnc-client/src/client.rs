@@ -24,6 +24,9 @@ pub enum ClientStream {
 }
 
 impl AsyncRead for ClientStream {
+    /// Delegates read readiness directly to the concrete transport so
+    /// buffered frames stay on the Architecture §15 zero-copy path without
+    /// layering additional indirection.
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -37,6 +40,10 @@ impl AsyncRead for ClientStream {
 }
 
 impl AsyncWrite for ClientStream {
+    /// Delegates write readiness to the underlying transport without
+    /// introducing dynamic dispatch, which keeps buffered writes on the
+    /// Section 14 thread-pinned path compliant with Architecture §15's
+    /// loaner-buffer rules.
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -48,6 +55,9 @@ impl AsyncWrite for ClientStream {
         }
     }
 
+    /// Flushes bytes on whichever transport is active so that ingestion
+    /// frames honor the write-buffering guarantees described in Architecture
+    /// §22 without duplicating logic across TCP/TLS paths.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             ClientStream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
@@ -55,6 +65,9 @@ impl AsyncWrite for ClientStream {
         }
     }
 
+    /// Propagates orderly shutdown to the concrete stream implementation,
+    /// enabling graceful disconnects per Architecture §14's pinning strategy
+    /// whether the session is plain TCP or TLS.
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             ClientStream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
@@ -221,7 +234,16 @@ impl ClientConfig {
         }
     }
 
-    /// Enable TLS with the provided configuration
+    /// Enables TLS for this configuration so clients can satisfy
+    /// Architecture §14's production security guidance when traversing
+    /// untrusted networks.
+    ///
+    /// # Arguments
+    /// * `tls_config` - Certificates and trust roots passed through to
+    ///   `lnc-network`'s TLS connector.
+    ///
+    /// # Returns
+    /// * `Self` - Updated config allowing fluent builder-style chaining.
     pub fn with_tls(mut self, tls_config: TlsClientConfig) -> Self {
         self.tls = Some(tls_config);
         self
@@ -245,9 +267,20 @@ pub struct LanceClient {
 }
 
 impl LanceClient {
-    /// Resolve an address string (hostname:port or IP:port) to a SocketAddr
+    /// Resolves an address string (hostname:port or IP:port) to a `SocketAddr`
+    /// so clients can honor Architecture §10.1's Docker-first deployment model
+    /// where hostnames are common.
     ///
-    /// This performs DNS resolution for hostnames and validates IP addresses.
+    /// # Arguments
+    /// * `addr` - Address string such as `"10.0.0.5:1992"` or
+    ///   `"broker.lance:1992"`.
+    ///
+    /// # Returns
+    /// * `Result<SocketAddr>` - Parsed IP:port pair ready for `TcpStream`.
+    ///
+    /// # Errors
+    /// * [`ClientError::ProtocolError`] when DNS resolution fails or produces
+    ///   no usable endpoints.
     async fn resolve_address(addr: &str) -> Result<SocketAddr> {
         // First, try parsing as a SocketAddr directly (for IP:port format)
         if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
@@ -382,13 +415,36 @@ impl LanceClient {
         self.batch_id.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Send an ingest request to the default topic (topic 0)
+    /// Sends an ingest frame to the default topic (ID 0) while preserving the
+    /// Architecture §22 write-buffering guarantees.
+    ///
+    /// # Arguments
+    /// * `payload` - Record batch encoded using the zero-copy LWP format.
+    /// * `record_count` - Logical record total encoded in the frame header.
+    ///
+    /// # Returns
+    /// * `Result<u64>` - Server-assigned batch identifier for the frame.
+    ///
+    /// # Errors
+    /// Propagates [`ClientError::Timeout`] when the write exceeds the configured
+    /// deadline or any framing/connection error surfaced by Tokio.
     pub async fn send_ingest(&mut self, payload: Bytes, record_count: u32) -> Result<u64> {
         self.send_ingest_to_topic(0, payload, record_count, None)
             .await
     }
 
-    /// Send an ingest request to a specific topic
+    /// Sends an ingest frame to a specific topic while attaching metadata
+    /// required by Architecture §22's deferred flush/ack scheme.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Destination topic identifier.
+    /// * `payload` - Zero-copy encoded batch.
+    /// * `record_count` - Logical records contained in `payload`.
+    /// * `_auth_config` - Optional future hook for per-request auth context.
+    ///
+    /// # Returns
+    /// * `Result<u64>` - Batch identifier allocated by the client monotonic
+    ///   counter and echoed back by the server.
     pub async fn send_ingest_to_topic(
         &mut self,
         topic_id: u32,
@@ -423,13 +479,33 @@ impl LanceClient {
         Ok(batch_id)
     }
 
-    /// Send an ingest request and wait for acknowledgment (default topic)
+    /// Sends an ingest request to the default topic and waits for the
+    /// corresponding acknowledgment, mirroring Architecture §22.3 sync gates.
+    ///
+    /// # Arguments
+    /// * `payload` - Ingest batch to transmit.
+    /// * `record_count` - Logical record total for metrics validation.
+    ///
+    /// # Returns
+    /// * `Result<u64>` - The acked batch identifier if the server confirms the
+    ///   write succeeded.
     pub async fn send_ingest_sync(&mut self, payload: Bytes, record_count: u32) -> Result<u64> {
         self.send_ingest_to_topic_sync(0, payload, record_count, None)
             .await
     }
 
-    /// Send an ingest request to a specific topic and wait for acknowledgment
+    /// Sends an ingest request to a topic and blocks for server acknowledgment
+    /// so callers can enforce durability or backpressure decisions inline.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Destination topic.
+    /// * `payload` - Zero-copy loaner buffer to transmit.
+    /// * `record_count` - Logical records contained in the batch.
+    /// * `auth_config` - Optional per-request authentication context.
+    ///
+    /// # Returns
+    /// * `Result<u64>` - The acked batch identifier, ensuring sequencing with
+    ///   downstream consumers.
     pub async fn send_ingest_to_topic_sync(
         &mut self,
         topic_id: u32,
@@ -443,6 +519,18 @@ impl LanceClient {
         self.wait_for_ack(batch_id).await
     }
 
+    /// Waits for a specific acknowledgment frame, enforcing Architecture §22's
+    /// deferred flush contract between ingestion and persistence stages.
+    ///
+    /// # Arguments
+    /// * `expected_batch_id` - Identifier produced by the paired send path.
+    ///
+    /// # Returns
+    /// * `Result<u64>` - The acked batch identifier (matching expectation).
+    ///
+    /// # Errors
+    /// Surfaces protocol mismatches, server backpressure, or error frames so
+    /// callers can react immediately.
     async fn wait_for_ack(&mut self, expected_batch_id: u64) -> Result<u64> {
         let frame = self.recv_frame().await?;
 
@@ -476,7 +564,16 @@ impl LanceClient {
         }
     }
 
-    /// Receive an acknowledgment for a previously sent ingest request
+    /// Receives the next acknowledgment frame and translates server feedback
+    /// (ack, backpressure, or error) into structured [`ClientError`] variants.
+    ///
+    /// # Returns
+    /// * `Result<u64>` - Acked batch identifier if the server confirmed success.
+    ///
+    /// # Errors
+    /// Surfaces [`ClientError::ServerBackpressure`] or
+    /// [`ClientError::InvalidResponse`] when the frame type deviates from the
+    /// Architecture §22 control flow expectations.
     pub async fn recv_ack(&mut self) -> Result<u64> {
         let frame = self.recv_frame().await?;
 
@@ -496,7 +593,12 @@ impl LanceClient {
         }
     }
 
-    /// Send a keepalive message to maintain the connection
+    /// Sends a keepalive frame so long-lived clients satisfy Architecture §9.4
+    /// drain/force-exit requirements and keep connection state fresh.
+    ///
+    /// # Returns
+    /// * `Result<()>` - Ok when the frame is flushed before the configured
+    ///   write timeout expires.
     pub async fn send_keepalive(&mut self) -> Result<()> {
         let frame = Frame::new_keepalive();
         let frame_bytes = encode_frame(&frame);
@@ -513,7 +615,15 @@ impl LanceClient {
         Ok(())
     }
 
-    /// Receive a keepalive response from the server
+    /// Waits for a keepalive response, guaranteeing the control-plane path is
+    /// still healthy per Architecture §9.4 monitoring requirements.
+    ///
+    /// # Returns
+    /// * `Result<()>` - Ok when the server replies with `FrameType::Keepalive`.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::InvalidResponse`] when any other frame type
+    /// arrives, signaling connection drift.
     pub async fn recv_keepalive(&mut self) -> Result<()> {
         let frame = self.recv_frame().await?;
 
@@ -609,7 +719,8 @@ impl LanceClient {
         self.parse_delete_response(response)
     }
 
-    /// Set retention policy for an existing topic
+    /// Sets the retention policy for an existing topic, mirroring the
+    /// configuration model documented in Architecture §12.7.
     ///
     /// # Arguments
     /// * `topic_id` - Topic identifier
@@ -758,8 +869,22 @@ impl LanceClient {
         self.parse_fetch_response(response)
     }
 
-    /// Subscribe to a topic for streaming data
-    /// Returns the consumer ID and starting offset
+    /// Subscribes to a topic for streaming consumption, honoring the consumer
+    /// coordination model described in Architecture §20.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic to follow.
+    /// * `start_offset` - First logical offset to deliver.
+    /// * `max_batch_bytes` - Maximum payload size per delivery window.
+    /// * `consumer_id` - Stable consumer identifier for server-side tracking.
+    ///
+    /// # Returns
+    /// * `Result<SubscribeResult>` - Contains the confirmed consumer_id and
+    ///   start offset granted by the server.
+    ///
+    /// # Errors
+    /// Surfaces timeouts, protocol violations, or server error frames (e.g.,
+    /// `ControlCommand::ErrorResponse`).
     pub async fn subscribe(
         &mut self,
         topic_id: u32,
@@ -783,7 +908,19 @@ impl LanceClient {
         self.parse_subscribe_response(response)
     }
 
-    /// Unsubscribe from a topic
+    /// Unsubscribes a consumer from a topic, ensuring server resources are
+    /// reclaimed per Architecture §20's consumer lifecycle.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic to leave.
+    /// * `consumer_id` - Consumer identifier provided during subscribe.
+    ///
+    /// # Returns
+    /// * `Result<()>` - Ok when the server acknowledges the unsubscribe.
+    ///
+    /// # Errors
+    /// Propagates [`ClientError::ServerError`] if the server rejects the
+    /// request or [`ClientError::InvalidResponse`] if a non-ack frame arrives.
     pub async fn unsubscribe(&mut self, topic_id: u32, consumer_id: u64) -> Result<()> {
         let frame = Frame::new_unsubscribe(topic_id, consumer_id);
         let frame_bytes = encode_frame(&frame);
@@ -1085,6 +1222,17 @@ impl LanceClient {
         }
     }
 
+    /// Reads the next wire frame into the preallocated buffer, preserving the
+    /// Architecture §15 zero-copy guarantees while translating parse failures
+    /// into structured [`ClientError`] values.
+    ///
+    /// # Returns
+    /// * `Result<Frame>` - Fully parsed LWP frame ready for higher-level
+    ///   ingestion/consumer handlers.
+    ///
+    /// # Errors
+    /// Propagates timeouts, malformed headers, or connection closures so
+    /// callers can fail fast when the transport becomes unhealthy.
     async fn recv_frame(&mut self) -> Result<Frame> {
         // Max frame size cap to prevent OOM from malformed headers (16 MB)
         const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;

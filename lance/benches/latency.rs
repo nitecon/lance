@@ -77,14 +77,23 @@ mod latency_gates {
     const P999_LIMIT_NS: u128 = 50_000;
     const ITERATIONS: usize = 10_000;
 
-    /// Allocation counting allocator for zero-allocation tests
-    /// Per Architecture §11.2
+    /// Allocation counting allocator for zero-allocation tests.
+    ///
+    /// This helper mirrors the Architecture §11.2 mandate that any hot
+    /// path benchmark must prove **zero heap churn**. The counters allow
+    /// the benches in this module to assert that no allocations slip into
+    /// the loaner-path operations even when optional features are enabled.
     struct CountingAllocator {
         allocations: AtomicUsize,
         deallocations: AtomicUsize,
     }
 
     impl CountingAllocator {
+        /// Builds a fresh allocator with both counters set to zero.
+        ///
+        /// # Returns
+        /// * `Self` - a const-initializable instance that can be promoted
+        ///   to a `static` for use with `#[global_allocator]`.
         const fn new() -> Self {
             Self {
                 allocations: AtomicUsize::new(0),
@@ -92,11 +101,20 @@ mod latency_gates {
             }
         }
 
+        /// Resets both the allocation and deallocation counters.
+        ///
+        /// This is used prior to each measurement loop so that tests can
+        /// attribute any subsequent increments to the code under test.
         fn reset(&self) {
             self.allocations.store(0, Ordering::SeqCst);
             self.deallocations.store(0, Ordering::SeqCst);
         }
 
+        /// Returns the number of heap allocations observed so far.
+        ///
+        /// # Returns
+        /// * `usize` - total calls to [`GlobalAlloc::alloc`] since the
+        ///   previous [`CountingAllocator::reset`].
         fn allocation_count(&self) -> usize {
             self.allocations.load(Ordering::SeqCst)
         }
@@ -110,11 +128,24 @@ mod latency_gates {
 
     #[cfg(feature = "alloc-counter")]
     unsafe impl GlobalAlloc for CountingAllocator {
+        /// Forwards heap allocations to the system allocator while counting
+        /// invocations so regression tests can enforce the zero-allocation gate.
+        ///
+        /// # Safety
+        /// This has the same safety contract as [`GlobalAlloc::alloc`]: the
+        /// caller must ensure the requested layout is valid and the returned
+        /// pointer is handled according to Rust allocation rules.
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             self.allocations.fetch_add(1, Ordering::Relaxed);
             System.alloc(layout)
         }
 
+        /// Mirrors [`GlobalAlloc::dealloc`] while tracking total frees so
+        /// that leak detection matches allocation counts in tests.
+        ///
+        /// # Safety
+        /// Equivalent to [`GlobalAlloc::dealloc`]; the caller must supply the
+        /// original pointer and layout obtained from a previous allocation.
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             self.deallocations.fetch_add(1, Ordering::Relaxed);
             System.dealloc(ptr, layout)

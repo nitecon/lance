@@ -48,7 +48,8 @@ use crate::client::{ClientConfig, LanceClient};
 use crate::error::{ClientError, Result};
 use crate::tls::TlsClientConfig;
 
-/// Configuration for connection pool
+/// Configuration knobs for the LANCE client connection pool, mirroring the
+/// resilience patterns documented in Architecture §§14 and 20.
 #[derive(Debug, Clone)]
 pub struct ConnectionPoolConfig {
     /// Maximum number of connections in the pool
@@ -163,7 +164,8 @@ impl ConnectionPoolConfig {
     }
 }
 
-/// Connection pool statistics
+/// Snapshot of connection-pool statistics exposed for observability and sized
+/// to match Architecture §27's metrics guidance.
 #[derive(Debug, Clone, Default)]
 pub struct PoolStats {
     /// Total connections created
@@ -186,7 +188,8 @@ pub struct PoolStats {
     pub reconnect_attempts: u64,
 }
 
-/// Internal pool metrics using atomics
+/// Internal pool metrics using atomics (not exported outside the crate) so we
+/// can keep Architecture §27 counters non-blocking.
 #[derive(Debug, Default)]
 struct PoolMetrics {
     connections_created: AtomicU64,
@@ -216,7 +219,8 @@ impl PoolMetrics {
     }
 }
 
-/// Pooled connection wrapper
+/// Internal tracked connection paired with lifecycle metadata so we can enforce
+/// Architecture §14 lifetime/idle policies.
 struct PooledConnection {
     client: LanceClient,
     created_at: Instant,
@@ -248,7 +252,11 @@ impl PooledConnection {
     }
 }
 
-/// Connection pool for managing LANCE client connections
+/// Connection pool for managing LANCE client connections, ensuring we reuse
+/// TCP/TLS sessions per Architecture §14 instead of spawning new ones per
+/// request. The pool keeps pre-warmed connections, enforces max/idle caps, and
+/// wires up background health checks so ingestion/consumer threads avoid
+/// blocking on connect storms.
 pub struct ConnectionPool {
     addr: String,
     config: ConnectionPoolConfig,
@@ -259,10 +267,19 @@ pub struct ConnectionPool {
 }
 
 impl ConnectionPool {
-    /// Create a new connection pool
+    /// Creates a new connection pool bound to the provided address in keeping
+    /// with Architecture §14's pinning and reuse strategy.
     ///
-    /// The address can be either an IP:port (e.g., "127.0.0.1:1992") or
-    /// a hostname:port (e.g., "lance.example.com:1992").
+    /// # Arguments
+    /// * `addr` - Target endpoint (`"host:port"`) shared by pooled clients.
+    /// * `config` - Pool configuration describing capacity, timeouts, and TLS.
+    ///
+    /// # Returns
+    /// * `Result<Self>` - Ready-to-use pool with `min_idle` connections opened
+    ///   and a health-check task running (if enabled).
+    ///
+    /// # Errors
+    /// Propagates connection failures when seeding initial idle clients.
     pub async fn new(addr: &str, config: ConnectionPoolConfig) -> Result<Self> {
         let pool = Self {
             addr: addr.to_string(),
@@ -302,7 +319,15 @@ impl ConnectionPool {
         Ok(pool)
     }
 
-    /// Get a connection from the pool
+    /// Acquires a pooled connection, respecting the configured acquire timeout
+    /// and returning the RAII guard used throughout the client APIs.
+    ///
+    /// # Returns
+    /// * `Result<PooledClient>` - Guard wrapping the loaned connection.
+    ///
+    /// # Errors
+    /// * [`ClientError::Timeout`] if acquisition exceeds `acquire_timeout`.
+    /// * [`ClientError::ConnectionClosed`] if the semaphore is closed.
     pub async fn get(&self) -> Result<PooledClient> {
         self.metrics
             .acquire_attempts
@@ -380,7 +405,14 @@ impl ConnectionPool {
         })
     }
 
-    /// Create a new connection
+    /// Creates a brand-new `LanceClient` based on the pool's configuration.
+    ///
+    /// # Returns
+    /// * `Result<PooledConnection>` - Fresh connection wrapped with lifecycle
+    ///   metadata for expiry/idle enforcement.
+    ///
+    /// # Errors
+    /// Propagates underlying `LanceClient::connect`/`connect_tls` failures.
     async fn create_connection(&self) -> Result<PooledConnection> {
         let mut client_config = ClientConfig::new(&self.addr);
         client_config.connect_timeout = self.config.connect_timeout;
@@ -401,7 +433,8 @@ impl ConnectionPool {
         self.metrics.snapshot()
     }
 
-    /// Close the pool
+    /// Gracefully shuts down the pool, clearing idle connections and marking
+    /// future `get` calls as invalid per Architecture §14 teardown guidance.
     pub async fn close(&self) {
         self.running.store(false, Ordering::Relaxed);
 
@@ -468,7 +501,8 @@ impl ConnectionPool {
     }
 }
 
-/// RAII wrapper for pooled connection
+/// RAII guard that returns the connection to the pool on drop, keeping the
+/// Architecture §14 resource caps accurate.
 pub struct PooledClient {
     conn: Option<PooledConnection>,
     pool: Arc<Mutex<VecDeque<PooledConnection>>>,
@@ -531,8 +565,8 @@ impl Drop for PooledClient {
     }
 }
 
-/// Reconnecting client wrapper with automatic reconnection
-/// Client with automatic reconnection and leader redirection support
+/// Reconnecting client wrapper offering automatic reconnection and leader
+/// redirection support per Architecture §21.
 pub struct ReconnectingClient {
     addr: String,
     config: ClientConfig,
@@ -754,11 +788,8 @@ impl ReconnectingClient {
     }
 }
 
-/// Cluster-aware client with automatic node discovery
-///
-/// Discovers cluster nodes and maintains connections for high availability.
-/// Note: Write routing to the leader is handled server-side via transparent
-/// forwarding - clients can send writes to ANY node.
+/// Cluster-aware client with automatic node discovery. It discovers nodes and
+/// maintains healthy connections for read availability per Architecture §21.
 pub struct ClusterClient {
     /// Known cluster nodes
     nodes: Vec<SocketAddr>,
@@ -777,9 +808,20 @@ pub struct ClusterClient {
 }
 
 impl ClusterClient {
-    /// Create a new cluster client with seed nodes
+    /// Creates a cluster client using the provided seed nodes, aligning with
+    /// Architecture §21's discovery process.
     ///
-    /// Seed addresses can be either IP:port or hostname:port format.
+    /// # Arguments
+    /// * `seed_addrs` - List of seed endpoints (`"host:port"`) used to fetch
+    ///   the cluster topology.
+    ///
+    /// # Returns
+    /// * `Result<Self>` - Initialized client after a successful discovery
+    ///   round-trip.
+    ///
+    /// # Errors
+    /// * [`ClientError::ProtocolError`] when no seed nodes resolve.
+    /// * Propagates underlying connect/discovery errors when all nodes fail.
     pub async fn connect(seed_addrs: &[&str]) -> Result<Self> {
         let nodes: Vec<SocketAddr> = seed_addrs.iter().filter_map(|s| s.parse().ok()).collect();
 
@@ -804,7 +846,19 @@ impl ClusterClient {
         Ok(cluster)
     }
 
-    /// Create a new cluster client with TLS
+    /// Creates a TLS-enabled cluster client using the provided seed nodes so we
+    /// can satisfy Architecture §14's transport security guidance.
+    ///
+    /// # Arguments
+    /// * `seed_addrs` - List of seed endpoints for discovery.
+    /// * `tls_config` - Certificates and trust roots forwarded to
+    ///   `LanceClient`.
+    ///
+    /// # Returns
+    /// * `Result<Self>` - Initialized TLS client once discovery succeeds.
+    ///
+    /// # Errors
+    /// Mirrors [`ClusterClient::connect`], plus TLS handshake failures.
     pub async fn connect_tls(seed_addrs: &[&str], tls_config: TlsClientConfig) -> Result<Self> {
         let nodes: Vec<SocketAddr> = seed_addrs.iter().filter_map(|s| s.parse().ok()).collect();
 

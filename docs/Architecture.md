@@ -41,6 +41,7 @@
 - [Raft Persistence Execution Isolation (Step 1)](#raft-persistence-execution-isolation-step-1)
 - [Coordinator Runtime Isolation (Step 2)](#coordinator-runtime-isolation-step-2)
 - [Data Forwarder Runtime Isolation (Step 3)](#data-forwarder-runtime-isolation-step-3)
+- [Replication Transport Concurrency (PeerManager)](#replication-transport-concurrency-peermanager)
 
 ---
 
@@ -5624,6 +5625,16 @@ Implemented in `lance/src/server/mod.rs`:
 - Forwarder lifecycle logs now clearly indicate dedicated-runtime startup and shutdown.
 
 This removes replication-forwarding CPU and async scheduling pressure from the main runtime while preserving existing quorum ACK accounting semantics.
+## Replication Transport Concurrency (PeerManager)
+
+`PeerManager` uses per-peer connection locking to isolate slow followers and prevent cross-peer head-of-line blocking.
+
+- Peer registry: `Arc<RwLock<HashMap<u16, Arc<Mutex<PeerConnection>>>>>`
+- Map lock scope: lookup/insert/remove only (short critical sections)
+- Network I/O (`connect`, `send`, `recv`): performed under the specific peer's mutex, never under the global map lock
+- Raft RPC request/response (`AppendEntries`, `PreVote`, `Vote`) remains serialized per peer to preserve protocol correctness without message IDs
+
+This design ensures one slow/unreachable follower cannot delay heartbeats or control RPCs to other followers, reducing election churn under load while keeping existing wire protocol semantics.
 ---
 
 [↑ Back to Top](#technical-design-project-lance) | [← Back to Docs Index](./README.md)

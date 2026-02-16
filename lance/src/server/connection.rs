@@ -15,7 +15,9 @@ use bytes::Bytes;
 use futures::future::try_join_all;
 use lnc_core::{BatchPool, LanceError, Result};
 use lnc_network::{ControlCommand, FrameType, LWP_HEADER_SIZE, parse_frame};
-use lnc_replication::{AsyncQuorumManager, ClusterCoordinator, LeaderConnectionPool, QuorumResult};
+use lnc_replication::{
+    AsyncQuorumManager, ClusterCoordinator, ForwardError, LeaderConnectionPool, QuorumResult,
+};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
@@ -464,8 +466,11 @@ where
         return handle_authenticate(ctx, frame).await;
     }
 
-    // Check if write command needs forwarding
-    if command_handlers::is_write_operation(command) {
+    // Forward write commands and fetch reads through the leader for consistent
+    // metadata visibility during leadership churn / follower catch-up windows.
+    let should_forward_to_leader =
+        command_handlers::is_write_operation(command) || command == ControlCommand::Fetch;
+    if should_forward_to_leader {
         if let Some(action) =
             try_forward_control_to_leader(ctx, buffer, consumed, read_offset).await
         {
@@ -577,6 +582,30 @@ where
                     return Some(FrameAction::Forwarded);
                 }
             },
+            Err(ForwardError::LeaderUnknown) => {
+                if let Some(leader_addr) = coord.leader_addr_authoritative().await {
+                    pool.on_leader_change(Some(leader_addr)).await;
+                    match pool.forward_write(&buffer[..consumed]).await {
+                        Ok(response) => {
+                            if ctx.stream.write_all(&response).await.is_ok() {
+                                buffer.copy_within(consumed..read_offset, 0);
+                                return Some(FrameAction::Forwarded);
+                            }
+                        },
+                        Err(e) => {
+                            warn!(target: "lance::server", error = %e, "Write forwarding to leader failed");
+                            let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
+                            buffer.copy_within(consumed..read_offset, 0);
+                            return Some(FrameAction::Forwarded);
+                        },
+                    }
+                }
+
+                warn!(target: "lance::server", "Write forwarding to leader failed: leader address unknown");
+                let _ = send_error(ctx.stream, "FORWARD_FAILED: Leader address unknown").await;
+                buffer.copy_within(consumed..read_offset, 0);
+                return Some(FrameAction::Forwarded);
+            },
             Err(e) => {
                 warn!(target: "lance::server", error = %e, "Write forwarding to leader failed");
                 let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
@@ -620,6 +649,30 @@ where
                     buffer.copy_within(consumed..read_offset, 0);
                     return Some(FrameAction::Forwarded);
                 }
+            },
+            Err(ForwardError::LeaderUnknown) => {
+                if let Some(leader_addr) = coord.leader_addr_authoritative().await {
+                    pool.on_leader_change(Some(leader_addr)).await;
+                    match pool.forward_write(&buffer[..consumed]).await {
+                        Ok(response) => {
+                            if ctx.stream.write_all(&response).await.is_ok() {
+                                buffer.copy_within(consumed..read_offset, 0);
+                                return Some(FrameAction::Forwarded);
+                            }
+                        },
+                        Err(e) => {
+                            warn!(target: "lance::server", error = %e, "Control command forwarding to leader failed");
+                            let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
+                            buffer.copy_within(consumed..read_offset, 0);
+                            return Some(FrameAction::Forwarded);
+                        },
+                    }
+                }
+
+                warn!(target: "lance::server", "Control command forwarding to leader failed: leader address unknown");
+                let _ = send_error(ctx.stream, "FORWARD_FAILED: Leader address unknown").await;
+                buffer.copy_within(consumed..read_offset, 0);
+                return Some(FrameAction::Forwarded);
             },
             Err(e) => {
                 warn!(target: "lance::server", error = %e, "Control command forwarding to leader failed");
@@ -671,7 +724,7 @@ where
     // Check if this is a write operation that requires leader
     if command_handlers::is_write_operation(command) {
         if let Some(coord) = cluster {
-            if !coord.is_leader() {
+            if !coord.is_leader_authoritative().await {
                 return send_not_leader_error(stream, coord.leader_addr().map(|a| a.to_string()))
                     .await;
             }

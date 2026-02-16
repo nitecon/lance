@@ -775,8 +775,11 @@ impl Producer {
     ///
     /// Flushes all buffered records and releases resources.
     pub async fn close(self) -> Result<()> {
-        self.running.store(false, Ordering::Relaxed);
+        // Flush first while the background flush task is still running.
+        // If we flip `running` first, the task can exit before servicing
+        // this flush request, causing close() to return ConnectionClosed.
         self.flush().await?;
+        self.running.store(false, Ordering::Relaxed);
         Ok(())
     }
 }

@@ -505,9 +505,12 @@ impl Config {
             node_id: self.node_id,
             listen_addr: self.replication_addr,
             discovery,
-            heartbeat_interval: Duration::from_millis(150),
-            election_timeout_min: Duration::from_millis(300),
-            election_timeout_max: Duration::from_millis(500),
+            // Keep these aligned with RaftConfig production defaults.
+            // The old 150/300-500ms timings are too aggressive under real I/O + network jitter
+            // and cause frequent leader churn during benchmark/chaos runs.
+            heartbeat_interval: Duration::from_millis(250),
+            election_timeout_min: Duration::from_millis(1000),
+            election_timeout_max: Duration::from_millis(2000),
             raw_peer_strings: self.peers.clone(),
         }
     }

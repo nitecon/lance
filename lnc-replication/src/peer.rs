@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -96,10 +96,10 @@ pub struct PeerConfig {
 impl Default for PeerConfig {
     fn default() -> Self {
         Self {
-            connect_timeout: Duration::from_secs(5),
-            read_timeout: Duration::from_secs(10),
-            write_timeout: Duration::from_secs(5),
-            reconnect_delay: Duration::from_secs(1),
+            connect_timeout: Duration::from_secs(1),
+            read_timeout: Duration::from_secs(2),
+            write_timeout: Duration::from_secs(1),
+            reconnect_delay: Duration::from_millis(250),
             max_reconnect_attempts: 10,
         }
     }
@@ -113,6 +113,9 @@ pub enum PeerState {
     Connected,
     Failed,
 }
+
+type PeerConnectionHandle = Arc<Mutex<PeerConnection>>;
+type PeerConnectionMap = Arc<RwLock<HashMap<u16, PeerConnectionHandle>>>;
 
 /// Represents a connection to a peer node
 pub struct PeerConnection {
@@ -485,7 +488,7 @@ impl PeerConnection {
 
 /// Manages connections to all peer nodes with health tracking
 pub struct PeerManager {
-    peers: Arc<RwLock<HashMap<u16, PeerConnection>>>,
+    peers: PeerConnectionMap,
     health: Arc<RwLock<HashMap<u16, FollowerHealth>>>,
     config: PeerConfig,
 }
@@ -500,46 +503,60 @@ impl PeerManager {
     }
 
     pub async fn add_peer(&self, peer_id: u16, addr: SocketAddr) {
-        let mut peers = self.peers.write().await;
-        match peers.entry(peer_id) {
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let conn = PeerConnection::new(peer_id, addr, self.config.clone());
-                e.insert(conn);
-
-                // Initialize health tracking for this peer
-                let mut health = self.health.write().await;
-                health.insert(peer_id, FollowerHealth::new(peer_id));
-
-                info!(
-                    target: "lance::replication",
+        let mut inserted = false;
+        let conn = {
+            let mut peers = self.peers.write().await;
+            if let Some(existing) = peers.get(&peer_id) {
+                Arc::clone(existing)
+            } else {
+                let conn = Arc::new(Mutex::new(PeerConnection::new(
                     peer_id,
-                    addr = %addr,
-                    "Added peer with health tracking"
-                );
-            },
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                let existing = e.get();
-                if existing.addr != addr {
-                    info!(
-                        target: "lance::replication",
-                        peer_id,
-                        old_addr = %existing.addr,
-                        new_addr = %addr,
-                        "Peer address changed, updating connection"
-                    );
-                    let mut conn = PeerConnection::new(peer_id, addr, self.config.clone());
-                    // Preserve disconnect state so reconnect logic kicks in
-                    std::mem::swap(e.get_mut(), &mut conn);
-                    // Old connection is dropped here
-                }
-            },
+                    addr,
+                    self.config.clone(),
+                )));
+                peers.insert(peer_id, Arc::clone(&conn));
+                inserted = true;
+                conn
+            }
+        };
+
+        if inserted {
+            // Initialize health tracking for this peer
+            let mut health = self.health.write().await;
+            health.insert(peer_id, FollowerHealth::new(peer_id));
+
+            info!(
+                target: "lance::replication",
+                peer_id,
+                addr = %addr,
+                "Added peer with health tracking"
+            );
+            return;
+        }
+
+        let mut existing = conn.lock().await;
+        if existing.addr != addr {
+            info!(
+                target: "lance::replication",
+                peer_id,
+                old_addr = %existing.addr,
+                new_addr = %addr,
+                "Peer address changed, updating connection"
+            );
+            *existing = PeerConnection::new(peer_id, addr, self.config.clone());
         }
     }
 
     pub async fn remove_peer(&self, peer_id: u16) {
-        let mut peers = self.peers.write().await;
-        if let Some(mut conn) = peers.remove(&peer_id) {
+        let removed = {
+            let mut peers = self.peers.write().await;
+            peers.remove(&peer_id)
+        };
+
+        if let Some(conn) = removed {
+            let mut conn = conn.lock().await;
             conn.disconnect();
+            drop(conn);
 
             // Remove health tracking
             let mut health = self.health.write().await;
@@ -554,13 +571,21 @@ impl PeerManager {
     }
 
     pub async fn connect_all(&self) {
-        let mut peers = self.peers.write().await;
-        for (peer_id, conn) in peers.iter_mut() {
+        let peers: Vec<(u16, Arc<Mutex<PeerConnection>>)> = {
+            let peers = self.peers.read().await;
+            peers
+                .iter()
+                .map(|(peer_id, conn)| (*peer_id, Arc::clone(conn)))
+                .collect()
+        };
+
+        for (peer_id, conn) in peers {
+            let mut conn = conn.lock().await;
             if !conn.is_connected() && conn.should_reconnect() {
                 if let Err(e) = conn.connect().await {
                     warn!(
                         target: "lance::replication",
-                        peer_id = *peer_id,
+                        peer_id,
                         error = %e,
                         "Failed to connect to peer"
                     );
@@ -570,17 +595,36 @@ impl PeerManager {
     }
 
     pub async fn disconnect_all(&self) {
-        let mut peers = self.peers.write().await;
-        for (peer_id, conn) in peers.iter_mut() {
+        let peers: Vec<(u16, Arc<Mutex<PeerConnection>>)> = {
+            let peers = self.peers.read().await;
+            peers
+                .iter()
+                .map(|(peer_id, conn)| (*peer_id, Arc::clone(conn)))
+                .collect()
+        };
+
+        for (peer_id, conn) in peers {
+            let mut conn = conn.lock().await;
             if conn.is_connected() {
                 conn.disconnect();
                 info!(
                     target: "lance::replication",
-                    peer_id = *peer_id,
+                    peer_id,
                     "Disconnected peer during shutdown"
                 );
             }
         }
+    }
+
+    async fn get_peer_connection(
+        &self,
+        peer_id: u16,
+    ) -> Result<PeerConnectionHandle, std::io::Error> {
+        let peers = self.peers.read().await;
+        peers
+            .get(&peer_id)
+            .cloned()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Peer not found"))
     }
 
     pub async fn send_to_peer(
@@ -588,10 +632,8 @@ impl PeerManager {
         peer_id: u16,
         msg: &ReplicationMessage,
     ) -> Result<(), std::io::Error> {
-        let mut peers = self.peers.write().await;
-        let conn = peers
-            .get_mut(&peer_id)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Peer not found"))?;
+        let conn = self.get_peer_connection(peer_id).await?;
+        let mut conn = conn.lock().await;
 
         if !conn.is_connected() {
             conn.connect().await?;
@@ -608,19 +650,17 @@ impl PeerManager {
         let msg = ReplicationMessage::AppendEntriesRequest(request);
         let start = Instant::now();
 
-        self.send_to_peer(peer_id, &msg).await?;
-
-        // Receive response
-        let mut peers = self.peers.write().await;
-        let conn = peers
-            .get_mut(&peer_id)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Peer not found"))?;
-
+        let conn = self.get_peer_connection(peer_id).await?;
+        let mut conn = conn.lock().await;
+        if !conn.is_connected() {
+            conn.connect().await?;
+        }
+        conn.send(&msg).await?;
         let response_msg = conn.recv().await?;
         let latency = start.elapsed();
 
         // Record latency for health tracking
-        drop(peers); // Release peers lock before acquiring health lock
+        drop(conn);
         self.record_peer_latency(peer_id, latency).await;
 
         match response_msg {
@@ -639,13 +679,12 @@ impl PeerManager {
         request: PreVoteRequest,
     ) -> Result<PreVoteResponse, std::io::Error> {
         let msg = ReplicationMessage::PreVoteRequest(request);
-        self.send_to_peer(peer_id, &msg).await?;
-
-        let mut peers = self.peers.write().await;
-        let conn = peers
-            .get_mut(&peer_id)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Peer not found"))?;
-
+        let conn = self.get_peer_connection(peer_id).await?;
+        let mut conn = conn.lock().await;
+        if !conn.is_connected() {
+            conn.connect().await?;
+        }
+        conn.send(&msg).await?;
         let response_msg = conn.recv().await?;
 
         match response_msg {
@@ -664,13 +703,12 @@ impl PeerManager {
         request: VoteRequest,
     ) -> Result<VoteResponse, std::io::Error> {
         let msg = ReplicationMessage::VoteRequest(request);
-        self.send_to_peer(peer_id, &msg).await?;
-
-        let mut peers = self.peers.write().await;
-        let conn = peers
-            .get_mut(&peer_id)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Peer not found"))?;
-
+        let conn = self.get_peer_connection(peer_id).await?;
+        let mut conn = conn.lock().await;
+        if !conn.is_connected() {
+            conn.connect().await?;
+        }
+        conn.send(&msg).await?;
         let response_msg = conn.recv().await?;
 
         match response_msg {
@@ -841,14 +879,17 @@ impl PeerManager {
     /// via [`Self::prepare_wire_frame`], so this only does connect-if-needed +
     /// `write_all`. Zero per-peer CPU work.
     async fn send_wire_frame_to_peer(
-        peers: &Arc<RwLock<HashMap<u16, PeerConnection>>>,
+        peers: &PeerConnectionMap,
         peer_id: u16,
         wire_frame: &[u8],
     ) -> Result<(), std::io::Error> {
-        let mut peers_guard = peers.write().await;
-        let conn = peers_guard
-            .get_mut(&peer_id)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Peer not found"))?;
+        let conn = {
+            let peers_guard = peers.read().await;
+            peers_guard.get(&peer_id).cloned().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "Peer not found")
+            })?
+        };
+        let mut conn = conn.lock().await;
 
         if !conn.is_connected() {
             conn.connect().await?;
@@ -884,19 +925,17 @@ impl PeerManager {
         let msg = ReplicationMessage::AppendEntriesRequest(request);
         let start = Instant::now();
 
-        self.send_to_peer(peer_id, &msg).await?;
-
-        // Receive response
-        let mut peers = self.peers.write().await;
-        let conn = peers
-            .get_mut(&peer_id)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Peer not found"))?;
-
+        let conn = self.get_peer_connection(peer_id).await?;
+        let mut conn = conn.lock().await;
+        if !conn.is_connected() {
+            conn.connect().await?;
+        }
+        conn.send(&msg).await?;
         let response_msg = conn.recv().await?;
         let latency = start.elapsed();
 
         // Record latency for health tracking
-        drop(peers); // Release peers lock before acquiring health lock
+        drop(conn);
         self.record_peer_latency(peer_id, latency).await;
 
         match response_msg {
@@ -909,19 +948,43 @@ impl PeerManager {
     }
 
     pub async fn connected_peer_count(&self) -> usize {
-        let peers = self.peers.read().await;
-        peers.values().filter(|c| c.is_connected()).count()
+        let peers: Vec<Arc<Mutex<PeerConnection>>> = {
+            let peers = self.peers.read().await;
+            peers.values().cloned().collect()
+        };
+
+        let mut connected = 0usize;
+        for conn in peers {
+            if conn.lock().await.is_connected() {
+                connected += 1;
+            }
+        }
+        connected
     }
 
     pub async fn peer_states(&self) -> HashMap<u16, PeerState> {
-        let peers = self.peers.read().await;
-        peers.iter().map(|(id, c)| (*id, c.state)).collect()
+        let peers: Vec<(u16, Arc<Mutex<PeerConnection>>)> = {
+            let peers = self.peers.read().await;
+            peers
+                .iter()
+                .map(|(peer_id, conn)| (*peer_id, Arc::clone(conn)))
+                .collect()
+        };
+
+        let mut states = HashMap::with_capacity(peers.len());
+        for (peer_id, conn) in peers {
+            states.insert(peer_id, conn.lock().await.state);
+        }
+        states
     }
 
     /// Get the address of a specific peer by node ID
     pub async fn get_peer_addr(&self, peer_id: u16) -> Option<SocketAddr> {
-        let peers = self.peers.read().await;
-        peers.get(&peer_id).map(|c| c.addr)
+        let conn = {
+            let peers = self.peers.read().await;
+            peers.get(&peer_id).cloned()
+        }?;
+        Some(conn.lock().await.addr)
     }
 
     /// Get all known peer IDs
@@ -939,7 +1002,10 @@ mod tests {
     #[test]
     fn test_peer_config_default() {
         let config = PeerConfig::default();
-        assert_eq!(config.connect_timeout, Duration::from_secs(5));
+        assert_eq!(config.connect_timeout, Duration::from_secs(1));
+        assert_eq!(config.read_timeout, Duration::from_secs(2));
+        assert_eq!(config.write_timeout, Duration::from_secs(1));
+        assert_eq!(config.reconnect_delay, Duration::from_millis(250));
         assert_eq!(config.max_reconnect_attempts, 10);
     }
 

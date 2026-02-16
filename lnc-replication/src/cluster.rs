@@ -614,12 +614,25 @@ impl ClusterCoordinator {
 
         // Best-effort commit-index heartbeat so followers that appended the entry can
         // apply it immediately instead of waiting for the next periodic heartbeat.
+        // IMPORTANT: use request/response API (not write-only broadcast) so
+        // AppendEntries responses are drained and cannot poison subsequent RPCs.
         if let Some(commit_req) = {
             let raft = self.raft.read().await;
             raft.create_append_entries(Vec::new())
         } {
-            let msg = crate::codec::ReplicationMessage::AppendEntriesRequest(commit_req);
-            let _ = self.peers.broadcast(&msg).await;
+            let peers = Arc::clone(&self.peers);
+            tokio::spawn(async move {
+                let peer_ids = peers.peer_ids().await;
+                let mut join_set = tokio::task::JoinSet::new();
+                for peer_id in peer_ids {
+                    let peers = Arc::clone(&peers);
+                    let req = commit_req.clone();
+                    join_set.spawn(async move {
+                        let _ = peers.send_append_entries(peer_id, req).await;
+                    });
+                }
+                while join_set.join_next().await.is_some() {}
+            });
         }
 
         // Record replication latency on success
@@ -1037,8 +1050,16 @@ impl ClusterCoordinator {
         };
 
         if let Some(req) = request {
-            let msg = ReplicationMessage::AppendEntriesRequest(req);
-            let _results = self.peers.broadcast(&msg).await;
+            let peer_ids = self.peers.peer_ids().await;
+            let mut join_set = tokio::task::JoinSet::new();
+            for peer_id in peer_ids {
+                let peers = Arc::clone(&self.peers);
+                let req = req.clone();
+                join_set.spawn(async move {
+                    let _ = peers.send_append_entries(peer_id, req).await;
+                });
+            }
+            while join_set.join_next().await.is_some() {}
 
             debug!(
                 target: "lance::cluster",
@@ -1347,27 +1368,38 @@ impl ClusterCoordinator {
             return Ok(()); // Not leader, skip heartbeats
         };
 
-        let msg = ReplicationMessage::AppendEntriesRequest(request);
-        let results = self.peers.broadcast(&msg).await;
-
-        for (peer_id, result) in results {
-            match result {
-                Ok(()) => {
-                    trace!(
-                        target: "lance::cluster",
-                        peer_id,
-                        "Sent heartbeat"
-                    );
-                },
-                Err(e) => {
-                    warn!(
-                        target: "lance::cluster",
-                        peer_id,
-                        error = %e,
-                        "Failed to send heartbeat"
-                    );
-                },
-            }
+        let peer_ids = self.peers.peer_ids().await;
+        for peer_id in peer_ids {
+            let peers = Arc::clone(&self.peers);
+            let req = request.clone();
+            tokio::spawn(async move {
+                match peers.send_append_entries(peer_id, req).await {
+                    Ok(resp) if resp.success => {
+                        trace!(
+                            target: "lance::cluster",
+                            peer_id,
+                            "Sent heartbeat"
+                        );
+                    },
+                    Ok(resp) => {
+                        warn!(
+                            target: "lance::cluster",
+                            peer_id,
+                            term = resp.term,
+                            match_index = resp.match_index,
+                            "Heartbeat rejected by follower"
+                        );
+                    },
+                    Err(e) => {
+                        warn!(
+                            target: "lance::cluster",
+                            peer_id,
+                            error = %e,
+                            "Failed to send heartbeat"
+                        );
+                    },
+                }
+            });
         }
 
         Ok(())

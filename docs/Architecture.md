@@ -56,6 +56,9 @@
 - [Coordinator Stability Telemetry and Readiness Separation](#coordinator-stability-telemetry-and-readiness-separation)
 - [Follower Catch-up Recovery Fix (AppendEntries prev_log_term)](#follower-catch-up-recovery-fix-appendentries-prev_log_term)
 - [Hot-Path Lock Removal in Async io_uring Backend](#hot-path-lock-removal-in-async-io_uring-backend)
+- [Hot-Path Dynamic Dispatch Removal for Async I/O Futures](#hot-path-dynamic-dispatch-removal-for-async-io-futures)
+- [Changes](#changes)
+- [Outcome](#outcome)
 
 ---
 
@@ -5873,6 +5876,33 @@ Behavioral intent remains unchanged:
 Validation:
 - Local hot-path audit grep (`Mutex|RwLock` over `lnc-core`/`lnc-io`) now returns no matches.
 - Cassa build remains green after the change.
+## Hot-Path Dynamic Dispatch Removal for Async I/O Futures
+
+To satisfy Engineering Standards §1 (No Dynamic Dispatch on data plane), the async write completion contract in `lnc-io` was changed from a boxed trait-object future to a concrete future type.
+
+## Changes
+- `lnc-io/src/backend.rs`
+  - Replaced `type WriteFuture = Pin<Box<...>>` with concrete `WriteFuture` struct.
+  - `WriteFuture` now wraps a `tokio::sync::oneshot::Receiver<AsyncWriteResult>` and implements `Future` directly.
+  - Added constructors:
+    - `WriteFuture::from_receiver(...)`
+    - `WriteFuture::ready(...)` (for fast-path tests/mocks).
+
+- `lnc-io/src/uring.rs`
+  - Completion sender now transmits `AsyncWriteResult` directly.
+  - `submit_write` now returns `WriteFuture::from_receiver(rx)`.
+  - CQE processing translates kernel result codes into `Result<usize>` before send.
+
+- `lnc-io/src/fallback.rs`
+  - `submit_write` now schedules I/O work and resolves completion through oneshot.
+  - Returns concrete `WriteFuture` rather than boxed trait-object future.
+
+- `lnc-replication/src/ingestion.rs` tests
+  - Mock backend updated to use `WriteFuture::ready(...)`.
+
+## Outcome
+- Removes `dyn` usage from audited hot-path crates while keeping completion semantics unchanged.
+- Preserves batch ownership-return contract (`(LoanableBatch, Result<usize>)`) for pool recycling.
 ---
 
 [↑ Back to Top](#technical-design-project-lance) | [← Back to Docs Index](./README.md)

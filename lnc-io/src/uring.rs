@@ -1710,7 +1710,7 @@ impl TeeForwarder {
 // Async I/O Backend (Zero-Copy Ferrari Engine)
 // ============================================================================
 
-use crate::backend::{AsyncIoBackend, WriteFuture};
+use crate::backend::{AsyncIoBackend, AsyncWriteResult, WriteFuture};
 use crate::priority::IoPriority;
 use dashmap::DashMap;
 use lnc_core::LoanableBatch;
@@ -1719,7 +1719,7 @@ use std::hint::spin_loop;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
-type CompletionSender = oneshot::Sender<(LoanableBatch, i32)>;
+type CompletionSender = oneshot::Sender<AsyncWriteResult>;
 
 /// Shared io_uring owner with a lock-free admission gate.
 ///
@@ -1876,26 +1876,7 @@ impl AsyncIoBackend for AsyncIoUringBackend {
 
         lnc_metrics::increment_io_submitted();
 
-        Ok(Box::pin(async move {
-            match rx.await {
-                Ok((batch, result_code)) => {
-                    let result = if result_code >= 0 {
-                        Ok(result_code as usize)
-                    } else {
-                        Err(LanceError::Io(std::io::Error::from_raw_os_error(
-                            -result_code,
-                        )))
-                    };
-                    (batch, result)
-                },
-                Err(_) => {
-                    panic!(
-                        "IoUringPoller dropped completion channel for batch_id {}",
-                        batch_id
-                    );
-                },
-            }
-        }))
+        Ok(WriteFuture::from_receiver(rx))
     }
 }
 
@@ -1930,7 +1911,14 @@ pub fn poll_async_completions(
     // PROCESSING SECTION: Slow map/channel ops (parallel with submissions)
     for (batch_id, result_code) in cqes {
         if let Some((_, (batch, tx))) = in_flight.remove(&batch_id) {
-            let _ = tx.send((batch, result_code));
+            let result = if result_code >= 0 {
+                Ok(result_code as usize)
+            } else {
+                Err(LanceError::Io(std::io::Error::from_raw_os_error(
+                    -result_code,
+                )))
+            };
+            let _ = tx.send((batch, result));
             lnc_metrics::increment_io_completed();
         } else {
             tracing::warn!(

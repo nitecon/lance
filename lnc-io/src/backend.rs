@@ -19,6 +19,8 @@ use crate::priority::IoPriority;
 use lnc_core::LoanableBatch;
 use std::future::Future;
 use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::sync::oneshot;
 
 /// The result of an async write operation:
 /// 1. The original batch (returned for recycling to BatchPool)
@@ -26,7 +28,37 @@ use std::pin::Pin;
 pub type AsyncWriteResult = (LoanableBatch, Result<usize>);
 
 /// A future that resolves when the hardware acknowledges the write.
-pub type WriteFuture = Pin<Box<dyn Future<Output = AsyncWriteResult> + Send>>;
+pub struct WriteFuture {
+    rx: oneshot::Receiver<AsyncWriteResult>,
+}
+
+impl WriteFuture {
+    #[inline]
+    #[must_use]
+    pub fn from_receiver(rx: oneshot::Receiver<AsyncWriteResult>) -> Self {
+        Self { rx }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn ready(result: AsyncWriteResult) -> Self {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(result);
+        Self { rx }
+    }
+}
+
+impl Future for WriteFuture {
+    type Output = AsyncWriteResult;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.rx).poll(cx) {
+            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Err(_)) => panic!("Write completion channel closed unexpectedly"),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
 
 /// High-Performance Asynchronous I/O Interface.
 ///

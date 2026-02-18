@@ -86,7 +86,7 @@ impl IngestionHandler {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use lnc_core::{LoanableBatch, DEFAULT_BATCH_SIZE};
+    use lnc_core::{DEFAULT_BATCH_SIZE, LoanableBatch};
 
     #[tokio::test]
     async fn test_ingestion_handler_creation() {

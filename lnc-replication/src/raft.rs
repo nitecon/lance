@@ -261,6 +261,13 @@ impl RaftNode {
         self.last_log_index
     }
 
+    /// Get the last log term.
+    #[inline]
+    #[must_use]
+    pub const fn last_log_term(&self) -> u64 {
+        self.last_log_term
+    }
+
     /// Get the last applied index.
     #[inline]
     #[must_use]

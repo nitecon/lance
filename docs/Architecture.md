@@ -53,6 +53,9 @@
 - [Topic Identity Epoch Phase 1 Implementation Status](#topic-identity-epoch-phase-1-implementation-status)
 - [Leader Readiness Gate (Elected vs Authoritative)](#leader-readiness-gate-elected-vs-authoritative)
 - [Client-Owned Topic Convergence for Validation Tools](#client-owned-topic-convergence-for-validation-tools)
+- [Coordinator Stability Telemetry and Readiness Separation](#coordinator-stability-telemetry-and-readiness-separation)
+- [Follower Catch-up Recovery Fix (AppendEntries prev_log_term)](#follower-catch-up-recovery-fix-appendentries-prev_log_term)
+- [Hot-Path Lock Removal in Async io_uring Backend](#hot-path-lock-removal-in-async-io_uring-backend)
 
 ---
 
@@ -5811,6 +5814,65 @@ Behavior:
 
 ### Intent
 Keep benchmark/chaos apps intentionally thin/dumb while centralizing transient control-plane handling (leader churn, forwarding, readiness windows) inside the client library.
+## Coordinator Stability Telemetry and Readiness Separation
+
+Added control-plane stability telemetry to support leader-tenure analysis and election-storm diagnosis under no-load vs load:
+
+- New Raft tenure/election metrics:
+  - `lance_raft_leader_tenure_ended_total`
+  - `lance_raft_leader_tenure_last_ms`
+  - `lance_raft_leader_tenure_avg_ms`
+  - `lance_raft_leader_tenure_ms` (histogram)
+  - `lance_raft_election_storms_total`
+  - `lance_raft_election_window_count`
+- New cluster control-plane readiness gauge:
+  - `lance_cluster_coordinator_ready`
+
+Coordinator behavior updates:
+- Election starts are tracked in a rolling window (30s) and flagged as storm when count crosses threshold.
+- Leadership loss now records completed tenure duration.
+- Coordinator readiness is emitted separately from data-plane readiness:
+  - follower: quorum-available
+  - leader: quorum-available AND leader-authoritative
+
+Health endpoint updates:
+- `/health/ready` now returns both `data_plane_ready` and `coordinator_ready`.
+- `/health` now includes both readiness dimensions and computes aggregate readiness from both.
+
+Intent: make coordinator instability visible independently from ingest/read pressure and provide measurable evidence for process-level control/data plane decoupling work.
+## Follower Catch-up Recovery Fix (AppendEntries prev_log_term)
+
+Root cause found in leader replication request construction for topic/data entries:
+
+- `prev_log_term` was populated from `current_term` instead of the actual previous entry term.
+- During/after leadership churn, followers at matching `prev_log_index` but different term correctly rejected AppendEntries per Raft log-matching, causing persistent heartbeat/data rejection loops and stalled catch-up.
+
+Fix applied:
+- Added `RaftNode::last_log_term()` accessor.
+- Updated both replication paths to set `prev_log_term = raft.last_log_term()` before advancing leader log:
+  - topic operation replication path
+  - enriched data replication path
+
+Outcome from validation:
+- Cassa build: pass
+- Cassa test (`./test.sh`): pass in latest run
+
+This change aligns AppendEntries metadata with Raft consistency requirements and prevents false divergence under term transitions.
+## Hot-Path Lock Removal in Async io_uring Backend
+
+To satisfy Engineering Standards §1 (No lock primitives on hot path crates), `lnc-io/src/uring.rs` was updated in the async backend path:
+
+- Replaced `Arc<Mutex<IoUring>>` with `Arc<RingAccess>`.
+- `RingAccess` uses `UnsafeCell<IoUring>` guarded by an `AtomicBool` admission gate (`compare_exchange` + `spin_loop`) to serialize mutable ring access without lock primitives.
+- Submission and completion harvesting now run through `RingAccess::with_ring(...)`.
+
+Behavioral intent remains unchanged:
+- submit path still pushes SQEs and conditionally wakes SQPOLL thread.
+- completion path still drains CQEs then resolves in-flight futures.
+
+Validation:
+- Local hot-path audit grep (`Mutex|RwLock` over `lnc-core`/`lnc-io`) now returns no matches.
+- Cassa build remains green after the change.
 ---
 
 [↑ Back to Top](#technical-design-project-lance) | [← Back to Docs Index](./README.md)

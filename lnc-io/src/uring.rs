@@ -1714,11 +1714,56 @@ use crate::backend::{AsyncIoBackend, WriteFuture};
 use crate::priority::IoPriority;
 use dashmap::DashMap;
 use lnc_core::LoanableBatch;
-use parking_lot::Mutex;
+use std::cell::UnsafeCell;
+use std::hint::spin_loop;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
 type CompletionSender = oneshot::Sender<(LoanableBatch, i32)>;
+
+/// Shared io_uring owner with a lock-free admission gate.
+///
+/// This avoids blocking lock primitives on the lnc-io hot path while still ensuring
+/// exclusive mutable access to io_uring internals during submission/completion
+/// harvesting.
+pub struct RingAccess {
+    ring: UnsafeCell<IoUring>,
+    gate: std::sync::atomic::AtomicBool,
+}
+
+// SAFETY: All access to `ring` is serialized by `gate`.
+unsafe impl Send for RingAccess {}
+// SAFETY: Shared references are safe because mutable access is gated.
+unsafe impl Sync for RingAccess {}
+
+impl RingAccess {
+    fn new(ring: IoUring) -> Self {
+        Self {
+            ring: UnsafeCell::new(ring),
+            gate: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn with_ring<T>(&self, f: impl FnOnce(&mut IoUring) -> T) -> T {
+        while self
+            .gate
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            spin_loop();
+        }
+
+        // SAFETY: gate guarantees exclusive mutable access.
+        let out = f(unsafe { &mut *self.ring.get() });
+        self.gate.store(false, std::sync::atomic::Ordering::Release);
+        out
+    }
+}
 
 /// Async-capable io_uring backend for zero-copy I/O.
 ///
@@ -1733,9 +1778,8 @@ type CompletionSender = oneshot::Sender<(LoanableBatch, i32)>;
 /// the kernel performs DMA. Dropping the future does NOT cancel
 /// the I/O - the batch remains pinned until CQE arrives.
 pub struct AsyncIoUringBackend {
-    /// Shared io_uring instance (submission requires mutex)
-    /// In production, use lock-free handoff to dedicated poller thread
-    ring: Arc<Mutex<IoUring>>,
+    /// Shared io_uring instance guarded by atomic gate.
+    ring: Arc<RingAccess>,
 
     /// File descriptor (must be opened with O_DIRECT)
     fd: RawFd,
@@ -1767,7 +1811,7 @@ impl AsyncIoUringBackend {
         );
 
         Ok(Self {
-            ring: Arc::new(Mutex::new(ring)),
+            ring: Arc::new(RingAccess::new(ring)),
             fd,
             in_flight: Arc::new(DashMap::new()),
         })
@@ -1780,7 +1824,7 @@ impl AsyncIoUringBackend {
     }
 
     /// Get a handle to the ring for the poller thread.
-    pub fn ring(&self) -> Arc<Mutex<IoUring>> {
+    fn ring(&self) -> Arc<RingAccess> {
         Arc::clone(&self.ring)
     }
 }
@@ -1808,27 +1852,26 @@ impl AsyncIoBackend for AsyncIoUringBackend {
 
         // Push SQE to submission queue + conditional wakeup (single lock)
         // With SQPOLL enabled, we usually skip the submit() syscall entirely
-        {
-            let mut ring = self.ring.lock();
-
+        let submit_result: Result<()> = self.ring.with_ring(|ring| {
             // Attempt to push SQE to submission queue
             let push_result = unsafe { ring.submission().push(&sqe) };
 
-            if let Err(_) = push_result {
-                // CRITICAL: Rollback in_flight insertion to prevent memory leak
-                self.in_flight.remove(&batch_id);
+            if push_result.is_err() {
                 return Err(LanceError::Io(std::io::Error::other("SQ full")));
             }
 
             // OPTIMIZATION: Only syscall if the SQPOLL thread needs waking up
             // Most of the time this branch is NOT taken (zero-syscall fast path)
             if ring.submission().need_wakeup() {
-                if let Err(e) = ring.submit() {
-                    // CRITICAL: Rollback in_flight insertion to prevent memory leak
-                    self.in_flight.remove(&batch_id);
-                    return Err(e.into());
-                }
+                ring.submit().map(|_| ()).map_err(Into::into)
+            } else {
+                Ok(())
             }
+        });
+        if let Err(e) = submit_result {
+            // CRITICAL: Rollback in_flight insertion to prevent memory leak
+            self.in_flight.remove(&batch_id);
+            return Err(e);
         }
 
         lnc_metrics::increment_io_submitted();
@@ -1865,19 +1908,18 @@ impl AsyncIoBackend for AsyncIoUringBackend {
 /// critical section and allows submitters to continue writing while
 /// the poller processes completions (DashMap lookups + channel sends).
 pub fn poll_async_completions(
-    ring: &Arc<Mutex<IoUring>>,
+    ring: &Arc<RingAccess>,
     in_flight: &Arc<DashMap<u64, (LoanableBatch, CompletionSender)>>,
 ) -> Result<u32> {
     // Pre-allocate buffer for CQEs (reused across calls in production)
     let mut cqes = Vec::with_capacity(64);
 
     // CRITICAL SECTION: Reap CQEs as fast as possible
-    {
-        let mut ring = ring.lock();
+    ring.with_ring(|ring| {
         for cqe in ring.completion() {
             cqes.push((cqe.user_data(), cqe.result()));
         }
-    } // Lock drops here -> Submitters can write again
+    }); // Gate released here -> Submitters can write again
 
     if cqes.is_empty() {
         return Ok(0);
@@ -1907,7 +1949,7 @@ pub fn poll_async_completions(
 /// Continuously polls for completions and notifies awaiting futures.
 /// This thread should be pinned to the same NUMA node as the NVMe device.
 pub struct AsyncIoPoller {
-    ring: Arc<Mutex<IoUring>>,
+    ring: Arc<RingAccess>,
     in_flight: Arc<DashMap<u64, (LoanableBatch, CompletionSender)>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 }

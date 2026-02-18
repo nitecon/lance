@@ -10,6 +10,7 @@ use crate::discovery::{ClusterConfig, PeerDiscovery};
 use crate::log_store::LogStore;
 use crate::peer::{PeerConfig, PeerManager, PeerState};
 use crate::raft::{FencingToken, RaftConfig, RaftNode, RaftState};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -113,6 +114,10 @@ pub struct ClusterCoordinator {
     /// - `handle_peer_connection` after follower processes AppendEntries
     /// - `replicate_data_enriched` after leader's commit_index advances via quorum
     commit_notify: Arc<Notify>,
+    /// Sliding window of election-start instants for storm detection.
+    election_start_window: tokio::sync::Mutex<VecDeque<Instant>>,
+    /// Last time the leader heartbeat fanout was emitted.
+    last_heartbeat_sent_at: tokio::sync::Mutex<Instant>,
 }
 
 impl ClusterCoordinator {
@@ -120,10 +125,15 @@ impl ClusterCoordinator {
     // Small depths can drop events under sustained ingest, causing followers to
     // miss topic/data apply notifications and diverge.
     const EVENT_CHANNEL_CAPACITY: usize = 65_536;
+    /// Count elections in this rolling window to detect storms.
+    const ELECTION_STORM_WINDOW: Duration = Duration::from_secs(30);
+    /// Elections within window at/above this threshold are considered a storm.
+    const ELECTION_STORM_THRESHOLD: usize = 3;
 
     /// Create a new cluster coordinator
     pub fn new(config: ClusterConfig) -> Self {
         let (event_tx, _) = broadcast::channel(Self::EVENT_CHANNEL_CAPACITY);
+        let heartbeat_interval = config.heartbeat_interval;
 
         // Create Raft cluster config from our config
         let raft_cluster_config = RaftClusterConfig::single(vec![ConfigNode {
@@ -156,6 +166,10 @@ impl ClusterCoordinator {
             .with_timeout(config.heartbeat_interval.as_millis() as u64 * 3);
         let quorum_manager = crate::quorum::AsyncQuorumManager::new(quorum_config);
 
+        // Coordinator starts not-ready until first coordination tick computes
+        // quorum/leadership state.
+        lnc_metrics::set_cluster_coordinator_ready(false);
+
         Self {
             config,
             raft: Arc::new(RwLock::new(raft)),
@@ -170,12 +184,19 @@ impl ClusterCoordinator {
             log_store: None,
             last_sync_time: std::sync::atomic::AtomicU64::new(0),
             commit_notify: Arc::new(Notify::new()),
+            election_start_window: tokio::sync::Mutex::new(VecDeque::new()),
+            last_heartbeat_sent_at: tokio::sync::Mutex::new(
+                Instant::now()
+                    .checked_sub(heartbeat_interval)
+                    .unwrap_or_else(Instant::now),
+            ),
         }
     }
 
     /// Create a new cluster coordinator with persistent log storage
     pub fn with_log_store(config: ClusterConfig, data_dir: &Path) -> Result<Self, std::io::Error> {
         let (event_tx, _) = broadcast::channel(Self::EVENT_CHANNEL_CAPACITY);
+        let heartbeat_interval = config.heartbeat_interval;
 
         // Open persistent log store
         let raft_dir = data_dir.join("raft");
@@ -238,6 +259,10 @@ impl ClusterCoordinator {
             .with_timeout(config.heartbeat_interval.as_millis() as u64 * 3);
         let quorum_manager = crate::quorum::AsyncQuorumManager::new(quorum_config);
 
+        // Coordinator starts not-ready until first coordination tick computes
+        // quorum/leadership state.
+        lnc_metrics::set_cluster_coordinator_ready(false);
+
         Ok(Self {
             config,
             raft: Arc::new(RwLock::new(raft)),
@@ -252,7 +277,48 @@ impl ClusterCoordinator {
             log_store: Some(Arc::new(std::sync::Mutex::new(log_store))),
             last_sync_time: std::sync::atomic::AtomicU64::new(0),
             commit_notify: Arc::new(Notify::new()),
+            election_start_window: tokio::sync::Mutex::new(VecDeque::new()),
+            last_heartbeat_sent_at: tokio::sync::Mutex::new(
+                Instant::now()
+                    .checked_sub(heartbeat_interval)
+                    .unwrap_or_else(Instant::now),
+            ),
         })
+    }
+
+    async fn should_send_heartbeat_now(&self) -> bool {
+        let mut last_sent = self.last_heartbeat_sent_at.lock().await;
+        if last_sent.elapsed() >= self.config.heartbeat_interval {
+            *last_sent = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn record_election_start(&self) {
+        let mut window = self.election_start_window.lock().await;
+        let now = Instant::now();
+        window.push_back(now);
+        while let Some(front) = window.front() {
+            if now.duration_since(*front) > Self::ELECTION_STORM_WINDOW {
+                window.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let election_count = window.len() as u64;
+        lnc_metrics::set_raft_election_window_count(election_count);
+        if window.len() >= Self::ELECTION_STORM_THRESHOLD {
+            lnc_metrics::increment_raft_election_storms();
+            warn!(
+                target: "lance::cluster",
+                election_count,
+                window_secs = Self::ELECTION_STORM_WINDOW.as_secs(),
+                "Election storm detected"
+            );
+        }
     }
 
     /// Subscribe to cluster events
@@ -539,7 +605,7 @@ impl ClusterCoordinator {
         let (term, prev_log_index, prev_log_term, new_log_index) = {
             let mut raft = self.raft.write().await;
             let prev_idx = raft.last_log_index();
-            let prev_term = raft.current_term();
+            let prev_term = raft.last_log_term();
             raft.advance_log(1);
             (
                 raft.current_term(),
@@ -822,7 +888,7 @@ impl ClusterCoordinator {
         let (term, prev_log_index, prev_log_term, new_log_index) = {
             let mut raft = self.raft.write().await;
             let prev_idx = raft.last_log_index();
-            let prev_term = raft.current_term();
+            let prev_term = raft.last_log_term();
             raft.advance_log(1);
             (
                 raft.current_term(),
@@ -1435,6 +1501,14 @@ impl ClusterCoordinator {
         lnc_metrics::set_cluster_node_count(total_nodes);
         lnc_metrics::set_cluster_healthy_nodes(connected_peers + 1); // +1 for self
         lnc_metrics::set_cluster_quorum_available(quorum_available);
+        let coordinator_ready = if is_leader {
+            self.cached_is_authoritative
+                .load(std::sync::atomic::Ordering::Acquire)
+                && quorum_available
+        } else {
+            quorum_available
+        };
+        lnc_metrics::set_cluster_coordinator_ready(coordinator_ready);
 
         // Update replication lag metrics
         let last_sync = self
@@ -1459,7 +1533,7 @@ impl ClusterCoordinator {
         self.apply_committed_entries().await;
         self.refresh_leader_readiness().await;
 
-        if is_leader {
+        if is_leader && self.should_send_heartbeat_now().await {
             // Send heartbeats to all peers
             if let Err(e) = self.send_heartbeats().await {
                 warn!(
@@ -1478,6 +1552,18 @@ impl ClusterCoordinator {
         // Use Release ordering to ensure all leader-only data structure writes
         // (next_index, match_index, etc.) are visible to threads reading is_leader
         let old_is_leader = self.cached_is_leader.swap(is_leader, Ordering::Release);
+
+        if old_is_leader && !is_leader {
+            lnc_metrics::increment_raft_leader_stepdowns();
+            let elected_at_ms = self.leader_elected_at_ms.load(Ordering::Relaxed);
+            if elected_at_ms > 0 {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(elected_at_ms);
+                lnc_metrics::record_raft_leader_tenure_ms(now_ms.saturating_sub(elected_at_ms));
+            }
+        }
 
         // Update cached leader address if leadership changed
         if old_is_leader != is_leader || !is_leader {
@@ -1568,6 +1654,7 @@ impl ClusterCoordinator {
                 "Election timeout elapsed, starting election"
             );
             lnc_metrics::increment_raft_elections_started();
+            self.record_election_start().await;
             self.start_election().await;
         }
     }
@@ -1582,13 +1669,20 @@ impl ClusterCoordinator {
             return Ok(()); // Not leader, skip heartbeats
         };
 
+        // Bound heartbeat RPC latency so a single slow/unresponsive follower
+        // does not stall the coordinator loop long enough to trigger elections.
+        let heartbeat_rpc_timeout = self.config.heartbeat_interval.saturating_mul(2);
+
         let peer_ids = self.peers.peer_ids().await;
         let mut join_set = tokio::task::JoinSet::new();
         for peer_id in peer_ids {
             let peers = Arc::clone(&self.peers);
             let req = request.clone();
+            let rpc_timeout = heartbeat_rpc_timeout;
             join_set.spawn(async move {
-                let result = peers.send_append_entries(peer_id, req).await;
+                let result =
+                    tokio::time::timeout(rpc_timeout, peers.send_append_entries(peer_id, req))
+                        .await;
                 (peer_id, result)
             });
         }
@@ -1600,14 +1694,14 @@ impl ClusterCoordinator {
             };
 
             match result {
-                Ok(resp) if resp.success => {
+                Ok(Ok(resp)) if resp.success => {
                     trace!(
                         target: "lance::cluster",
                         peer_id,
                         "Sent heartbeat"
                     );
                 },
-                Ok(resp) => {
+                Ok(Ok(resp)) => {
                     if resp.term > request.term {
                         highest_observed_term = Some(
                             highest_observed_term
@@ -1622,12 +1716,20 @@ impl ClusterCoordinator {
                         "Heartbeat rejected by follower"
                     );
                 },
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(
                         target: "lance::cluster",
                         peer_id,
                         error = %e,
                         "Failed to send heartbeat"
+                    );
+                },
+                Err(_) => {
+                    warn!(
+                        target: "lance::cluster",
+                        peer_id,
+                        timeout_ms = heartbeat_rpc_timeout.as_millis() as u64,
+                        "Heartbeat RPC timed out"
                     );
                 },
             }

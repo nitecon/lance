@@ -115,10 +115,19 @@ async fn handle_request(
             }
         },
         (&Method::GET, "/health/ready") => {
-            if state.is_ready() {
-                json_response(StatusCode::OK, r#"{"status":"ready"}"#)
+            let data_plane_ready = state.is_ready();
+            let coordinator_ready = lnc_metrics::cluster_coordinator_ready();
+            if data_plane_ready && coordinator_ready {
+                json_response(
+                    StatusCode::OK,
+                    r#"{"status":"ready","data_plane_ready":true,"coordinator_ready":true}"#,
+                )
             } else {
-                json_response(StatusCode::SERVICE_UNAVAILABLE, r#"{"status":"not_ready"}"#)
+                let body = format!(
+                    r#"{{"status":"not_ready","data_plane_ready":{},"coordinator_ready":{}}}"#,
+                    data_plane_ready, coordinator_ready
+                );
+                json_response(StatusCode::SERVICE_UNAVAILABLE, &body)
             }
         },
         (&Method::GET, "/health/startup") => {
@@ -130,7 +139,9 @@ async fn handle_request(
         },
         (&Method::GET, "/health") => {
             let alive = state.is_alive();
-            let ready = state.is_ready();
+            let data_plane_ready = state.is_ready();
+            let coordinator_ready = lnc_metrics::cluster_coordinator_ready();
+            let ready = data_plane_ready && coordinator_ready;
             let startup = state.is_startup_complete();
             let status = if alive && ready && startup {
                 StatusCode::OK
@@ -138,8 +149,8 @@ async fn handle_request(
                 StatusCode::SERVICE_UNAVAILABLE
             };
             let body = format!(
-                r#"{{"alive":{},"ready":{},"startup_complete":{}}}"#,
-                alive, ready, startup
+                r#"{{"alive":{},"ready":{},"data_plane_ready":{},"coordinator_ready":{},"startup_complete":{}}}"#,
+                alive, ready, data_plane_ready, coordinator_ready, startup
             );
             json_response(status, &body)
         },

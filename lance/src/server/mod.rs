@@ -165,7 +165,7 @@ pub async fn run(
         // Use persistent log storage for durable Raft state (term, voted_for, log entries).
         // Falls back to in-memory-only mode if persistence fails (e.g. first run, permissions).
         let coordinator =
-            match ClusterCoordinator::with_persistence(cluster_config.clone(), &config.data_dir) {
+            match ClusterCoordinator::with_log_store(cluster_config.clone(), &config.data_dir) {
                 Ok(c) => {
                     info!(
                         target: "lance::server",
@@ -348,7 +348,14 @@ pub async fn run(
             // Track last known leader for change detection
             let mut last_leader = event_coord.leader_addr();
             // Topic writers for follower data replication (only used by followers)
-            let mut follower_writers: std::collections::HashMap<u32, writer::TopicWriter> =
+            // Enriched L3 path uses (topic_id, segment_name) to support concurrent
+            // segment streams for hot topics without offset collisions.
+            let mut follower_writers_enriched: std::collections::HashMap<
+                (u32, String),
+                writer::TopicWriter,
+            > = std::collections::HashMap::new();
+            // Legacy path keeps topic-scoped writer cache.
+            let mut follower_writers_legacy: std::collections::HashMap<u32, writer::TopicWriter> =
                 std::collections::HashMap::new();
             // Resync actor for bulk segment transfer when follower is too far behind
             let mut resync_actor =
@@ -406,7 +413,8 @@ pub async fn run(
                                 );
                             }
                             // Remove any cached writer for deleted topic
-                            follower_writers.remove(&topic_id);
+                            follower_writers_legacy.remove(&topic_id);
+                            follower_writers_enriched.retain(|(tid, _), _| *tid != topic_id);
                         },
                     },
                     Ok(ClusterEvent::DataReceivedEnriched(entry)) => {
@@ -415,7 +423,7 @@ pub async fn run(
                         if let Err(e) = ingestion::write_replicated_data_enriched(
                             &event_config,
                             &event_registry,
-                            &mut follower_writers,
+                            &mut follower_writers_enriched,
                             &entry,
                         ) {
                             warn!(
@@ -425,7 +433,8 @@ pub async fn run(
                                 error = %e,
                                 "Failed to write enriched replicated data"
                             );
-                            follower_writers.remove(&topic_id);
+                            follower_writers_enriched
+                                .remove(&(topic_id, entry.segment_name.clone()));
                         }
                     },
                     Ok(ClusterEvent::DataReceived { topic_id, payload }) => {
@@ -433,7 +442,7 @@ pub async fn run(
                         if let Err(e) = ingestion::write_replicated_data(
                             &event_config,
                             &event_registry,
-                            &mut follower_writers,
+                            &mut follower_writers_legacy,
                             topic_id,
                             &payload,
                         ) {
@@ -444,7 +453,7 @@ pub async fn run(
                                 error = %e,
                                 "Failed to write replicated data (legacy)"
                             );
-                            follower_writers.remove(&topic_id);
+                            follower_writers_legacy.remove(&topic_id);
                         }
                     },
                     Ok(ClusterEvent::BecameLeader { term, .. }) => {
@@ -454,42 +463,56 @@ pub async fn run(
                         info!(
                             target: "lance::server",
                             term,
-                            writers = follower_writers.len(),
+                            writers = follower_writers_legacy.len() + follower_writers_enriched.len(),
                             "BecameLeader — closing follower writer segments"
                         );
 
-                        // Sync all local topics to followers to ensure cluster-wide consistency
-                        // This is critical because each pod has its own persistent volume
-                        let local_topics = event_registry.list_topics();
-                        if !local_topics.is_empty() {
-                            info!(
-                                target: "lance::server",
-                                topic_count = local_topics.len(),
-                                "Syncing local topics to followers after becoming leader"
-                            );
-                            for topic in local_topics {
-                                let op = TopicOperation::Create {
-                                    topic_id: topic.id,
-                                    name: topic.name.clone(),
-                                    created_at: topic.created_at,
-                                };
-                                if let Err(e) = event_coord.replicate_topic_op(op).await {
-                                    warn!(
-                                        target: "lance::server",
-                                        topic_id = topic.id,
-                                        topic_name = %topic.name,
-                                        error = %e,
-                                        "Failed to sync topic to followers"
-                                    );
-                                }
-                            }
-                        }
+                        // Re-emit committed topic operations to self-heal local topic
+                        // registry state after election churn / receiver lag.
+                        event_coord.reemit_committed_topic_ops().await;
+
+                        // IMPORTANT: do not fan-out local topic registry state here.
+                        // Per-node disk state can be stale under churn; propagating it
+                        // can overwrite authoritative committed metadata.
+                        // Metadata convergence is driven by committed TopicOp replay.
 
                         let end_ts = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_nanos() as u64)
                             .unwrap_or(0);
-                        for (topic_id, mut tw) in follower_writers.drain() {
+                        for (topic_id, mut tw) in follower_writers_legacy.drain() {
+                            if let Err(e) = tw.writer.fsync() {
+                                warn!(
+                                    target: "lance::server",
+                                    topic_id,
+                                    error = %e,
+                                    "Failed to fsync follower segment on leader transition"
+                                );
+                                continue;
+                            }
+                            match tw.writer.close(end_ts) {
+                                Ok(closed_path) => {
+                                    let _ = tw.index_builder.write_indexes(&closed_path);
+                                    debug!(
+                                        target: "lance::server",
+                                        topic_id,
+                                        segment = %closed_path.display(),
+                                        "Closed follower segment on leader transition"
+                                    );
+                                },
+                                Err(e) => {
+                                    warn!(
+                                        target: "lance::server",
+                                        topic_id,
+                                        error = %e,
+                                        "Failed to close follower segment on leader transition"
+                                    );
+                                },
+                            }
+                        }
+
+                        for ((topic_id, _segment_name), mut tw) in follower_writers_enriched.drain()
+                        {
                             if let Err(e) = tw.writer.fsync() {
                                 warn!(
                                     target: "lance::server",
@@ -594,6 +617,44 @@ pub async fn run(
                             skipped = n,
                             "Cluster event receiver lagged"
                         );
+
+                        // We may have missed topic/data apply events. Reconcile metadata
+                        // and clear cached follower writers so future enriched writes reopen
+                        // from disk instead of using stale in-memory offsets.
+                        event_coord.reemit_committed_topic_ops().await;
+                        follower_writers_legacy.clear();
+                        follower_writers_enriched.clear();
+
+                        // Proactively request bulk resync from current leader to recover
+                        // any missed data-plane events from channel lag.
+                        if !resync_actor.is_active() {
+                            if let Some(leader_id) = event_coord.leader_id().await {
+                                if leader_id != event_config.node_id {
+                                    if let Some(leader_repl_addr) =
+                                        event_coord.peer_addr(leader_id).await
+                                    {
+                                        warn!(
+                                            target: "lance::resync",
+                                            skipped = n,
+                                            leader_id,
+                                            leader_addr = %leader_repl_addr,
+                                            "Lagged apply receiver - initiating follower bulk resync"
+                                        );
+                                        if let Err(e) =
+                                            resync_actor.initiate_resync(leader_repl_addr, 0).await
+                                        {
+                                            warn!(
+                                                target: "lance::resync",
+                                                skipped = n,
+                                                error = %e,
+                                                "Bulk resync after lagged receiver failed"
+                                            );
+                                            resync_actor.reset();
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     },
                     Err(broadcast::error::RecvError::Closed) => {
                         debug!(target: "lance::server", "Cluster event channel closed");

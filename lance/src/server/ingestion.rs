@@ -14,6 +14,9 @@ static SEQUENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Request to ingest data into a topic
 pub struct IngestionRequest {
     pub topic_id: u32,
+    /// Connection-scoped routing key used to shard hot topics across actors
+    /// while preserving per-connection ordering.
+    pub routing_key: u64,
     pub timestamp_ns: u64,
     pub record_count: u32,
     pub payload: Bytes,
@@ -106,10 +109,11 @@ pub fn write_replicated_data(
 pub fn write_replicated_data_enriched(
     config: &Config,
     topic_registry: &TopicRegistry,
-    topic_writers: &mut HashMap<u32, TopicWriter>,
+    topic_writers: &mut HashMap<(u32, String), TopicWriter>,
     entry: &lnc_replication::DataReplicationEntry,
 ) -> Result<()> {
     let topic_id = entry.topic_id;
+    let writer_key = (topic_id, entry.segment_name.clone());
     let topic_dir = if topic_id == 0 {
         config.data_dir.join("segments").join("0")
     } else {
@@ -129,7 +133,7 @@ pub fn write_replicated_data_enriched(
         let writer = lnc_io::SegmentWriter::create_named(&topic_dir, &entry.segment_name)?;
         let index_builder = lnc_index::IndexBuilder::with_defaults();
         topic_writers.insert(
-            topic_id,
+            writer_key.clone(),
             TopicWriter {
                 writer,
                 index_builder,
@@ -138,7 +142,7 @@ pub fn write_replicated_data_enriched(
     }
 
     // Use Entry API to handle initialization atomically without double-lookup
-    let topic_writer = match topic_writers.entry(topic_id) {
+    let topic_writer = match topic_writers.entry(writer_key.clone()) {
         Entry::Occupied(o) => o.into_mut(),
         Entry::Vacant(v) => {
             tracing::warn!(
@@ -267,7 +271,7 @@ pub fn write_replicated_data_enriched(
         topic_writer.index_builder.clear();
 
         // Remove the writer — next write with NEW_SEGMENT flag will create a new one
-        topic_writers.remove(&topic_id);
+        topic_writers.remove(&writer_key);
     }
 
     Ok(())

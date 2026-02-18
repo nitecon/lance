@@ -143,6 +143,8 @@ pub struct TopicInfo {
     pub name: String,
     /// Unix timestamp when the topic was created
     pub created_at: u64,
+    /// Topic identity epoch for stale-id detection
+    pub topic_epoch: u64,
     /// Retention policy configuration (None = no retention policy set)
     pub retention: Option<RetentionInfo>,
 }
@@ -665,6 +667,141 @@ impl LanceClient {
         self.parse_topic_response(response)
     }
 
+    /// Ensure a topic exists and return its metadata.
+    ///
+    /// This helper encapsulates common create/list convergence retry behavior so
+    /// application callers (bench/chaos) can stay simple.
+    pub async fn ensure_topic(
+        &mut self,
+        name: &str,
+        max_attempts: usize,
+        base_backoff_ms: u64,
+    ) -> Result<TopicInfo> {
+        let attempts = max_attempts.max(1);
+        let mut last_error: Option<ClientError> = None;
+        let mut saw_retryable_error = false;
+
+        for attempt in 1..=attempts {
+            let mut retryable_this_attempt = false;
+
+            match self.create_topic(name).await {
+                Ok(info) => {
+                    trace!(
+                        topic_id = info.id,
+                        topic_name = %info.name,
+                        attempt,
+                        max_attempts = attempts,
+                        "Topic ensured via create_topic"
+                    );
+                    return Ok(info);
+                },
+                Err(create_err) => {
+                    if create_err.is_retryable() {
+                        retryable_this_attempt = true;
+                        saw_retryable_error = true;
+                    }
+                    last_error = Some(ClientError::ServerError(create_err.to_string()));
+                    warn!(
+                        topic_name = %name,
+                        attempt,
+                        max_attempts = attempts,
+                        error = %create_err,
+                        "create_topic failed during ensure_topic; retrying with list fallback"
+                    );
+                },
+            }
+
+            match self.list_topics().await {
+                Ok(topics) => {
+                    if let Some(topic) = topics.into_iter().find(|t| t.name == name) {
+                        trace!(
+                            topic_id = topic.id,
+                            topic_name = %topic.name,
+                            attempt,
+                            max_attempts = attempts,
+                            "Topic ensured via list_topics fallback"
+                        );
+                        return Ok(topic);
+                    }
+                },
+                Err(list_err) => {
+                    if list_err.is_retryable() {
+                        retryable_this_attempt = true;
+                        saw_retryable_error = true;
+                    }
+                    last_error = Some(ClientError::ServerError(list_err.to_string()));
+                    warn!(
+                        topic_name = %name,
+                        attempt,
+                        max_attempts = attempts,
+                        error = %list_err,
+                        "list_topics failed during ensure_topic"
+                    );
+                },
+            }
+
+            if attempt < attempts {
+                let backoff_ms = if retryable_this_attempt {
+                    base_backoff_ms.saturating_mul(attempt as u64).max(1)
+                } else {
+                    // Non-retryable errors are unlikely to heal with long sleeps.
+                    base_backoff_ms.max(1)
+                };
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+
+                // Refresh connection to improve odds of landing on current leader
+                // after elections and readiness transitions.
+                let reconnect_config = self.config.clone();
+                match Self::connect(reconnect_config).await {
+                    Ok(new_client) => {
+                        *self = new_client;
+                    },
+                    Err(reconnect_err) => {
+                        warn!(
+                            topic_name = %name,
+                            attempt,
+                            max_attempts = attempts,
+                            error = %reconnect_err,
+                            "ensure_topic reconnect attempt failed"
+                        );
+                        last_error = Some(reconnect_err);
+                    },
+                }
+            }
+        }
+
+        if let Some(err) = last_error {
+            return Err(ClientError::ServerError(format!(
+                "ensure_topic('{}') failed after {} attempts: {}",
+                name, attempts, err
+            )));
+        }
+
+        if saw_retryable_error {
+            return Err(ClientError::ServerError(format!(
+                "ensure_topic('{}') exhausted {} retryable attempts",
+                name, attempts
+            )));
+        }
+
+        Err(ClientError::ServerError(format!(
+            "topic '{}' not found after {} ensure_topic attempts",
+            name, attempts
+        )))
+    }
+
+    /// Ensure topic with standard retry profile suitable for benchmark/chaos tools.
+    pub async fn ensure_topic_default(&mut self, name: &str) -> Result<TopicInfo> {
+        const DEFAULT_ENSURE_TOPIC_ATTEMPTS: usize = 20;
+        const DEFAULT_ENSURE_TOPIC_BACKOFF_MS: u64 = 500;
+        self.ensure_topic(
+            name,
+            DEFAULT_ENSURE_TOPIC_ATTEMPTS,
+            DEFAULT_ENSURE_TOPIC_BACKOFF_MS,
+        )
+        .await
+    }
+
     /// List all topics on the server
     pub async fn list_topics(&mut self) -> Result<Vec<TopicInfo>> {
         let frame = Frame::new_list_topics();
@@ -1152,6 +1289,7 @@ impl LanceClient {
                     id: json["id"].as_u64().unwrap_or(0) as u32,
                     name: json["name"].as_str().unwrap_or("").to_string(),
                     created_at: json["created_at"].as_u64().unwrap_or(0),
+                    topic_epoch: json["topic_epoch"].as_u64().unwrap_or(1),
                     retention,
                 })
             },
@@ -1199,6 +1337,7 @@ impl LanceClient {
                                     id: t["id"].as_u64().unwrap_or(0) as u32,
                                     name: t["name"].as_str().unwrap_or("").to_string(),
                                     created_at: t["created_at"].as_u64().unwrap_or(0),
+                                    topic_epoch: t["topic_epoch"].as_u64().unwrap_or(1),
                                     retention,
                                 }
                             })

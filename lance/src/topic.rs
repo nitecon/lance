@@ -6,11 +6,25 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{debug, info, warn};
 
+pub const CURRENT_TOPIC_EPOCH: u64 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopicIdentityError {
+    UnknownTopic,
+    StaleEpoch { expected: u64, actual: u64 },
+}
+
+const fn default_topic_epoch() -> u64 {
+    CURRENT_TOPIC_EPOCH
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicMetadata {
     pub id: u32,
     pub name: String,
     pub created_at: u64,
+    #[serde(default = "default_topic_epoch")]
+    pub topic_epoch: u64,
     #[serde(default)]
     pub auth: Option<TopicAuthConfig>,
     #[serde(default)]
@@ -43,6 +57,7 @@ impl TopicMetadata {
             id,
             name,
             created_at,
+            topic_epoch: CURRENT_TOPIC_EPOCH,
             auth: None,
             retention: None,
         }
@@ -154,6 +169,15 @@ impl TopicRegistry {
         self.create_topic_with_retention(name, None)
     }
 
+    /// Reserve and return the next topic ID.
+    ///
+    /// This supports clustered replicate-first create flows where topic metadata
+    /// should only become visible locally after the create operation is
+    /// replicated and committed.
+    pub fn reserve_topic_id(&self) -> u32 {
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+
     /// Create a topic with optional retention policy
     pub fn create_topic_with_retention(
         &self,
@@ -215,28 +239,6 @@ impl TopicRegistry {
         name: &str,
         created_at: u64,
     ) -> Result<TopicMetadata> {
-        {
-            let by_name = self
-                .topics_by_name
-                .read()
-                .map_err(|_| LanceError::Protocol("Lock poisoned".into()))?;
-            let by_id = self
-                .topics_by_id
-                .read()
-                .map_err(|_| LanceError::Protocol("Lock poisoned".into()))?;
-
-            // Check if topic already exists (idempotency for replayed operations)
-            if by_name.contains_key(name) || by_id.contains_key(&id) {
-                return Ok(TopicMetadata {
-                    id,
-                    name: name.to_string(),
-                    created_at,
-                    auth: None,
-                    retention: None,
-                });
-            }
-        }
-
         // Update next_id if this ID is >= current to prevent conflicts
         loop {
             let current = self.next_id.load(Ordering::SeqCst);
@@ -256,6 +258,7 @@ impl TopicRegistry {
             id,
             name: name.to_string(),
             created_at,
+            topic_epoch: CURRENT_TOPIC_EPOCH,
             auth: None,
             retention: None,
         };
@@ -276,6 +279,40 @@ impl TopicRegistry {
                 .write()
                 .map_err(|_| LanceError::Protocol("Lock poisoned".into()))?;
 
+            // Idempotent fast path for replayed TopicOp::Create entries.
+            if by_name.get(name).copied() == Some(id) && by_id.contains_key(&id) {
+                return Ok(metadata);
+            }
+
+            // Reconcile stale mappings after election churn / partial ops:
+            // if this name currently points at a different ID, remove old ID row.
+            if let Some(existing_id_for_name) = by_name.get(name).copied() {
+                if existing_id_for_name != id {
+                    by_id.remove(&existing_id_for_name);
+                    warn!(
+                        target: "lance::topic",
+                        topic_name = %name,
+                        old_topic_id = existing_id_for_name,
+                        new_topic_id = id,
+                        "Replacing stale replicated topic mapping by name"
+                    );
+                }
+            }
+
+            // If this ID was previously associated to another name, remove that name mapping.
+            if let Some(existing_meta_for_id) = by_id.get(&id) {
+                if existing_meta_for_id.name != name {
+                    by_name.remove(&existing_meta_for_id.name);
+                    warn!(
+                        target: "lance::topic",
+                        topic_id = id,
+                        old_topic_name = %existing_meta_for_id.name,
+                        new_topic_name = %name,
+                        "Replacing stale replicated topic mapping by id"
+                    );
+                }
+            }
+
             by_name.insert(name.to_string(), id);
             by_id.insert(id, metadata.clone());
         }
@@ -291,12 +328,49 @@ impl TopicRegistry {
     }
 
     pub fn get_topic_by_id(&self, id: u32) -> Option<TopicMetadata> {
-        self.topics_by_id.read().ok()?.get(&id).cloned()
+        if let Some(meta) = self.topics_by_id.read().ok()?.get(&id).cloned() {
+            return Some(meta);
+        }
+
+        self.hydrate_topic_from_disk(id)
     }
 
     /// Alias for get_topic_by_id for API compatibility
+    #[allow(dead_code)]
     pub fn get_topic(&self, id: u32) -> Option<TopicMetadata> {
         self.get_topic_by_id(id)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_topic_epoch(&self, id: u32) -> Option<u64> {
+        self.get_topic_by_id(id).map(|m| m.topic_epoch)
+    }
+
+    #[allow(dead_code)]
+    pub fn topic_matches_epoch(&self, id: u32, expected_epoch: u64) -> bool {
+        self.get_topic_epoch(id) == Some(expected_epoch)
+    }
+
+    #[allow(dead_code)]
+    pub fn validate_topic_identity(
+        &self,
+        id: u32,
+        expected_epoch: Option<u64>,
+    ) -> std::result::Result<TopicMetadata, TopicIdentityError> {
+        let metadata = self
+            .get_topic_by_id(id)
+            .ok_or(TopicIdentityError::UnknownTopic)?;
+
+        if let Some(expected) = expected_epoch {
+            if metadata.topic_epoch != expected {
+                return Err(TopicIdentityError::StaleEpoch {
+                    expected,
+                    actual: metadata.topic_epoch,
+                });
+            }
+        }
+
+        Ok(metadata)
     }
 
     #[allow(dead_code)]
@@ -317,9 +391,89 @@ impl TopicRegistry {
             .unwrap_or_default()
     }
 
+    fn hydrate_topic_from_disk(&self, id: u32) -> Option<TopicMetadata> {
+        let metadata_path = self
+            .data_dir
+            .join("segments")
+            .join(id.to_string())
+            .join("metadata.json");
+        if !metadata_path.exists() {
+            return None;
+        }
+
+        let metadata = match TopicMetadata::load(&metadata_path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    target: "lance::topic",
+                    topic_id = id,
+                    path = %metadata_path.display(),
+                    error = %e,
+                    "Failed to hydrate topic metadata from disk"
+                );
+                return None;
+            },
+        };
+
+        let mut by_id = match self.topics_by_id.write() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(
+                    target: "lance::topic",
+                    topic_id = id,
+                    error = %e,
+                    "RwLock poisoned while hydrating topics_by_id"
+                );
+                return None;
+            },
+        };
+        let mut by_name = match self.topics_by_name.write() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(
+                    target: "lance::topic",
+                    topic_id = id,
+                    error = %e,
+                    "RwLock poisoned while hydrating topics_by_name"
+                );
+                return None;
+            },
+        };
+
+        if let Some(existing_id_for_name) = by_name.get(&metadata.name).copied() {
+            if existing_id_for_name != metadata.id {
+                by_id.remove(&existing_id_for_name);
+            }
+        }
+        if let Some(existing_meta_for_id) = by_id.get(&metadata.id) {
+            if existing_meta_for_id.name != metadata.name {
+                by_name.remove(&existing_meta_for_id.name);
+            }
+        }
+
+        by_name.insert(metadata.name.clone(), metadata.id);
+        by_id.insert(metadata.id, metadata.clone());
+
+        info!(
+            target: "lance::topic",
+            topic_id = metadata.id,
+            topic_name = %metadata.name,
+            "Hydrated topic metadata from disk"
+        );
+
+        Some(metadata)
+    }
+
     pub fn topic_exists(&self, id: u32) -> bool {
         match self.topics_by_id.read() {
-            Ok(guard) => guard.contains_key(&id),
+            Ok(guard) => {
+                if guard.contains_key(&id) {
+                    true
+                } else {
+                    drop(guard);
+                    self.hydrate_topic_from_disk(id).is_some()
+                }
+            },
             Err(e) => {
                 tracing::error!(
                     target: "lance::topic",
@@ -650,6 +804,8 @@ pub struct TopicInfo {
     pub id: u32,
     pub name: String,
     pub created_at: u64,
+    #[serde(default = "default_topic_epoch")]
+    pub topic_epoch: u64,
 }
 
 impl From<&TopicMetadata> for TopicInfo {
@@ -658,6 +814,7 @@ impl From<&TopicMetadata> for TopicInfo {
             id: m.id,
             name: m.name.clone(),
             created_at: m.created_at,
+            topic_epoch: m.topic_epoch,
         }
     }
 }

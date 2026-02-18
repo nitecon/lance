@@ -10,7 +10,7 @@ use crate::auth::TokenValidator;
 use crate::consumer::{ConsumerRateLimiter, FetchRequest, FetchResponse, read_segment_zero_copy};
 use crate::shutdown::{begin_operation, end_operation, is_shutdown_requested};
 use crate::subscription::SubscriptionManager;
-use crate::topic::TopicRegistry;
+use crate::topic::{TopicIdentityError, TopicRegistry};
 use bytes::Bytes;
 use futures::future::try_join_all;
 use lnc_core::{BatchPool, LanceError, Result};
@@ -19,12 +19,16 @@ use lnc_replication::{
     AsyncQuorumManager, ClusterCoordinator, ForwardError, LeaderConnectionPool, QuorumResult,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 // 4 Golden Signals - sampled latency tracking (hot-path safe)
 use lnc_metrics::time_ingest_sampled;
 
 const INITIAL_BUFFER_SIZE: usize = 256 * 1024;
+const LEADER_DISCOVERY_RETRIES: usize = 3;
+const LEADER_DISCOVERY_BASE_BACKOFF_MS: u64 = 50;
+static CONNECTION_ROUTING_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Connection context holding shared state for frame processing
 struct ConnectionContext<'a, S> {
@@ -42,6 +46,8 @@ struct ConnectionContext<'a, S> {
     quorum_manager: &'a Option<Arc<AsyncQuorumManager>>,
     /// This node's ID (for recording leader's own quorum ACK)
     node_id: u16,
+    /// Stable connection-scoped key for hot-topic actor sharding.
+    routing_key: u64,
 }
 
 /// Result of frame processing
@@ -91,6 +97,7 @@ where
 {
     let mut buffer = vec![0u8; INITIAL_BUFFER_SIZE];
     let mut read_offset = 0usize;
+    let connection_routing_key = CONNECTION_ROUTING_COUNTER.fetch_add(1, Ordering::Relaxed);
     // Track authentication state for this connection
     let mut authenticated = !token_validator.is_enabled();
 
@@ -130,6 +137,7 @@ where
             authenticated: &mut authenticated,
             quorum_manager: &quorum_manager,
             node_id,
+            routing_key: connection_routing_key,
         };
 
         read_offset = process_frames(ctx, &mut buffer, &mut read_offset, &mut ack_buffer).await?;
@@ -397,18 +405,70 @@ where
     let timestamp_ns = frame.header.ingest_header.timestamp_ns;
     let record_count = frame.record_count();
 
-    // Validate topic exists
-    if topic_id != 0 && !ctx.topic_registry.topic_exists(topic_id) {
-        warn!(target: "lance::server", topic_id, batch_id, "Ingest to unknown topic");
-        if send_error(ctx.stream, "Unknown topic").await.is_err() {
-            end_operation();
-            return FrameAction::Error(LanceError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "Failed to send error",
-            )));
+    // Validate topic identity. Epoch validation is optional in phase 1
+    // (`None`) but this call site is now prepared for stale-id rejection.
+    if topic_id != 0
+        && matches!(
+            ctx.topic_registry.validate_topic_identity(topic_id, None),
+            Err(TopicIdentityError::UnknownTopic)
+        )
+    {
+        if let Some(coord) = ctx.cluster.as_ref() {
+            // Best-effort self-heal: if this node has committed topic ops that
+            // were not yet reflected in local registry state, replay them now
+            // before surfacing Unknown topic to the client.
+            coord.reemit_committed_topic_ops().await;
+            if ctx.topic_registry.topic_exists(topic_id) {
+                debug!(
+                    target: "lance::server",
+                    topic_id,
+                    batch_id,
+                    "Recovered topic metadata via committed-op replay"
+                );
+            } else {
+                debug!(
+                    target: "lance::server",
+                    topic_id,
+                    batch_id,
+                    "Topic still missing after committed-op replay"
+                );
+            }
         }
-        end_operation();
-        return FrameAction::Continue;
+
+        if ctx.topic_registry.topic_exists(topic_id) {
+            // Metadata was recovered after best-effort replay/hydration.
+        } else {
+            // Re-check leadership/forwarding once more before returning Unknown topic.
+            // During startup/election churn, role can change between the initial
+            // pre-check and this local topic lookup.
+            if let Some(action) = try_forward_to_leader(ctx, buffer, consumed, read_offset).await {
+                end_operation();
+                return action;
+            }
+
+            let err_msg = if ctx.cluster.is_some() {
+                warn!(
+                    target: "lance::server",
+                    topic_id,
+                    batch_id,
+                    "Ingest topic metadata not yet converged; returning transient forward failure"
+                );
+                "FORWARD_FAILED: Unknown topic (metadata convergence)"
+            } else {
+                warn!(target: "lance::server", topic_id, batch_id, "Ingest to unknown topic");
+                "Unknown topic"
+            };
+
+            if send_error(ctx.stream, err_msg).await.is_err() {
+                end_operation();
+                return FrameAction::Error(LanceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Failed to send error",
+                )));
+            }
+            end_operation();
+            return FrameAction::Continue;
+        }
     }
 
     if let Some(ref payload) = frame.payload {
@@ -430,6 +490,7 @@ where
 
         let request = IngestionRequest {
             topic_id,
+            routing_key: ctx.routing_key,
             timestamp_ns,
             record_count,
             payload: payload.clone(),
@@ -475,7 +536,7 @@ where
     // Forward write commands and fetch reads through the leader for consistent
     // metadata visibility during leadership churn / follower catch-up windows.
     let should_forward_to_leader =
-        command_handlers::is_write_operation(command) || command == ControlCommand::Fetch;
+        command_handlers::is_topic_metadata_operation(command) || command == ControlCommand::Fetch;
     if should_forward_to_leader {
         if let Some(action) =
             try_forward_control_to_leader(ctx, buffer, consumed, read_offset).await
@@ -565,6 +626,23 @@ where
     FrameAction::Continue
 }
 
+async fn resolve_leader_addr_with_retry(
+    coord: &ClusterCoordinator,
+) -> Option<std::net::SocketAddr> {
+    for attempt in 0..LEADER_DISCOVERY_RETRIES {
+        if let Some(addr) = coord.leader_addr_authoritative().await {
+            return Some(addr);
+        }
+
+        if attempt + 1 < LEADER_DISCOVERY_RETRIES {
+            let backoff_ms = LEADER_DISCOVERY_BASE_BACKOFF_MS * (attempt as u64 + 1);
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+        }
+    }
+
+    None
+}
+
 /// Try to forward write to leader, returns Some(FrameAction) if handled
 async fn try_forward_to_leader<S>(
     ctx: &mut ConnectionContext<'_, S>,
@@ -580,6 +658,12 @@ where
         return None;
     }
 
+    if coord.is_leader() {
+        // Data-plane ingest is allowed on elected leader while readiness warms up.
+        // Metadata operations remain gated separately via authoritative checks.
+        return None;
+    }
+
     if let Some(pool) = ctx.leader_pool {
         match pool.forward_write(&buffer[..consumed]).await {
             Ok(response) => {
@@ -589,7 +673,7 @@ where
                 }
             },
             Err(ForwardError::LeaderUnknown) => {
-                if let Some(leader_addr) = coord.leader_addr_authoritative().await {
+                if let Some(leader_addr) = resolve_leader_addr_with_retry(coord).await {
                     pool.on_leader_change(Some(leader_addr)).await;
                     match pool.forward_write(&buffer[..consumed]).await {
                         Ok(response) => {
@@ -648,6 +732,21 @@ where
         return None;
     }
 
+    if coord.is_leader() {
+        lnc_metrics::increment_cluster_elected_not_ready_rejects();
+        warn!(
+            target: "lance::server",
+            "Leader elected but not ready; rejecting control command with retryable forward failure"
+        );
+        let _ = send_error(
+            ctx.stream,
+            "FORWARD_FAILED: Leader not ready (apply/metadata catch-up)",
+        )
+        .await;
+        buffer.copy_within(consumed..read_offset, 0);
+        return Some(FrameAction::Forwarded);
+    }
+
     if let Some(pool) = ctx.leader_pool {
         match pool.forward_write(&buffer[..consumed]).await {
             Ok(response) => {
@@ -657,7 +756,7 @@ where
                 }
             },
             Err(ForwardError::LeaderUnknown) => {
-                if let Some(leader_addr) = coord.leader_addr_authoritative().await {
+                if let Some(leader_addr) = resolve_leader_addr_with_retry(coord).await {
                     pool.on_leader_change(Some(leader_addr)).await;
                     match pool.forward_write(&buffer[..consumed]).await {
                         Ok(response) => {
@@ -727,10 +826,20 @@ async fn handle_control_command<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    // Check if this is a write operation that requires leader
-    if command_handlers::is_write_operation(command) {
+    // Topic metadata commands are leader-authoritative to avoid stale
+    // follower registry responses during startup/election churn.
+    if command_handlers::is_topic_metadata_operation(command) {
         if let Some(coord) = cluster {
             if !coord.is_leader_authoritative().await {
+                if coord.is_leader() {
+                    lnc_metrics::increment_cluster_elected_not_ready_rejects();
+                    return send_error(
+                        stream,
+                        "FORWARD_FAILED: Leader not ready (apply/metadata catch-up)",
+                    )
+                    .await;
+                }
+
                 return send_not_leader_error(stream, coord.leader_addr().map(|a| a.to_string()))
                     .await;
             }

@@ -44,6 +44,15 @@
 - [Replication Transport Concurrency (PeerManager)](#replication-transport-concurrency-peermanager)
 - [Ingest ACK Semantics (Local Durability vs Quorum)](#ingest-ack-semantics-local-durability-vs-quorum)
 - [Ingest ACK Semantics (Local Durability vs Quorum)](#ingest-ack-semantics-local-durability-vs-quorum)
+- [Ingestion Flush Two-Phase Signaling](#ingestion-flush-two-phase-signaling)
+- [Topic Metadata Convergence During Leader Churn](#topic-metadata-convergence-during-leader-churn)
+- [M3 Single-Topic Hotspot Mitigation (Connection-Scoped Routing)](#m3-single-topic-hotspot-mitigation-connection-scoped-routing)
+- [Topic Create Convergence for Existing Local Names (Cluster Mode)](#topic-create-convergence-for-existing-local-names-cluster-mode)
+- [Higher-Term Response Demotion and Heartbeat Response Draining](#higher-term-response-demotion-and-heartbeat-response-draining)
+- [Integrity Model Shift: Topic Identity Epoch (Planned/Active)](#integrity-model-shift-topic-identity-epoch-plannedactive)
+- [Topic Identity Epoch Phase 1 Implementation Status](#topic-identity-epoch-phase-1-implementation-status)
+- [Leader Readiness Gate (Elected vs Authoritative)](#leader-readiness-gate-elected-vs-authoritative)
+- [Client-Owned Topic Convergence for Validation Tools](#client-owned-topic-convergence-for-validation-tools)
 
 ---
 
@@ -5654,6 +5663,154 @@ Rationale:
 Trade-off:
 - ACK now means "durable on leader" rather than "quorum-committed".
 - Operators should monitor quorum failure metrics and logs as first-class SLO signals for replication health.
+## Ingestion Flush Two-Phase Signaling
+
+In the multi-actor ingestion path, post-fsync handling is now explicitly two-phase:
+
+1. **Phase 1 (Latency release):** all `write_done_tx` waiters are signaled immediately after WAL sync + segment fsync complete.
+2. **Phase 2 (Replication enqueue):** replication requests are enqueued after waiter release.
+
+Replication enqueue uses `try_send` fast-path with `blocking_send` fallback when channel capacity is exhausted.
+
+This preserves replication delivery semantics while removing replication-channel backpressure from the client ACK critical path. Client ACK latency now tracks local durability, not replication queue occupancy.
+## Topic Metadata Convergence During Leader Churn
+
+To reduce `Unknown topic` / `Topic not found` windows during elections and transient quorum instability, the server now applies two convergence-safe behaviors:
+
+1. **Create rollback self-heal**
+   - In clustered mode, when `replicate_topic_op_sync(Create)` returns an error, the local optimistic topic create is still rolled back.
+   - Immediately after rollback, the node replays committed topic operations from the Raft log (`reemit_committed_topic_ops`) to repair false-negative rollback cases where the create committed during leadership churn but quorum observation raced.
+   - This preserves leader-authoritative semantics while restoring deterministic local metadata convergence.
+
+2. **Fetch-side transient handling in clustered mode**
+   - If a fetch request targets a topic whose metadata is temporarily missing on a node in cluster mode, the server returns `CATCHING_UP` instead of hard `Topic not found`.
+   - This aligns fetch behavior with replication convergence semantics and avoids escalating short-lived metadata lag into terminal client errors.
+
+These changes are consistency-first and do not alter standalone mode behavior.
+## M3 Single-Topic Hotspot Mitigation (Connection-Scoped Routing)
+
+### Summary
+To reduce single-topic ingest concentration on one ingestion actor, actor routing now uses a mixed key:
+
+- `topic_id`
+- a stable **connection-scoped routing key**
+
+This preserves per-connection ordering while allowing many concurrent producers on the same topic to spread across actors.
+
+### Routing Rule
+`actor_id = hash(topic_id, routing_key) % actor_count`
+
+The routing key is assigned once per connection and attached to each `IngestionRequest`.
+
+### Replication/Follower Handling
+Because hot-topic sharding can produce multiple active segment streams per topic, follower enriched replication writer caches are keyed by:
+
+- `(topic_id, segment_name)`
+
+instead of only `topic_id`. This prevents writer-state collisions when applying leader-dictated segment streams.
+
+### Operational Note
+This change improves ingest parallelism under single-topic load, but consistency/visibility under election churn is still governed by Raft commit/apply convergence and topic-metadata replay logic. Stability validation remains required with repeated benchmark + chaos cycles.
+## Topic Create Convergence for Existing Local Names (Cluster Mode)
+
+### Problem
+Under election churn, a node can retain stale local topic-name mappings that are not fully converged through committed Raft topic operations. A naive local duplicate check (`topic already exists`) can then return unusable metadata to clients, causing later `Unknown topic` errors on ingest/fetch after leader changes.
+
+### Change
+For clustered `CreateTopic` and `CreateTopicWithRetention`:
+
+- if the topic name already exists locally, the server now attempts **replicated idempotent convergence** using `TopicOperation::Create` with the existing `(topic_id, name, created_at)` instead of returning a fast local duplicate error;
+- success path materializes/reconciles local metadata with `create_topic_with_id`; retention is re-applied where relevant.
+
+### Intent
+This converts local duplicate detection into a convergence operation so topic creation semantics remain cluster-authoritative and reduces stale-name-induced integrity failures (`Unknown topic` after apparent successful setup).
+## Higher-Term Response Demotion and Heartbeat Response Draining
+
+### Problem
+The leader heartbeat path previously fire-and-forgot `AppendEntries` RPCs and did not react to follower responses carrying a higher term. That can prolong stale leadership windows during churn and amplify metadata inconsistency symptoms (including `Unknown topic` bursts).
+
+### Change
+- Heartbeat RPCs are now drained in-process (JoinSet) rather than detached fire-and-forget tasks.
+- Any observed higher-term `AppendEntriesResponse` now triggers immediate Raft demotion (`observe_remote_term`) and emits `LostLeadership`.
+- The same higher-term guard is applied in synchronous topic-op and enriched data replication response loops to fail fast on stale leaders.
+
+### Safety/Intent
+This aligns response handling with Raft term monotonicity expectations: once a higher term is observed, the sender must stop acting as leader immediately. The expected effect is reduced stale-leader write windows and tighter control-plane convergence under chaos churn.
+## Integrity Model Shift: Topic Identity Epoch (Planned/Active)
+
+### Decision
+Given persistent chaos-time `Unknown topic` storms after leader demotion and metadata replay hardening, we are beginning a model-level change: **topic identity epoching**.
+
+### Goal
+Introduce an epoch/generation for topic identity so stale topic-id usage can be deterministically detected and rejected, forcing metadata refresh instead of ambiguous `Unknown topic` failure loops.
+
+### Phase 1 Scope (starting now)
+- Track epoch in server-side topic metadata.
+- Surface epoch in topic metadata responses.
+- Prepare stale-id rejection hooks in ingest/read command paths.
+
+### Expected Follow-up
+Phase 2 will wire epoch into client/server request validation paths so stale producer/consumer handles can self-heal via topic refresh under election churn.
+## Topic Identity Epoch Phase 1 Implementation Status
+
+### Current wiring
+- `TopicRegistry` now exposes `validate_topic_identity(topic_id, expected_epoch)` with typed outcomes:
+  - `UnknownTopic`
+  - `StaleEpoch { expected, actual }`
+- In **ingest** command handling, topic existence checks are routed through `validate_topic_identity(..., None)`.
+- In **fetch/read** command handling, topic existence checks are routed through `validate_topic_identity(..., None)`.
+
+### Why this matters
+This completes the Phase-1 "hook preparation" requirement without changing wire compatibility yet:
+- server metadata still carries `topic_epoch`
+- topic responses still surface `topic_epoch`
+- request-path call sites are now ready for Phase-2 strict stale-epoch rejection once epoch is carried in request metadata.
+
+### Behavior impact (phase 1)
+- No protocol break.
+- No mandatory client changes.
+- Existing unknown-topic convergence behavior remains unchanged (`CATCHING_UP`/retryable forwarding semantics in cluster mode).
+## Leader Readiness Gate (Elected vs Authoritative)
+
+### Problem
+Raft election victory alone (`state == Leader`) does not guarantee this node has applied all committed entries into the local state machine yet. During this warm-up window, serving authoritative metadata/write paths can surface transient `Unknown topic` gaps.
+
+### Change
+A readiness gate now separates:
+- **Elected leader** (`RaftState::Leader`)
+- **Authoritative leader** (`Leader && last_applied >= commit_index`)
+
+Implementation highlights:
+- `ClusterCoordinator::is_leader_authoritative()` now requires both elected-leader status and readiness.
+- Readiness is recomputed from commit/apply convergence in the coordination loop and commit-notify path.
+- On election win, node starts as **not ready**, replicates No-Op, and transitions to ready only after apply lag reaches zero.
+- Write/control request paths return retryable `FORWARD_FAILED: Leader not ready (apply/metadata catch-up)` while elected-but-not-ready.
+
+### Metrics added
+- `lance_cluster_leader_ready` (gauge)
+- `lance_cluster_leader_ready_transition_ms` (gauge)
+- `lance_cluster_elected_not_ready_rejects_total` (counter)
+- `lance_cluster_apply_lag_entries` (gauge)
+- `lance_cluster_apply_lag_at_election` (gauge)
+
+### Intent
+This prevents newly elected leaders from becoming authoritative before their local state machine is converged, reducing churn-time metadata gaps and `Unknown topic` bursts without changing Raft vote wire semantics.
+## Client-Owned Topic Convergence for Validation Tools
+
+Bench/chaos topic setup now relies on `lnc-client` convergence behavior rather than embedding create/list retry loops in application code.
+
+### Client API
+- `LanceClient::ensure_topic(name, max_attempts, base_backoff_ms)`
+- `LanceClient::ensure_topic_default(name)`
+
+Behavior:
+1. Attempt `create_topic`.
+2. Fallback to `list_topics` lookup by name.
+3. Apply attempt-based backoff.
+4. Reconnect between attempts to improve leader convergence across elections/readiness transitions.
+
+### Intent
+Keep benchmark/chaos apps intentionally thin/dumb while centralizing transient control-plane handling (leader churn, forwarding, readiness windows) inside the client library.
 ---
 
 [↑ Back to Top](#technical-design-project-lance) | [← Back to Docs Index](./README.md)

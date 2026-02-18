@@ -348,38 +348,14 @@ async fn setup_topic(endpoint: &str, topic_name: &str) -> Result<u32, String> {
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
 
-    // Try to create topic (returns existing info if already exists)
-    match client.create_topic(topic_name).await {
-        Ok(info) => {
-            info!(topic_id = info.id, name = %info.name, "Topic ready");
-            let _ = client.close().await;
-            return Ok(info.id);
-        },
-        Err(e) => {
-            warn!("create_topic returned error (may already exist): {e}");
-        },
-    }
+    let topic = client
+        .ensure_topic_default(topic_name)
+        .await
+        .map_err(|e| format!("ensure_topic failed: {e}"))?;
 
-    // Fallback: list topics and find by name
-    match client.list_topics().await {
-        Ok(topics) => {
-            let _ = client.close().await;
-            for t in &topics {
-                if t.name == topic_name {
-                    info!(topic_id = t.id, name = %t.name, "Found existing topic");
-                    return Ok(t.id);
-                }
-            }
-            Err(format!(
-                "topic '{}' not found after create attempt",
-                topic_name
-            ))
-        },
-        Err(e) => {
-            let _ = client.close().await;
-            Err(format!("list_topics failed: {e}"))
-        },
-    }
+    info!(topic_id = topic.id, name = %topic.name, "Topic ready");
+    let _ = client.close().await;
+    Ok(topic.id)
 }
 
 /// Generate a deterministic payload of the given size

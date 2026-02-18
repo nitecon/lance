@@ -119,6 +119,11 @@ pub static CLUSTER_NODE_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static CLUSTER_HEALTHY_NODES: AtomicU64 = AtomicU64::new(0);
 pub static CLUSTER_IS_LEADER: AtomicU64 = AtomicU64::new(0);
 pub static CLUSTER_QUORUM_AVAILABLE: AtomicU64 = AtomicU64::new(0);
+pub static CLUSTER_LEADER_READY: AtomicU64 = AtomicU64::new(0);
+pub static CLUSTER_LEADER_READY_TRANSITION_MS: AtomicU64 = AtomicU64::new(0);
+pub static CLUSTER_ELECTED_NOT_READY_REJECTS: AtomicU64 = AtomicU64::new(0);
+pub static CLUSTER_APPLY_LAG_ENTRIES: AtomicU64 = AtomicU64::new(0);
+pub static CLUSTER_APPLY_LAG_AT_ELECTION: AtomicU64 = AtomicU64::new(0);
 
 // Replication lag metrics (bytes behind leader, time since last sync)
 pub static REPLICATION_LAG_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -335,6 +340,36 @@ pub fn set_cluster_quorum_available(available: bool) {
     CLUSTER_QUORUM_AVAILABLE.store(if available { 1 } else { 0 }, Ordering::Relaxed);
 }
 
+/// Set whether this node is leader-ready (1 = yes, 0 = no).
+#[inline]
+pub fn set_cluster_leader_ready(ready: bool) {
+    CLUSTER_LEADER_READY.store(if ready { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// Set elapsed milliseconds from election win to ready-authoritative transition.
+#[inline]
+pub fn set_cluster_leader_ready_transition_ms(ms: u64) {
+    CLUSTER_LEADER_READY_TRANSITION_MS.store(ms, Ordering::Relaxed);
+}
+
+/// Increment counter for requests rejected while leader was elected but not ready.
+#[inline]
+pub fn increment_cluster_elected_not_ready_rejects() {
+    CLUSTER_ELECTED_NOT_READY_REJECTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Set current commit/apply lag (entries).
+#[inline]
+pub fn set_cluster_apply_lag_entries(entries: u64) {
+    CLUSTER_APPLY_LAG_ENTRIES.store(entries, Ordering::Relaxed);
+}
+
+/// Set apply lag captured at/after election while readiness is pending.
+#[inline]
+pub fn set_cluster_apply_lag_at_election(entries: u64) {
+    CLUSTER_APPLY_LAG_AT_ELECTION.store(entries, Ordering::Relaxed);
+}
+
 // Replication lag metric functions
 
 /// Set the replication lag in bytes (how far behind the leader).
@@ -438,6 +473,11 @@ pub struct MetricsSnapshot {
     pub cluster_healthy_nodes: u64,
     pub cluster_is_leader: u64,
     pub cluster_quorum_available: u64,
+    pub cluster_leader_ready: u64,
+    pub cluster_leader_ready_transition_ms: u64,
+    pub cluster_elected_not_ready_rejects: u64,
+    pub cluster_apply_lag_entries: u64,
+    pub cluster_apply_lag_at_election: u64,
     // Replication lag metrics
     pub replication_lag_bytes: u64,
     pub replication_last_sync_ms: u64,
@@ -492,6 +532,13 @@ impl MetricsSnapshot {
             cluster_healthy_nodes: CLUSTER_HEALTHY_NODES.load(Ordering::Relaxed),
             cluster_is_leader: CLUSTER_IS_LEADER.load(Ordering::Relaxed),
             cluster_quorum_available: CLUSTER_QUORUM_AVAILABLE.load(Ordering::Relaxed),
+            cluster_leader_ready: CLUSTER_LEADER_READY.load(Ordering::Relaxed),
+            cluster_leader_ready_transition_ms: CLUSTER_LEADER_READY_TRANSITION_MS
+                .load(Ordering::Relaxed),
+            cluster_elected_not_ready_rejects: CLUSTER_ELECTED_NOT_READY_REJECTS
+                .load(Ordering::Relaxed),
+            cluster_apply_lag_entries: CLUSTER_APPLY_LAG_ENTRIES.load(Ordering::Relaxed),
+            cluster_apply_lag_at_election: CLUSTER_APPLY_LAG_AT_ELECTION.load(Ordering::Relaxed),
             // Replication lag metrics
             replication_lag_bytes: REPLICATION_LAG_BYTES.load(Ordering::Relaxed),
             replication_last_sync_ms: REPLICATION_LAST_SYNC_MS.load(Ordering::Relaxed),
@@ -619,6 +666,26 @@ pub fn init_prometheus_exporter(
     metrics::describe_gauge!(
         "lance_cluster_quorum_available",
         "Whether quorum is available (1=yes, 0=no)"
+    );
+    metrics::describe_gauge!(
+        "lance_cluster_leader_ready",
+        "Whether this node is elected leader and apply-caught-up (1=yes, 0=no)"
+    );
+    metrics::describe_gauge!(
+        "lance_cluster_leader_ready_transition_ms",
+        "Milliseconds from election win to leader-ready transition"
+    );
+    metrics::describe_counter!(
+        "lance_cluster_elected_not_ready_rejects_total",
+        "Requests rejected while node was leader but not yet ready"
+    );
+    metrics::describe_gauge!(
+        "lance_cluster_apply_lag_entries",
+        "Current commit_index - last_applied lag in entries"
+    );
+    metrics::describe_gauge!(
+        "lance_cluster_apply_lag_at_election",
+        "Apply lag sampled during leader readiness warm-up"
     );
 
     // Replication lag metrics
@@ -754,6 +821,15 @@ pub fn export_to_prometheus() {
     metrics::gauge!("lance_cluster_healthy_nodes").set(snapshot.cluster_healthy_nodes as f64);
     metrics::gauge!("lance_cluster_is_leader").set(snapshot.cluster_is_leader as f64);
     metrics::gauge!("lance_cluster_quorum_available").set(snapshot.cluster_quorum_available as f64);
+    metrics::gauge!("lance_cluster_leader_ready").set(snapshot.cluster_leader_ready as f64);
+    metrics::gauge!("lance_cluster_leader_ready_transition_ms")
+        .set(snapshot.cluster_leader_ready_transition_ms as f64);
+    metrics::counter!("lance_cluster_elected_not_ready_rejects_total")
+        .absolute(snapshot.cluster_elected_not_ready_rejects);
+    metrics::gauge!("lance_cluster_apply_lag_entries")
+        .set(snapshot.cluster_apply_lag_entries as f64);
+    metrics::gauge!("lance_cluster_apply_lag_at_election")
+        .set(snapshot.cluster_apply_lag_at_election as f64);
 
     // Replication lag metrics
     metrics::gauge!("lance_replication_lag_bytes").set(snapshot.replication_lag_bytes as f64);

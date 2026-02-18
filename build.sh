@@ -67,6 +67,14 @@ fi
 echo ""
 
 # ── Step 5: Dependency Audit ─────────────────────
+# Build benchmark and chaos binaries used by ./test.sh so test runs
+# always execute the current source, not stale previous artifacts.
+echo "▶ [5/6] Building release benchmark + chaos binaries..."
+cargo build --release -p lnc-bench -p lnc-chaos
+echo "✅ Release benchmark/chaos binaries built"
+echo ""
+
+# ── Step 5b: Dependency Audit ─────────────────────
 echo "▶ [5/6] Running cargo deny..."
 if command -v cargo-deny &> /dev/null; then
     cargo deny check

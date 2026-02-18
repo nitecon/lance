@@ -216,6 +216,17 @@ impl RaftNode {
         self.current_term
     }
 
+    /// Observe a remote term discovered via RPC response handling.
+    ///
+    /// Returns `true` when this node had to step down to follower.
+    pub fn observe_remote_term(&mut self, remote_term: u64) -> bool {
+        if remote_term > self.current_term {
+            self.become_follower(remote_term);
+            return true;
+        }
+        false
+    }
+
     /// Get the current leader ID (if known).
     #[inline]
     #[must_use]
@@ -535,6 +546,22 @@ impl RaftNode {
             self.state = RaftState::Follower;
         }
 
+        // Enforce Raft log matching property (best-effort with in-memory index/term state):
+        // reject appends whose declared prev_log does not align with our local log tail.
+        // This prevents stale leaders from rolling followers backward via blind success.
+        if req.prev_log_index == self.last_log_index
+            && req.prev_log_index > 0
+            && req.prev_log_term != self.last_log_term
+        {
+            return AppendEntriesResponse {
+                term: self.current_term,
+                success: false,
+                match_index: self.last_log_index,
+                follower_hlc: self.hlc.now(),
+                follower_id: self.node_id,
+            };
+        }
+
         // Advance log index based on the actual entries received.
         // CRITICAL FIX: We must update last_log_index for ALL entry types (NoOp, TopicOp,
         // ConfigChange, Data), not just Data. The previous filter caused followers to ignore
@@ -542,9 +569,8 @@ impl RaftNode {
         // permanently stuck at 1. This caused the leader to believe followers were behind,
         // triggering infinite retries and memory leaks in AsyncQuorumManager.
         //
-        // The LogStore has already persisted these entries, so the in-memory state must
-        // reflect reality. Elections (§5.4.1) require accurate log indices to pick the
-        // follower with the most up-to-date log.
+        // Elections (§5.4.1) require accurate log indices to pick the follower
+        // with the most up-to-date log.
         if let Some(last_entry) = req.entries.last() {
             self.last_log_index = last_entry.index;
             self.last_log_term = last_entry.term;
@@ -1062,6 +1088,23 @@ mod tests {
         assert_eq!(node.state, RaftState::Follower);
         assert_eq!(node.current_term, 2);
         assert!(node.fencing_token.is_none()); // Fencing token revoked
+    }
+
+    #[test]
+    fn test_observe_remote_term_steps_down_leader() {
+        let config = test_config();
+        let mut node = RaftNode::new(1, config, RaftConfig::default());
+
+        node.current_term = 3;
+        node.state = RaftState::Leader;
+        node.fencing_token = Some(FencingToken::new(3, 1));
+
+        let stepped_down = node.observe_remote_term(4);
+
+        assert!(stepped_down);
+        assert_eq!(node.state, RaftState::Follower);
+        assert_eq!(node.current_term, 4);
+        assert!(node.fencing_token.is_none());
     }
 
     #[test]

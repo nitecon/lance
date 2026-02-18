@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, info, warn};
 
 /// Unified ingestion sender that works with both single-actor (flume) and multi-actor modes
@@ -161,7 +162,9 @@ impl MultiActorSender {
     /// This is async and yields to the Tokio runtime when the channel is full,
     /// providing true backpressure without busy-spinning.
     pub async fn send(&self, request: IngestionRequest) -> Result<()> {
-        let actor_id = (request.topic_id as usize) % self.actor_count;
+        let mixed =
+            (request.topic_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ request.routing_key;
+        let actor_id = (mixed as usize) % self.actor_count;
 
         // send_async yields to the Tokio runtime if the channel is full.
         // No more busy-spinning!
@@ -456,15 +459,18 @@ fn flush_and_signal_sync(
     }
     dirty_topics.clear();
 
-    for s in pending_signals.drain(..) {
-        if let Some(tx) = s.write_done_tx {
+    // Phase 1: release all client waiters now that data is durable locally.
+    // This keeps ACK latency independent from replication channel backpressure.
+    for s in pending_signals.iter_mut() {
+        if let Some(tx) = s.write_done_tx.take() {
             let _ = tx.send(());
         }
+    }
 
+    // Phase 2: enqueue replication work after client waiters are released.
+    for s in pending_signals.drain(..) {
         if let Some(tx) = replication_tx {
-            // Block thread until space available in replication channel
-            // This prevents silent drops that cause quorum timeouts
-            if let Err(_e) = tx.blocking_send(DataReplicationRequest {
+            let repl_req = DataReplicationRequest {
                 topic_id: s.topic_id,
                 payload: s.payload,
                 segment_name: s.meta.segment_name,
@@ -473,8 +479,20 @@ fn flush_and_signal_sync(
                 is_new_segment: s.meta.is_new_segment,
                 rotated_after: s.meta.rotated_after,
                 write_id: s.write_id,
-            }) {
-                tracing::error!(target: "lance::ingestion", "Replication channel closed");
+            };
+
+            // Fast path: avoid blocking/context switch if channel has capacity.
+            // Fallback: block to preserve replication request delivery semantics.
+            match tx.try_send(repl_req) {
+                Ok(()) => {},
+                Err(TrySendError::Full(repl_req)) => {
+                    if let Err(_e) = tx.blocking_send(repl_req) {
+                        tracing::error!(target: "lance::ingestion", "Replication channel closed");
+                    }
+                },
+                Err(TrySendError::Closed(_)) => {
+                    tracing::error!(target: "lance::ingestion", "Replication channel closed");
+                },
             }
         }
     }
@@ -557,15 +575,19 @@ mod tests {
             actor_count: 4,
         };
 
-        // Verify partition key calculation: topic_id % actor_count
-        assert_eq!(0 % 4, 0);
-        assert_eq!(1 % 4, 1);
-        assert_eq!(2 % 4, 2);
-        assert_eq!(3 % 4, 3);
-        assert_eq!(4 % 4, 0);
-        assert_eq!(5 % 4, 1);
-
         // Verify sender has correct actor count
         assert_eq!(sender.actor_count, 4);
+
+        // Hot-topic sharding: same topic can map to different actors
+        // for different routing keys.
+        let topic_id = 42u32;
+        let mut seen = std::collections::HashSet::new();
+        for routing_key in [1u64, 7, 13, 21, 34, 55, 89, 144] {
+            let actor = (((topic_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ routing_key)
+                as usize)
+                % 4;
+            seen.insert(actor);
+        }
+        assert!(seen.len() > 1);
     }
 }

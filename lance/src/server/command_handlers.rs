@@ -11,7 +11,7 @@
 
 use crate::consumer::{ConsumerRateLimiter, FetchRequest, FetchResponse};
 use crate::subscription::SubscriptionManager;
-use crate::topic::{RetentionConfig, TopicListResponse, TopicRegistry};
+use crate::topic::{RetentionConfig, TopicIdentityError, TopicListResponse, TopicRegistry};
 use bytes::Bytes;
 use lnc_network::{ControlCommand, Frame};
 use lnc_replication::{ClusterCoordinator, TopicOperation};
@@ -116,7 +116,22 @@ impl<'a> ControlCommandDispatcher<'a> {
 
     /// Execute fetch request against topic registry
     fn handle_fetch_request(&self, req: &FetchRequest) -> Frame {
-        if self.ctx.topic_registry.get_topic(req.topic_id).is_none() {
+        if matches!(
+            self.ctx
+                .topic_registry
+                .validate_topic_identity(req.topic_id, None),
+            Err(TopicIdentityError::UnknownTopic)
+        ) {
+            if self.ctx.cluster.is_some() {
+                debug!(
+                    target: "lance::server",
+                    topic_id = req.topic_id,
+                    requested_offset = req.start_offset,
+                    "Fetch topic metadata missing on this node; returning CATCHING_UP"
+                );
+                return Frame::new_catching_up(0);
+            }
+
             return Frame::new_error_response(&format!("Topic {} not found", req.topic_id));
         }
 
@@ -154,11 +169,14 @@ impl<'a> ControlCommandDispatcher<'a> {
     }
 }
 
-/// Check if a command is a write operation requiring leader
-pub fn is_write_operation(command: ControlCommand) -> bool {
+/// Check if a command is topic metadata operation requiring leader-authoritative handling.
+/// This includes read + write metadata commands to avoid stale follower views.
+pub fn is_topic_metadata_operation(command: ControlCommand) -> bool {
     matches!(
         command,
         ControlCommand::CreateTopic
+            | ControlCommand::ListTopics
+            | ControlCommand::GetTopic
             | ControlCommand::DeleteTopic
             | ControlCommand::SetRetention
             | ControlCommand::CreateTopicWithRetention
@@ -175,39 +193,128 @@ pub async fn handle_create_topic(ctx: &CommandContext<'_>, payload: Option<&Byte
         return Frame::new_error_response("Topic name required");
     }
 
-    match ctx.topic_registry.create_topic(&topic_name) {
-        Ok(metadata) => {
-            // Replicate topic creation to followers (if in cluster mode)
-            if let Some(coord) = ctx.cluster {
-                let op = TopicOperation::Create {
-                    topic_id: metadata.id,
-                    name: metadata.name.clone(),
-                    created_at: metadata.created_at,
-                };
-                if let Err(e) = coord.replicate_topic_op_sync(op).await {
-                    warn!(
-                        target: "lance::server",
-                        topic_id = metadata.id,
-                        error = %e,
-                        "Failed to replicate topic creation - returning error to client"
-                    );
-                    // Delete the locally created topic since replication failed
-                    let _ = ctx.topic_registry.delete_topic(metadata.id);
-                    return Frame::new_error_response(&format!(
-                        "Failed to replicate topic creation: {}",
-                        e
-                    ));
-                }
+    if let Some(coord) = ctx.cluster {
+        // If a topic name already exists locally, converge it through replicated
+        // idempotent create instead of failing fast. This heals stale local-only
+        // mappings under churn and guarantees cluster-wide visibility.
+        if let Some(existing_id) = ctx.topic_registry.get_topic_id_by_name(&topic_name) {
+            let created_at = ctx
+                .topic_registry
+                .get_topic_by_id(existing_id)
+                .map(|m| m.created_at)
+                .unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                });
+
+            let op = TopicOperation::Create {
+                topic_id: existing_id,
+                name: topic_name.clone(),
+                created_at,
+            };
+
+            if let Err(e) = coord.replicate_topic_op_sync(op).await {
+                warn!(
+                    target: "lance::server",
+                    topic_id = existing_id,
+                    topic_name = %topic_name,
+                    error = %e,
+                    "Failed to converge existing topic creation"
+                );
+                coord.reemit_committed_topic_ops().await;
+                return Frame::new_error_response(&format!(
+                    "Failed to replicate existing topic convergence: {}",
+                    e
+                ));
             }
 
-            let response_data = serde_json::json!({
-                "id": metadata.id,
-                "name": metadata.name,
-                "created_at": metadata.created_at
-            });
-            Frame::new_topic_response(Bytes::from(response_data.to_string()))
-        },
-        Err(e) => Frame::new_error_response(&e.to_string()),
+            let _ = ctx
+                .topic_registry
+                .create_topic_with_id(existing_id, &topic_name, created_at);
+
+            if let Some(metadata) = ctx.topic_registry.get_topic_by_id(existing_id) {
+                let response_data = serde_json::json!({
+                    "id": metadata.id,
+                    "name": metadata.name,
+                    "created_at": metadata.created_at,
+                    "topic_epoch": metadata.topic_epoch
+                });
+                return Frame::new_topic_response(Bytes::from(response_data.to_string()));
+            }
+        }
+
+        // Cluster mode: replicate first, then materialize locally.
+        // This prevents transient visibility of uncommitted topic metadata.
+        let topic_id = ctx.topic_registry.reserve_topic_id();
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let op = TopicOperation::Create {
+            topic_id,
+            name: topic_name.clone(),
+            created_at,
+        };
+
+        if let Err(e) = coord.replicate_topic_op_sync(op).await {
+            warn!(
+                target: "lance::server",
+                topic_id,
+                error = %e,
+                "Failed to replicate topic creation - returning error to client"
+            );
+
+            // Leader churn can race with sync quorum observation. If this
+            // create actually committed after we returned an error, replay
+            // committed topic ops to restore local metadata deterministically.
+            coord.reemit_committed_topic_ops().await;
+
+            return Frame::new_error_response(&format!(
+                "Failed to replicate topic creation: {}",
+                e
+            ));
+        }
+
+        match ctx
+            .topic_registry
+            .create_topic_with_id(topic_id, &topic_name, created_at)
+        {
+            Ok(metadata) => {
+                let response_data = serde_json::json!({
+                    "id": metadata.id,
+                    "name": metadata.name,
+                    "created_at": metadata.created_at,
+                    "topic_epoch": metadata.topic_epoch
+                });
+                Frame::new_topic_response(Bytes::from(response_data.to_string()))
+            },
+            Err(e) => Frame::new_error_response(&e.to_string()),
+        }
+    } else {
+        // Standalone mode keeps local duplicate semantics.
+        if ctx
+            .topic_registry
+            .get_topic_id_by_name(&topic_name)
+            .is_some()
+        {
+            return Frame::new_error_response(&format!("Topic '{}' already exists", topic_name));
+        }
+
+        match ctx.topic_registry.create_topic(&topic_name) {
+            Ok(metadata) => {
+                let response_data = serde_json::json!({
+                    "id": metadata.id,
+                    "name": metadata.name,
+                    "created_at": metadata.created_at,
+                    "topic_epoch": metadata.topic_epoch
+                });
+                Frame::new_topic_response(Bytes::from(response_data.to_string()))
+            },
+            Err(e) => Frame::new_error_response(&e.to_string()),
+        }
     }
 }
 
@@ -230,7 +337,8 @@ pub fn handle_get_topic(ctx: &CommandContext<'_>, payload: Option<&Bytes>) -> Fr
             let response_data = serde_json::json!({
                 "id": metadata.id,
                 "name": metadata.name,
-                "created_at": metadata.created_at
+                "created_at": metadata.created_at,
+                "topic_epoch": metadata.topic_epoch
             });
             Frame::new_topic_response(Bytes::from(response_data.to_string()))
         },
@@ -493,44 +601,147 @@ pub async fn handle_create_topic_with_retention(
                 max_bytes: Some(max_bytes),
             });
 
-            match ctx
-                .topic_registry
-                .create_topic_with_retention(&topic_name, retention)
-            {
-                Ok(metadata) => {
-                    // Replicate to followers if in cluster mode
-                    if let Some(coord) = ctx.cluster {
-                        let op = TopicOperation::Create {
-                            topic_id: metadata.id,
-                            name: metadata.name.clone(),
-                            created_at: metadata.created_at,
-                        };
-                        if let Err(e) = coord.replicate_topic_op_sync(op).await {
-                            warn!(
-                                target: "lance::server",
-                                topic_id = metadata.id,
-                                error = %e,
-                                "Failed to replicate topic creation - returning error to client"
-                            );
-                            // Delete the locally created topic since replication failed
-                            let _ = ctx.topic_registry.delete_topic(metadata.id);
-                            return Frame::new_error_response(&format!(
-                                "Failed to replicate topic creation: {}",
-                                e
-                            ));
-                        }
+            if let Some(coord) = ctx.cluster {
+                if let Some(existing_id) = ctx.topic_registry.get_topic_id_by_name(&topic_name) {
+                    let created_at = ctx
+                        .topic_registry
+                        .get_topic_by_id(existing_id)
+                        .map(|m| m.created_at)
+                        .unwrap_or_else(|| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0)
+                        });
+
+                    let op = TopicOperation::Create {
+                        topic_id: existing_id,
+                        name: topic_name.clone(),
+                        created_at,
+                    };
+
+                    if let Err(e) = coord.replicate_topic_op_sync(op).await {
+                        warn!(
+                            target: "lance::server",
+                            topic_id = existing_id,
+                            topic_name = %topic_name,
+                            error = %e,
+                            "Failed to converge existing topic creation with retention"
+                        );
+                        coord.reemit_committed_topic_ops().await;
+                        return Frame::new_error_response(&format!(
+                            "Failed to replicate existing topic convergence: {}",
+                            e
+                        ));
                     }
 
-                    let response_data = serde_json::json!({
-                        "id": metadata.id,
-                        "name": metadata.name,
-                        "created_at": metadata.created_at,
-                        "max_age_secs": max_age_secs,
-                        "max_bytes": max_bytes
-                    });
-                    Frame::new_topic_response(Bytes::from(response_data.to_string()))
-                },
-                Err(e) => Frame::new_error_response(&e.to_string()),
+                    let _ = ctx.topic_registry.create_topic_with_id(
+                        existing_id,
+                        &topic_name,
+                        created_at,
+                    );
+                    let _ = ctx
+                        .topic_registry
+                        .set_retention(existing_id, max_age_secs, max_bytes);
+
+                    if let Some(metadata) = ctx.topic_registry.get_topic_by_id(existing_id) {
+                        let response_data = serde_json::json!({
+                            "id": metadata.id,
+                            "name": metadata.name,
+                            "created_at": metadata.created_at,
+                            "topic_epoch": metadata.topic_epoch,
+                            "max_age_secs": max_age_secs,
+                            "max_bytes": max_bytes
+                        });
+                        return Frame::new_topic_response(Bytes::from(response_data.to_string()));
+                    }
+                }
+
+                // Cluster mode: replicate first, then materialize locally.
+                // This prevents transient visibility of uncommitted topic metadata.
+                let topic_id = ctx.topic_registry.reserve_topic_id();
+                let created_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                let op = TopicOperation::Create {
+                    topic_id,
+                    name: topic_name.clone(),
+                    created_at,
+                };
+
+                if let Err(e) = coord.replicate_topic_op_sync(op).await {
+                    warn!(
+                        target: "lance::server",
+                        topic_id,
+                        error = %e,
+                        "Failed to replicate topic creation - returning error to client"
+                    );
+
+                    // Leader churn can race with sync quorum observation. If
+                    // the create committed despite this error path, replay
+                    // committed topic ops to reconcile local registry state.
+                    coord.reemit_committed_topic_ops().await;
+
+                    return Frame::new_error_response(&format!(
+                        "Failed to replicate topic creation: {}",
+                        e
+                    ));
+                }
+
+                match ctx
+                    .topic_registry
+                    .create_topic_with_id(topic_id, &topic_name, created_at)
+                {
+                    Ok(mut metadata) => {
+                        metadata.retention = retention.clone();
+                        let _ = ctx
+                            .topic_registry
+                            .set_retention(topic_id, max_age_secs, max_bytes);
+
+                        let response_data = serde_json::json!({
+                            "id": metadata.id,
+                            "name": metadata.name,
+                            "created_at": metadata.created_at,
+                            "topic_epoch": metadata.topic_epoch,
+                            "max_age_secs": max_age_secs,
+                            "max_bytes": max_bytes
+                        });
+                        Frame::new_topic_response(Bytes::from(response_data.to_string()))
+                    },
+                    Err(e) => Frame::new_error_response(&e.to_string()),
+                }
+            } else {
+                // Standalone mode keeps local duplicate semantics.
+                if ctx
+                    .topic_registry
+                    .get_topic_id_by_name(&topic_name)
+                    .is_some()
+                {
+                    return Frame::new_error_response(&format!(
+                        "Topic '{}' already exists",
+                        topic_name
+                    ));
+                }
+
+                match ctx
+                    .topic_registry
+                    .create_topic_with_retention(&topic_name, retention)
+                {
+                    Ok(metadata) => {
+                        let response_data = serde_json::json!({
+                            "id": metadata.id,
+                            "name": metadata.name,
+                            "created_at": metadata.created_at,
+                            "topic_epoch": metadata.topic_epoch,
+                            "max_age_secs": max_age_secs,
+                            "max_bytes": max_bytes
+                        });
+                        Frame::new_topic_response(Bytes::from(response_data.to_string()))
+                    },
+                    Err(e) => Frame::new_error_response(&e.to_string()),
+                }
             }
         },
         None => Frame::new_error_response("Invalid create topic payload"),
@@ -548,15 +759,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_write_operation() {
-        assert!(is_write_operation(ControlCommand::CreateTopic));
-        assert!(is_write_operation(ControlCommand::DeleteTopic));
-        assert!(is_write_operation(ControlCommand::SetRetention));
-        assert!(is_write_operation(ControlCommand::CreateTopicWithRetention));
-        assert!(!is_write_operation(ControlCommand::ListTopics));
-        assert!(!is_write_operation(ControlCommand::GetTopic));
-        assert!(!is_write_operation(ControlCommand::Fetch));
-        assert!(!is_write_operation(ControlCommand::Subscribe));
+    fn test_is_topic_metadata_operation() {
+        assert!(is_topic_metadata_operation(ControlCommand::CreateTopic));
+        assert!(is_topic_metadata_operation(ControlCommand::DeleteTopic));
+        assert!(is_topic_metadata_operation(ControlCommand::SetRetention));
+        assert!(is_topic_metadata_operation(
+            ControlCommand::CreateTopicWithRetention
+        ));
+        assert!(is_topic_metadata_operation(ControlCommand::ListTopics));
+        assert!(is_topic_metadata_operation(ControlCommand::GetTopic));
+        assert!(!is_topic_metadata_operation(ControlCommand::Fetch));
+        assert!(!is_topic_metadata_operation(ControlCommand::Subscribe));
     }
 
     #[test]

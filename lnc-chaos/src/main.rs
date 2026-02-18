@@ -30,13 +30,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::BytesMut;
 use clap::Parser;
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 use lnc_client::{
     ClientConfig, Consumer, ConsumerConfig, LanceClient, PollResult, Producer, ProducerConfig,
-    RecordIterator, RecordType, encode_record,
+    RecordIterator, RecordParseError, RecordType, encode_record,
 };
 
 /// LANCE Chaos Testing Tool — validates data integrity during rolling restarts
@@ -174,25 +175,35 @@ impl EndpointReport {
         roll_performed: bool,
         roll_result: Option<String>,
     ) -> Self {
+        let produced = stats.produced.load(Ordering::Relaxed);
+        let consumed = stats.consumed.load(Ordering::Relaxed);
         let gaps = stats.gaps.load(Ordering::Relaxed);
         let duplicates = stats.duplicates.load(Ordering::Relaxed);
         let out_of_order = stats.out_of_order.load(Ordering::Relaxed);
+        let parse_errors = stats.parse_errors.load(Ordering::Relaxed);
+        let producer_errors = stats.producer_errors.load(Ordering::Relaxed);
+        let consumer_errors = stats.consumer_errors.load(Ordering::Relaxed);
+        let no_data_loss = produced == consumed;
+        let data_flow_observed = produced > 0 && consumed > 0;
+        let structural_clean = gaps == 0 && duplicates == 0 && out_of_order == 0;
+        let io_clean = parse_errors == 0 && producer_errors == 0 && consumer_errors == 0;
+
         Self {
             label: label.to_string(),
             endpoint: endpoint.to_string(),
-            produced: stats.produced.load(Ordering::Relaxed),
-            consumed: stats.consumed.load(Ordering::Relaxed),
+            produced,
+            consumed,
             gaps,
             duplicates,
             out_of_order,
-            parse_errors: stats.parse_errors.load(Ordering::Relaxed),
-            producer_errors: stats.producer_errors.load(Ordering::Relaxed),
-            consumer_errors: stats.consumer_errors.load(Ordering::Relaxed),
+            parse_errors,
+            producer_errors,
+            consumer_errors,
             producer_reconnects: stats.producer_reconnects.load(Ordering::Relaxed),
             consumer_reconnects: stats.consumer_reconnects.load(Ordering::Relaxed),
             roll_performed,
             roll_result,
-            passed: gaps == 0 && duplicates == 0 && out_of_order == 0,
+            passed: structural_clean && io_clean && no_data_loss && data_flow_observed,
         }
     }
 }
@@ -253,41 +264,14 @@ async fn resolve_topic(endpoint: &str, topic_name: &str, clean: bool) -> Result<
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
-    // Try to create topic (will succeed if new, or return existing info)
-    match client.create_topic(topic_name).await {
-        Ok(info) => {
-            info!(topic_id = info.id, name = %info.name, "Topic ready");
-            let _ = client.close().await;
-            Ok(info.id)
-        },
-        Err(e) => {
-            // If topic already exists, the error message typically contains the ID
-            // Try listing topics to find it
-            warn!("create_topic returned error (may already exist): {}", e);
-            match client.list_topics().await {
-                Ok(topics) => {
-                    let _ = client.close().await;
-                    for t in &topics {
-                        if t.name == topic_name {
-                            info!(topic_id = t.id, name = %t.name, "Found existing topic");
-                            return Ok(t.id);
-                        }
-                    }
-                    Err(format!(
-                        "topic '{}' not found after create failed: {}",
-                        topic_name, e
-                    ))
-                },
-                Err(list_err) => {
-                    let _ = client.close().await;
-                    Err(format!(
-                        "create_topic failed: {}, list_topics failed: {}",
-                        e, list_err
-                    ))
-                },
-            }
-        },
-    }
+    let topic = client
+        .ensure_topic_default(topic_name)
+        .await
+        .map_err(|e| format!("ensure_topic failed: {e}"))?;
+
+    info!(topic_id = topic.id, name = %topic.name, "Topic ready");
+    let _ = client.close().await;
+    Ok(topic.id)
 }
 
 /// Producer task: connects once and sends messages in a loop.
@@ -339,8 +323,14 @@ async fn producer_task(
     let mut seq: u64 = 1;
     let mut ticker = tokio::time::interval(Duration::from_micros(interval_us));
 
-    // Signal consumer we're starting
-    ready.notify_one();
+    // Wait briefly for consumer baseline; don't stall the entire test window
+    // if startup tail-seek is slow under leader churn.
+    if tokio::time::timeout(Duration::from_secs(5), ready.notified())
+        .await
+        .is_err()
+    {
+        warn!("[{label}] Consumer readiness timeout; starting producer anyway");
+    }
 
     while stats.producer_running.load(Ordering::Relaxed) {
         ticker.tick().await;
@@ -377,13 +367,50 @@ async fn producer_task(
 }
 
 /// Process fetched records, verifying sequential ordering.
-fn process_records(result: &PollResult, expected_seq: &mut u64, stats: &Stats) {
-    for record_result in RecordIterator::new(result.data.clone()) {
+fn process_records(
+    result: &PollResult,
+    expected_seq: &mut u64,
+    stats: &Stats,
+    partial_tail: &mut BytesMut,
+) {
+    let mut merged = BytesMut::with_capacity(partial_tail.len() + result.data.len());
+    if !partial_tail.is_empty() {
+        merged.extend_from_slice(partial_tail);
+        partial_tail.clear();
+    }
+    merged.extend_from_slice(&result.data);
+
+    let data = merged.freeze();
+    let mut iter = RecordIterator::new(data.clone());
+
+    while let Some(record_result) = iter.next() {
         let record = match record_result {
             Ok(r) => r,
             Err(e) => {
-                stats.parse_errors.fetch_add(1, Ordering::Relaxed);
-                warn!("Record parse error (skipping rest of batch): {}", e);
+                match e {
+                    // Fetch payloads can end on non-record boundaries. Preserve
+                    // trailing bytes and continue on next poll instead of
+                    // flagging a parse error/data loss.
+                    RecordParseError::InsufficientHeader { .. }
+                    | RecordParseError::InsufficientPayload { .. } => {
+                        let tail_offset = iter.offset();
+                        if tail_offset < data.len() {
+                            partial_tail.extend_from_slice(&data[tail_offset..]);
+                        }
+                    },
+                    other => {
+                        let tail_offset = iter.offset();
+                        stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+                        warn!("Record parse error (skipping rest of batch): {}", other);
+
+                        // Attempt single-byte resync on malformed record headers
+                        // (e.g. corrupted/unaligned type+len) so we do not lose
+                        // the entire remaining payload window.
+                        if tail_offset + 1 < data.len() {
+                            partial_tail.extend_from_slice(&data[(tail_offset + 1)..]);
+                        }
+                    },
+                }
                 break;
             },
         };
@@ -437,11 +464,6 @@ async fn consumer_task(
     stats: Arc<Stats>,
     ready: Arc<Notify>,
 ) {
-    // Wait for producer to start
-    ready.notified().await;
-    // Small delay to let some messages accumulate
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     let config = ConsumerConfig::new(topic_id).with_max_fetch_bytes(max_fetch_bytes);
 
     // Connect — library retries internally on transient failures
@@ -459,13 +481,19 @@ async fn consumer_task(
         }
     };
 
-    // Seek past existing data so we only verify new messages
+    // Seek past existing data so we only verify new messages from this run.
+    // We tolerate transient startup errors and require a few consecutive idle
+    // polls before declaring ourselves at tail.
     info!("[{label}] Consumer seeking past existing data...");
+    let startup_deadline = Instant::now() + Duration::from_secs(20);
     let mut seek_fetches: u64 = 0;
-    loop {
+    let mut consecutive_idle: u8 = 0;
+
+    while Instant::now() < startup_deadline {
         match consumer.poll().await {
             Ok(Some(result)) if !result.end_of_stream => {
                 seek_fetches += 1;
+                consecutive_idle = 0;
                 if seek_fetches % 100 == 0 {
                     info!(
                         offset = consumer.current_offset(),
@@ -473,28 +501,51 @@ async fn consumer_task(
                     );
                 }
             },
-            _ => break,
+            Ok(Some(_)) | Ok(None) => {
+                consecutive_idle = consecutive_idle.saturating_add(1);
+                if consecutive_idle >= 3 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            },
+            Err(e) => {
+                warn!(error = %e, "[{label}] startup tail seek poll failed, retrying");
+                stats.consumer_reconnects.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            },
         }
     }
+
     if seek_fetches > 0 {
         info!(
             offset = consumer.current_offset(),
-            seek_fetches, "[{label}] Skipped existing data, starting verification from tail"
+            seek_fetches, "[{label}] Skipped existing data before verification"
         );
     }
+    if Instant::now() >= startup_deadline {
+        warn!(
+            offset = consumer.current_offset(),
+            "[{label}] startup tail seek deadline reached; continuing with current offset"
+        );
+    }
+
     info!(
         offset = consumer.current_offset(),
         "[{label}] Consumer ready, verifying new messages only"
     );
 
+    // Signal producer to start generating test data only after baseline is set.
+    ready.notify_one();
+
     // 0 = sentinel meaning "not yet initialized"; set from first parsed record
     let mut expected_seq: u64 = 0;
+    let mut partial_tail = BytesMut::new();
 
     while stats.running.load(Ordering::Relaxed) {
         // poll() auto-reconnects on transient errors
         match consumer.poll().await {
             Ok(Some(result)) => {
-                process_records(&result, &mut expected_seq, &stats);
+                process_records(&result, &mut expected_seq, &stats, &mut partial_tail);
             },
             Ok(None) => {
                 // No new data, poll again shortly

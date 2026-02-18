@@ -381,20 +381,21 @@ impl Consumer {
     /// Fetch with automatic retry on transient errors.
     /// Reconnects and retries from the same offset, preserving position.
     ///
-    /// On `ServerCatchingUp`, backs off for 5 seconds without marking the
-    /// connection as failed — the server is healthy, just behind on
-    /// replication. This lets the follower catch up before the next attempt.
+    /// On `ServerCatchingUp`, backs off for 5 seconds. If the server offset
+    /// remains stagnant across repeated attempts, the client forces a
+    /// reconnect so reads can re-route to a healthier/leader path while still
+    /// preserving the requested offset.
     ///
-    /// If the server offset does not advance after several attempts the data
-    /// is considered permanently lost (e.g. segment truncation after crash
-    /// recovery).  In that case the consumer resets its offset to the
-    /// server's position so it can resume reading new data.
+    /// If the server offset does not advance after several attempts we emit a
+    /// warning but preserve the client-requested offset. This keeps read
+    /// semantics monotonic and avoids implicit offset rewinds that can produce
+    /// duplicate replay.
     async fn fetch_with_retry(&mut self) -> Result<crate::client::FetchResult> {
         const MAX_RETRIES: u32 = 30;
         const CATCHING_UP_BACKOFF: Duration = Duration::from_secs(5);
-        /// After this many consecutive CATCHING_UP responses with an
-        /// unchanged server_offset we conclude the gap is permanent.
-        const STALE_RESET_THRESHOLD: u32 = 3;
+        /// Alert after this many consecutive CATCHING_UP responses with an
+        /// unchanged server_offset.
+        const STALE_ALERT_THRESHOLD: u32 = 3;
         let mut attempt = 0u32;
         let mut backoff = Duration::from_millis(500);
         const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -422,11 +423,7 @@ impl Consumer {
                 Err(ClientError::ServerCatchingUp { server_offset }) => {
                     attempt += 1;
 
-                    // Track whether the server is making progress.  If the
-                    // server_offset hasn't changed for STALE_RESET_THRESHOLD
-                    // consecutive attempts the data between server_offset and
-                    // our current_offset is permanently gone (crash-recovery
-                    // truncation).  Reset to the server's position to unblock.
+                    // Track whether the server is making progress.
                     if last_server_offset == Some(*server_offset) {
                         stale_count += 1;
                     } else {
@@ -434,20 +431,21 @@ impl Consumer {
                         last_server_offset = Some(*server_offset);
                     }
 
-                    if stale_count >= STALE_RESET_THRESHOLD {
+                    if stale_count == STALE_ALERT_THRESHOLD {
                         tracing::warn!(
                             topic_id = self.config.topic_id,
-                            old_offset = self.current_offset,
-                            new_offset = *server_offset,
-                            lost_bytes = self.current_offset.saturating_sub(*server_offset),
-                            "Data permanently unreachable — resetting consumer offset to server position"
+                            requested_offset = self.current_offset,
+                            server_offset,
+                            "Server offset stagnant while catching up; preserving consumer offset to avoid duplicate replay"
                         );
-                        self.current_offset = *server_offset;
-                        // Reset retry state so the next fetch starts clean
-                        stale_count = 0;
-                        last_server_offset = None;
-                        attempt = 0;
-                        continue;
+
+                        // Proactively reconnect after repeated stagnant catch-up
+                        // responses so we can re-resolve leader routing.
+                        self.client.mark_failed();
+
+                        // Surface to caller quickly instead of sleeping through
+                        // an extended catch-up loop on a stale route.
+                        return result;
                     }
 
                     if attempt >= MAX_RETRIES {
@@ -481,12 +479,13 @@ impl Consumer {
             return Ok(end);
         }
 
-        // Fetch from offset 0 to discover stream state
+        // Fetch from a very high offset so the server reports current end
+        // offset without returning partial record bytes from the beginning.
         let c = self.client.client().await?;
         let fetch_result = c
             .fetch(
                 self.config.topic_id,
-                0,
+                u64::MAX,
                 1, // Minimal fetch just to get stream info
             )
             .await?;

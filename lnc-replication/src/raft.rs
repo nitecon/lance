@@ -1,7 +1,35 @@
-//! Raft consensus protocol implementation with safety enhancements.
+//! Raft consensus protocol implementation with safety enhancements (CONTROL PLANE).
 //!
-//! This module implements the core Raft state machine with the following
-//! enhancements beyond the basic protocol:
+//! This module is part of the CONTROL PLANE, not the data plane.
+//! It implements the core Raft state machine for leader election, cluster
+//! membership, and metadata consensus. It does NOT handle actual data replication.
+//!
+//! # Architecture Note: Control Plane vs Data Plane
+//!
+//! LANCE separates control plane (Raft) from data plane (independent replication):
+//!
+//! - **Control Plane (this module)**: Uses Raft consensus for leader election,
+//!   cluster membership, and topic metadata. This is the "slow path" focused on
+//!   consistency. Raft log entries carry metadata only, NOT actual data payloads.
+//!
+//! - **Data Plane**: Uses independent replication for actual data writes.
+//!   Data plane replication is completely separate from Raft. The data plane
+//!   can function behind load balancers and does not block on Raft consensus.
+//!
+//! # Key Point
+//!
+//! Raft determines WHO is the leader, but data plane replication (not Raft)
+//! handles HOW data is replicated. Followers report their max offset to the
+//! control plane periodically (~50ms) so control plane knows which node has
+//! the latest data for failover decisions.
+//!
+//! For data plane implementation, see `lance/src/server/mod.rs` and
+//! `lnc-replication/src/quorum.rs`.
+//!
+//! See `docs/Architecture.md` section "Control Plane vs Data Plane Architecture"
+//! for detailed explanation.
+//!
+//! # Safety Enhancements
 //!
 //! - **Pre-Vote**: Prevents disruption from partitioned nodes rejoining
 //! - **Fencing tokens**: Revokes write authority from deposed leaders

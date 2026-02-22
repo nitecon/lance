@@ -336,6 +336,95 @@ pub async fn run(
             }
         });
 
+        // Start data plane listener for replication on port 1995
+        let data_plane_listen_addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+            1995,
+        );
+        let data_plane_topic_registry = Arc::clone(&topic_registry);
+        let data_plane_config = config.clone();
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(data_plane_listen_addr).await {
+                Ok(l) => {
+                    info!(
+                        target: "lance::data_plane",
+                        addr = %data_plane_listen_addr,
+                        "Data plane listener started"
+                    );
+                    l
+                },
+                Err(e) => {
+                    error!(
+                        target: "lance::data_plane",
+                        addr = %data_plane_listen_addr,
+                        error = %e,
+                        "Failed to bind data plane listener"
+                    );
+                    return;
+                },
+            };
+
+            loop {
+                match listener.accept().await {
+                    Ok((mut stream, addr)) => {
+                        let topic_registry = Arc::clone(&data_plane_topic_registry);
+                        let config = data_plane_config.clone();
+                        tokio::spawn(async move {
+                            let write_callback = |entry: &lnc_replication::DataReplicationEntry| -> std::result::Result<(), std::io::Error> {
+                                ingestion::write_replicated_data_enriched(
+                                    &config,
+                                    &topic_registry,
+                                    &mut std::collections::HashMap::new(),
+                                    entry,
+                                )
+                                .map_err(|e| std::io::Error::other(format!("Write failed: {}", e)))
+                            };
+
+                            // Keep handling multiple requests on the same connection
+                            loop {
+                                match lnc_replication::FollowerAckHandler::handle_replication_request(
+                                    &mut stream,
+                                    &write_callback,
+                                )
+                                .await
+                                {
+                                    Ok(_) => {
+                                        // Successfully handled request, continue to next
+                                        trace!(
+                                            target: "lance::data_plane",
+                                            peer = %addr,
+                                            "Data plane request handled, waiting for next"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // Connection closed or error - exit the loop
+                                        if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                                            warn!(
+                                                target: "lance::data_plane",
+                                                peer = %addr,
+                                                error = %e,
+                                                "Data plane connection error"
+                                            );
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                    },
+                    Err(e) => {
+                        warn!(
+                            target: "lance::data_plane",
+                            error = %e,
+                            "Failed to accept data plane connection"
+                        );
+                    },
+                }
+            }
+        });
+
+        // Subscribe to event channel and start handler BEFORE cluster loop to ensure receiver is active
+
         // Subscribe to event channel and start handler BEFORE cluster loop to ensure receiver is active
         let mut event_rx = coordinator.subscribe();
         let event_registry = Arc::clone(&topic_registry);

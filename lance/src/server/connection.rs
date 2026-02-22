@@ -271,20 +271,35 @@ where
 
                 let batch_id = p.batch_id;
 
-                // CONTROL PLANE DECOUPLING: ACK after local durability only.
-                // Replication happens asynchronously via the control plane.
-                // The data plane should not block on Raft quorum - this is the
-                // fundamental decoupling required for low-latency writes.
-                // Quorum tracking still happens in background for leader election
-                // consistency, but client ACK is immediate after local write.
-                if let Some((write_id, _rx)) = p.quorum_rx {
-                    // Fire-and-forget: let the quorum manager track replication
-                    // asynchronously. The write is durable locally (WAL + segment).
-                    // Replication will catch up via heartbeat-driven AppendEntries.
-                    let _ = write_id; // Suppress unused warning
+                // L3 QUORUM DURABILITY: Wait for quorum before ACKing client.
+                // This ensures writes are replicated to majority before client
+                // considers them committed, preventing data loss during failover.
+                if let Some((_write_id, rx)) = p.quorum_rx {
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+                        Ok(Ok(result)) => {
+                            if !result.is_success() {
+                                return (
+                                    idx,
+                                    Err(LanceError::QuorumNotReached {
+                                        required: 2,
+                                        received: 1,
+                                    }),
+                                );
+                            }
+                        },
+                        _ => {
+                            return (
+                                idx,
+                                Err(LanceError::QuorumNotReached {
+                                    required: 2,
+                                    received: 1,
+                                }),
+                            );
+                        },
+                    }
                 }
 
-                // Return batch_id on local durability success
+                // Return batch_id on quorum durability success
                 (idx, Ok(batch_id))
             });
         }

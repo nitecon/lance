@@ -1,7 +1,41 @@
-//! Cluster coordination module.
+//! Cluster coordination module (CONTROL PLANE).
 //!
-//! Ties together Raft consensus, peer networking, and discovery
-//! into a cohesive cluster management system.
+//! This module is part of the CONTROL PLANE, not the data plane.
+//! It uses Raft consensus for cluster metadata, leader election, and
+//! distributed state machine operations. It does NOT handle actual data replication.
+//!
+//! # Architecture Note: Control Plane vs Data Plane
+//!
+//! LANCE separates control plane (Raft) from data plane (independent replication):
+//!
+//! - **Control Plane (this module)**: Uses Raft for leader election, cluster
+//!   membership, and topic metadata. This is the "slow path" focused on consistency.
+//!   Raft consensus determines which node is leader, but Raft does NOT carry
+//!   actual data payloads - only metadata operations go through Raft.
+//!
+//! - **Data Plane**: Uses independent replication for actual data writes.
+//!   Data plane replication is completely separate from the Raft connections in this
+//!   module. The data plane can function behind load balancers and does not block
+//!   on Raft consensus.
+//!
+//! # Key Responsibilities
+//!
+//! - Leader election via Raft consensus
+//! - Topic metadata operations (CreateTopic, DeleteTopic)
+//! - Tracking "latest offset" via periodic follower reports
+//! - Determining which follower has most up-to-date data for failover
+//!
+//! # What This Module Does NOT Do
+//!
+//! - It does NOT replicate actual data writes (that's the data plane)
+//! - It does NOT carry data payloads in Raft log entries (only metadata)
+//! - It does NOT block on data replication (data plane handles that independently)
+//!
+//! For data plane implementation, see `lance/src/server/mod.rs` and
+//! `lnc-replication/src/quorum.rs`.
+//!
+//! See `docs/Architecture.md` section "Control Plane vs Data Plane Architecture"
+//! for detailed explanation.
 
 use crate::codec::{
     ClusterConfig as RaftClusterConfig, ConfigNode, NodeRole, ReplicationCodec, ReplicationMessage,
@@ -161,6 +195,8 @@ pub struct ClusterCoordinator {
     last_election_check_tick_at: tokio::sync::Mutex<Instant>,
     /// In-flight election round task handle, if any.
     election_round_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Data plane manager for data replication (separate from control plane)
+    data_plane_manager: Arc<crate::data_plane::DataPlaneManager>,
 }
 
 impl ClusterCoordinator {
@@ -400,6 +436,7 @@ impl ClusterCoordinator {
         // quorum/leadership state.
         lnc_metrics::set_cluster_coordinator_ready(false);
 
+        let node_id = config.node_id;
         Self {
             config,
             raft: Arc::new(RwLock::new(raft)),
@@ -427,6 +464,10 @@ impl ClusterCoordinator {
                     .unwrap_or_else(Instant::now),
             ),
             election_round_task: tokio::sync::Mutex::new(None),
+            data_plane_manager: Arc::new(crate::data_plane::DataPlaneManager::new(
+                node_id,
+                crate::data_plane::DataPlaneConfig::default(),
+            )),
         }
     }
 
@@ -505,6 +546,7 @@ impl ClusterCoordinator {
         // quorum/leadership state.
         lnc_metrics::set_cluster_coordinator_ready(false);
 
+        let node_id = config.node_id;
         Ok(Self {
             config,
             raft: Arc::new(RwLock::new(raft)),
@@ -532,6 +574,10 @@ impl ClusterCoordinator {
                     .unwrap_or_else(Instant::now),
             ),
             election_round_task: tokio::sync::Mutex::new(None),
+            data_plane_manager: Arc::new(crate::data_plane::DataPlaneManager::new(
+                node_id,
+                crate::data_plane::DataPlaneConfig::default(),
+            )),
         })
     }
 
@@ -775,6 +821,11 @@ impl ClusterCoordinator {
         raft.current_term()
     }
 
+    /// Get the number of connected peers
+    pub async fn connected_peer_count(&self) -> usize {
+        self.peers.connected_peer_count().await
+    }
+
     /// Get the current fencing token (only valid if leader)
     pub async fn fencing_token(&self) -> Option<FencingToken> {
         let raft = self.raft.read().await;
@@ -861,14 +912,86 @@ impl ClusterCoordinator {
         }
     }
 
-    /// Get connected peer count
-    pub async fn connected_peer_count(&self) -> usize {
-        self.peers.connected_peer_count().await
-    }
-
     /// Get peer states
     pub async fn peer_states(&self) -> std::collections::HashMap<u16, PeerState> {
         self.peers.peer_states().await
+    }
+
+    /// Sync followers from control plane (PeerManager) to data plane (DataPlaneManager).
+    /// This ensures the data plane has connections to all known followers.
+    pub async fn sync_followers_to_data_plane(&self) {
+        let peer_ids = self.peers.peer_ids().await;
+        let data_plane_ids = self.data_plane_manager.follower_ids().await;
+        let my_node_id = self.node_id();
+
+        debug!(
+            target: "lance::cluster",
+            peer_count = peer_ids.len(),
+            data_plane_follower_count = data_plane_ids.len(),
+            my_node_id,
+            peers = ?peer_ids,
+            data_plane_followers = ?data_plane_ids,
+            "Syncing followers to data plane"
+        );
+
+        // Add new followers to data plane (excluding self)
+        for peer_id in &peer_ids {
+            // Skip self - the leader should not replicate to itself
+            if *peer_id == my_node_id {
+                debug!(
+                    target: "lance::cluster",
+                    node_id = peer_id,
+                    "Skipping self in data plane sync"
+                );
+                continue;
+            }
+
+            if !data_plane_ids.contains(peer_id) {
+                if let Some(addr) = self.peers.get_peer_addr(*peer_id).await {
+                    // Data plane uses dedicated port 1995 (separate from resync 1994 and control 1993)
+                    let data_plane_addr = SocketAddr::new(addr.ip(), 1995);
+                    info!(
+                        target: "lance::cluster",
+                        node_id = peer_id,
+                        control_addr = %addr,
+                        data_plane_addr = %data_plane_addr,
+                        "Adding follower to data plane"
+                    );
+                    self.data_plane_manager
+                        .add_follower(*peer_id, data_plane_addr)
+                        .await;
+                    info!(
+                        target: "lance::cluster",
+                        node_id = peer_id,
+                        addr = %data_plane_addr,
+                        "Synced follower to data plane"
+                    );
+                } else {
+                    warn!(
+                        target: "lance::cluster",
+                        node_id = peer_id,
+                        "No peer address available for data plane sync"
+                    );
+                }
+            }
+        }
+
+        // Remove followers that are no longer in control plane (or self)
+        for dp_id in &data_plane_ids {
+            if !peer_ids.contains(dp_id) || *dp_id == my_node_id {
+                self.data_plane_manager.remove_follower(*dp_id).await;
+                info!(
+                    target: "lance::cluster",
+                    node_id = dp_id,
+                    "Removed follower from data plane"
+                );
+            }
+        }
+    }
+
+    /// Get the data plane manager (for external data plane operations)
+    pub fn data_plane_manager(&self) -> Arc<crate::data_plane::DataPlaneManager> {
+        Arc::clone(&self.data_plane_manager)
     }
 
     /// Persist a single log entry without blocking async executor workers.
@@ -1210,43 +1333,107 @@ impl ClusterCoordinator {
 
     /// Replicate ingested data to followers using the enriched wire format (L3 quorum).
     ///
-    /// Per Architecture.md §4.1.1 and LWP-Specification.md §18.2:
-    /// Encodes a `DataReplicationEntry` into a `LogEntry` with `EntryType::Data` and
-    /// broadcasts via AppendEntries to all connected peers.
+    /// # Architecture Note: Control Plane vs Data Plane
+    ///
+    /// This method is part of the **data plane**. It uses the `DataPlaneManager`
+    /// which maintains separate connections from the Raft control plane.
+    ///
+    /// - Data plane uses **separate connections** from control plane
+    /// - Control plane (Raft) connections are for metadata only
+    /// - Data plane replication is independent and handles actual data writes
     pub async fn replicate_data_enriched(
         &self,
         entry: crate::codec::DataReplicationEntry,
     ) -> Result<Vec<u16>, std::io::Error> {
-        // CONTROL PLANE DECOUPLING: Data replication is now fire-and-forget.
-        // The data plane writes locally (WAL + segment) and ACKs the client.
-        // Replication to followers happens asynchronously without blocking on
-        // Raft log operations. The control plane heartbeats will eventually
-        // synchronize state across the cluster.
-        //
-        // This decouples data plane latency from Raft consensus overhead.
+        // DATA PLANE REPLICATION via DataPlaneManager (separate from control plane)
 
         // Only leader replicates data
         if !self.is_leader() {
             return Ok(vec![]);
         }
 
-        // CONTROL PLANE DECOUPLING: Return immediately.
-        // Data is already written locally (WAL + segment) by the ingestion actor.
-        // The control plane heartbeats will synchronize followers asynchronously.
-        // This completely decouples data plane latency from replication overhead.
-        //
-        // Record replication activity timestamp for monitoring.
+        // Record replication activity timestamp for monitoring
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         self.last_sync_time
             .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        // Get follower IDs from data plane manager
+        let follower_ids = self.data_plane_manager.follower_ids().await;
+        if follower_ids.is_empty() {
+            warn!(
+                target: "lance::cluster",
+                "No followers in data plane manager - cannot replicate"
+            );
+            return Ok(vec![]);
+        }
 
-        // Return empty - no synchronous peer replication needed.
-        // Heartbeats handle follower catch-up via AppendEntries.
-        let _ = entry; // Suppress unused warning
-        Ok(vec![])
+        info!(
+            target: "lance::cluster",
+            follower_count = follower_ids.len(),
+            followers = ?follower_ids,
+            "Starting data plane replication"
+        );
+
+        let mut successful_peers = Vec::new();
+        let mut join_set = tokio::task::JoinSet::new();
+
+        // Clone follower_ids for use in spawned tasks (they need 'static lifetime)
+        let follower_ids_clone = follower_ids.clone();
+
+        // Fire replication to all followers concurrently via data plane
+        for follower_id in follower_ids_clone {
+            let data_plane = Arc::clone(&self.data_plane_manager);
+            let entry_clone = crate::codec::DataReplicationEntry {
+                topic_id: entry.topic_id,
+                global_offset: entry.global_offset,
+                segment_name: entry.segment_name.clone(),
+                write_offset: entry.write_offset,
+                flags: entry.flags,
+                payload_crc: entry.payload_crc,
+                payload: entry.payload.clone(),
+            };
+
+            join_set.spawn(async move {
+                let result = data_plane
+                    .replicate_to_follower(follower_id, &entry_clone)
+                    .await;
+                (follower_id, result.is_ok())
+            });
+        }
+        // Collect results
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok((follower_id, true)) => {
+                    successful_peers.push(follower_id);
+                },
+                Ok((follower_id, false)) => {
+                    warn!(
+                        target: "lance::cluster",
+                        follower_id = follower_id,
+                        "Data replication failed to follower"
+                    );
+                },
+                Err(e) => {
+                    warn!(
+                        target: "lance::cluster",
+                        error = %e,
+                        "Data replication task panicked"
+                    );
+                },
+            }
+        }
+
+        info!(
+            target: "lance::cluster",
+            successful_count = successful_peers.len(),
+            attempted_count = follower_ids.len(),
+            successful_peers = ?successful_peers,
+            "Data plane replication completed"
+        );
+
+        Ok(successful_peers)
     }
 
     /// Decode a data replication payload.
@@ -1673,6 +1860,7 @@ impl ClusterCoordinator {
         let mut heartbeat_ticker = tokio::time::interval(heartbeat_interval);
         let mut election_check_ticker = tokio::time::interval(Duration::from_millis(50));
         let mut peer_dns_refresh_ticker = tokio::time::interval(Duration::from_secs(1));
+        let mut data_plane_sync_ticker = tokio::time::interval(Duration::from_secs(5));
         let commit_notify = Arc::clone(&self.commit_notify);
 
         // Resolve peer hostnames promptly on startup so early heartbeats/elections
@@ -1694,6 +1882,13 @@ impl ClusterCoordinator {
                 }
                 _ = peer_dns_refresh_ticker.tick() => {
                     self.refresh_peer_addresses().await;
+                }
+                _ = data_plane_sync_ticker.tick() => {
+                    // Periodically sync followers to data plane if we're the leader
+                    // This ensures new peers are added even after initial election
+                    if self.is_leader() {
+                        self.sync_followers_to_data_plane().await;
+                    }
                 }
                 _ = shutdown.recv() => {
                     self.cancel_election_round_task("shutdown").await;
@@ -1737,7 +1932,7 @@ impl ClusterCoordinator {
         self.update_cached_leader_state(is_leader).await;
 
         // Publish cluster health metrics for production observability
-        let connected_peers = self.connected_peer_count().await;
+        let connected_peers = self.peers.connected_peer_count().await;
         let total_nodes = connected_peers + 1; // connected peers + self (approximation)
         let quorum_size = (total_nodes / 2) + 1;
         let quorum_available = connected_peers + 1 >= quorum_size; // +1 for self
@@ -2320,6 +2515,9 @@ impl ClusterCoordinator {
                             .store(elected_at_ms, std::sync::atomic::Ordering::Relaxed);
                         lnc_metrics::set_cluster_leader_ready(false);
                         lnc_metrics::set_cluster_apply_lag_at_election(apply_lag_at_election);
+
+                        // Sync followers to data plane for leader-side replication
+                        self.sync_followers_to_data_plane().await;
 
                         // Replicate No-Op entry to seal the log (Raft §5.4.2)
                         // This ensures the new leader can commit entries from its own term

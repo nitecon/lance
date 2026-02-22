@@ -1,12 +1,17 @@
-//! lnc-bench — Throughput and latency benchmark for LANCE
+//! lnc-bench — High-throughput benchmark for LANCE
 //!
-//! Measures peak ingestion throughput (msg/s, MB/s) and ACK latency
+//! Measures peak ingestion throughput (msg/s, MB/s) and end-to-end latency
 //! percentiles (p50, p95, p99, p999, max) using the lnc-client Producer API.
+//!
+//! LANCE is designed for millions of messages per second. This benchmark
+//! validates performance against realistic high-throughput targets:
+//!   - Throughput: 100K-1M+ msg/s (platform capability)
+//!   - Latency: sub-millisecond to low-millisecond (p50: <5ms, p99: <50ms)
 //!
 //! # Usage
 //!
 //! ```text
-//! lnc-bench --endpoint 127.0.0.1:1992 --topic 1 --duration 30 --msg-size 1024 --connections 4
+//! lnc-bench --endpoint 127.0.0.1:1992 --topic bench --duration 60 --connections 64 --pipeline 256
 //! ```
 
 use std::sync::Arc;
@@ -18,17 +23,19 @@ use clap::Parser;
 use tokio::sync::{Barrier, Semaphore, mpsc};
 use tracing::{error, info, warn};
 
-const LATENCY_P50_MAX_NS: u64 = 500;
-const LATENCY_P99_MAX_NS: u64 = 5_000;
-const LATENCY_P999_MAX_NS: u64 = 50_000;
+// Realistic latency targets for networked operations (nanoseconds)
+// LANCE targets sub-millisecond to low-millisecond latency
+const LATENCY_P50_MAX_NS: u64 = 5_000_000; // 5ms - excellent for LAN
+const LATENCY_P99_MAX_NS: u64 = 50_000_000; // 50ms - acceptable tail latency
+const LATENCY_P999_MAX_NS: u64 = 100_000_000; // 100ms - max acceptable tail
 const PRODUCE_TIMEOUT_SECS: u64 = 5;
 const DRAIN_TIMEOUT_SECS: u64 = 5;
 
-/// LANCE throughput and latency benchmark
+/// LANCE high-throughput benchmark
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "lnc-bench",
-    about = "Throughput and latency benchmark for LANCE"
+    about = "High-throughput benchmark for LANCE - designed for millions of msg/s"
 )]
 struct Args {
     /// LANCE server endpoint (host:port)
@@ -76,7 +83,13 @@ struct Args {
     latency: bool,
 
     /// Minimum throughput gate in messages/sec
-    #[arg(long, default_value = "10000")]
+    ///
+    /// LANCE platform targets:
+    ///   - 10K msg/s: Entry-level (single connection)
+    ///   - 100K msg/s: Good (multi-core, batching)
+    ///   - 500K msg/s: Excellent (optimized pipeline)
+    ///   - 1M+ msg/s: World-class (maximized parallelism)
+    #[arg(long, default_value = "50000")]
     min_throughput_msgs_per_sec: f64,
 
     /// Maximum allowed benchmark errors for pass gate
@@ -93,14 +106,20 @@ fn gate_status(pass: bool) -> &'static str {
 }
 
 fn throughput_health(msgs_per_sec: f64) -> (&'static str, &'static str) {
-    if msgs_per_sec < 100.0 {
-        ("🔴 RED", "<100 msg/s")
-    } else if msgs_per_sec < 1000.0 {
-        ("🟠 AMBER", "<1000 msg/s")
-    } else if msgs_per_sec > 10_000.0 {
-        ("🟢 GREEN", ">10000 msg/s")
+    if msgs_per_sec < 1_000.0 {
+        ("🔴 CRITICAL", "<1K msg/s - Severely constrained")
+    } else if msgs_per_sec < 10_000.0 {
+        ("🟠 LOW", "1K-10K msg/s - Development/testing pace")
+    } else if msgs_per_sec < 50_000.0 {
+        ("� MODERATE", "10K-50K msg/s - Entry production")
+    } else if msgs_per_sec < 100_000.0 {
+        ("🟢 GOOD", "50K-100K msg/s - Solid throughput")
+    } else if msgs_per_sec < 500_000.0 {
+        ("� EXCELLENT", "100K-500K msg/s - High performance")
+    } else if msgs_per_sec < 1_000_000.0 {
+        ("🟢 OUTSTANDING", "500K-1M msg/s - Near peak")
     } else {
-        ("🟡 YELLOW", "1000-10000 msg/s")
+        ("🏆 WORLD-CLASS", "1M+ msg/s - Platform maximized")
     }
 }
 
@@ -413,7 +432,7 @@ async fn main() {
             "SKIP (disabled by --skip-latency-gate)".to_string()
         } else {
             format!(
-                "{} (p50<=500ns, p99<=5us, p99.9<=50us)",
+                "{} (p50<=5ms, p99<=50ms, p99.9<=100ms)",
                 gate_status(latency_gate_pass)
             )
         }

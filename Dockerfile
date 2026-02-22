@@ -106,9 +106,11 @@ WORKDIR /var/lib/lance
 # Expose ports:
 #   1992 - LWP client connections (producers/consumers)
 #   1993 - Replication port (inter-node Raft/log sync, internal cluster traffic)
+#   1994 - Resync server port (internal catch-up replication)
+#   1995 - Data plane replication port (internal leader-to-follower data replication)
 #   9090 - Prometheus metrics scrape endpoint
 #   8080 - Health checks (/health/live, /health/ready for k8s probes)
-EXPOSE 1992 1993 9090 8080
+EXPOSE 1992 1993 1994 1995 9090 8080
 
 # Health check using netcat (more reliable than binary flag)
 HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=5 \

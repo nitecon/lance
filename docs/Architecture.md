@@ -59,6 +59,8 @@
 - [Hot-Path Dynamic Dispatch Removal for Async I/O Futures](#hot-path-dynamic-dispatch-removal-for-async-io-futures)
 - [Changes](#changes)
 - [Outcome](#outcome)
+- [Control Plane vs Data Plane Architecture](#control-plane-vs-data-plane-architecture)
+- [Control Plane vs Data Plane Architecture](#control-plane-vs-data-plane-architecture)
 
 ---
 
@@ -5903,6 +5905,159 @@ To satisfy Engineering Standards §1 (No Dynamic Dispatch on data plane), the as
 ## Outcome
 - Removes `dyn` usage from audited hot-path crates while keeping completion semantics unchanged.
 - Preserves batch ownership-return contract (`(LoanableBatch, Result<usize>)`) for pool recycling.
+
+## Control Plane vs Data Plane Architecture
+
+This section explains the fundamental architectural separation between control plane (Raft consensus) and data plane (independent replication) in LANCE, and how they interact to provide both high throughput and strong durability guarantees.
+
+### Core Principle
+
+LANCE employs a strict separation of concerns:
+
+- **Control Plane**: Uses Raft consensus for cluster metadata, leader election, and configuration changes. This is the "slow path" focused on consistency.
+- **Data Plane**: Uses independent replication for actual data writes, decoupled from Raft. This is the "fast path" focused on throughput.
+
+This separation allows the data plane to function behind load balancers and Kubernetes clusters without being blocked by Raft consensus operations.
+
+### Control Plane (Raft)
+
+**Responsibilities:**
+- Leader election and cluster membership
+- Topic metadata operations (CreateTopic, etc.)
+- Tracking the "latest offset" across the cluster via periodic reports
+- Determining which follower has the most up-to-date data for failover
+
+**Key Characteristics:**
+- Uses Raft log for consensus ( AppendEntries RPCs )
+- Does NOT carry actual data payloads (only metadata)
+- Followers report their max offset to the leader periodically (~50ms)
+- The "committed offset" is determined by Raft quorum (majority of nodes acknowledging)
+
+**Implementation Files:**
+- `lnc-replication/src/raft.rs` - Core Raft state machine
+- `lnc-replication/src/cluster.rs` - Cluster coordination via Raft
+
+### Data Plane (Independent Replication)
+
+**Responsibilities:**
+- Accepting and persisting actual data writes
+- Replicating data from leader to followers
+- Serving read requests from local storage
+- Managing catch-up during leadership changes
+
+**Key Characteristics:**
+- Completely separate from Raft connections
+- Leader writes locally, then replicates to followers
+- Followers ACK writes back to leader for client quorum
+- Can function independently (behind load balancers, etc.)
+- Uses its own network connections (not the Raft peer connections)
+
+**Implementation Files:**
+- `lance/src/server/connection.rs` - Client connection handling
+- `lnc-replication/src/quorum.rs` - Quorum tracking for data writes
+- `lance/src/server/mod.rs` - Data forwarder runtime
+
+### Write Flow (with Quorum)
+
+When a client sends a write request:
+
+1. **Receive**: If follower, forward to leader's data plane
+2. **Local Write**: Leader writes to local WAL + segment (immediate durability)
+3. **Quorum Registration**: Register write with `AsyncQuorumManager`
+4. **Replication**: Fire replication to all followers via data plane (concurrent)
+5. **Follower ACKs**: Followers receive data, write locally, ACK back to leader
+6. **Quorum Check**: Leader counts local write + follower ACKs
+7. **Client ACK**: Once quorum reached (e.g., 2/3 for 3-node cluster), ACK client
+8. **Background**: Control plane tracks offsets via periodic reports
+
+**Key Point**: The quorum wait happens in the data plane, NOT in Raft. The client ACK waits for data durability on a majority of nodes, not for Raft consensus.
+
+### Leadership Change & Catch-Up
+
+When leadership changes:
+
+1. New leader is elected via Raft (control plane)
+2. New leader queries Raft to find which node has the latest data offset
+3. New leader "subscribes" to that node's data plane to catch up
+4. Old leader continues serving reads/writes during catch-up
+5. Once caught up, new leader starts serving writes
+6. Old leader stops accepting writes, continues serving reads until drained
+
+**CATCHING_UP Protocol:**
+- During leadership transition, new leader returns `CATCHING_UP` to clients
+- Clients queue writes and retry until new leader is ready
+- This provides a graceful handoff without data loss
+
+### Why This Separation?
+
+**Without Separation (Raft for everything):**
+- Every write requires Raft consensus → high latency
+- Cannot work behind load balancers (requires direct peer connections)
+- Performance limited by Raft's synchronous nature
+
+**With Separation (LANCE model):**
+- Data plane achieves high throughput (no consensus blocking)
+- Works behind load balancers (data plane connections are independent)
+- Still provides strong durability (quorum waits for replication)
+- Control plane handles metadata consistency (Raft for cluster state)
+
+### Quorum Model
+
+**Client Write Quorum:**
+- For N nodes, requires (N/2 + 1) ACKs for client success
+- Leader's local write counts as 1 ACK
+- Follower ACKs are tracked via data plane responses
+- Quorum timeout prevents indefinite blocking (default: 5s)
+
+**Control Plane Quorum (Raft):**
+- Used for metadata operations (CreateTopic, etc.)
+- Requires majority of nodes for commit
+- Determines "committed offset" for cluster state
+
+**Interaction:**
+- Client quorum ensures data durability
+- Control plane quorum ensures cluster metadata consistency
+- They operate independently but complement each other
+
+### Implementation Notes
+
+**Data Plane Connections:**
+- Separate from Raft peer connections (`PeerManager` for Raft, different mechanism for data)
+- Currently the implementation uses the forwarder pattern in `lance/src/server/mod.rs`
+- Future: Dedicated data plane connections per follower
+
+**Quorum Tracking:**
+- `AsyncQuorumManager` tracks pending writes and ACKs
+- Leader records its own ACK immediately
+- Follower ACKs are recorded when replication succeeds
+- Client waits on `quorum_rx` channel for quorum result
+
+**Offset Tracking:**
+- Followers report max offset to control plane every ~50ms
+- Control plane determines which node has latest data
+- Used during failover to select catch-up source
+
+### Common Misunderstandings
+
+**Mistake 1: Using Raft connections for data replication**
+- WRONG: Using `PeerManager` connections to send data
+- CORRECT: Data plane uses separate connections/mechanism
+
+**Mistake 2: Blocking data plane on Raft consensus**
+- WRONG: Waiting for Raft commit before client ACK
+- CORRECT: Wait for data plane quorum (separate from Raft)
+
+**Mistake 3: Best-effort data replication**
+- WRONG: Fire-and-forget without ACKs
+- CORRECT: Wait for follower ACKs for quorum durability
+
+### Summary
+
+- **Control Plane (Raft)**: Cluster consensus, metadata, leadership elections
+- **Data Plane (Independent)**: High-throughput writes, quorum durability, client serving
+- **Separation**: Data plane does NOT use Raft connections or block on Raft
+- **Quorum**: Client ACKs wait for data plane quorum (2/3 nodes have data)
+- **Failover**: New leader catches up via data plane subscription to old leader
 ---
 
 [↑ Back to Top](#technical-design-project-lance) | [← Back to Docs Index](./README.md)

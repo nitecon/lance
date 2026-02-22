@@ -1,3 +1,43 @@
+//! Quorum tracking for data plane replication (DATA PLANE).
+//!
+//! This module is part of the DATA PLANE, not the control plane.
+//! It manages quorum tracking for client write operations, ensuring that
+//! writes are acknowledged to clients only after a majority of nodes have
+//! received the data.
+//!
+//! # Architecture Note: Control Plane vs Data Plane
+//!
+//! LANCE separates control plane (Raft) from data plane (independent replication):
+//!
+//! - **Control Plane (Raft)**: Handles leader election and metadata consensus.
+//!   See `lnc-replication/src/raft.rs` and `lnc-replication/src/cluster.rs`.
+//!
+//! - **Data Plane (this module)**: Handles actual data replication with quorum
+//!   tracking. This is the "fast path" focused on throughput. Client writes
+//!   are acknowledged only after a majority of nodes have the data.
+//!
+//! # Write Flow with Quorum
+//!
+//! 1. Leader receives write from client
+//! 2. Leader writes locally (immediate durability)
+//! 3. Leader registers write with `AsyncQuorumManager`
+//! 4. Leader replicates to followers via data plane (concurrent)
+//! 5. Followers receive data, write locally, ACK back to leader
+//! 6. Leader counts local write + follower ACKs
+//! 7. Once quorum reached (e.g., 2/3 for 3-node cluster), leader ACKs client
+//! 8. Control plane tracks offsets separately via periodic reports (~50ms)
+//!
+//! # Key Point
+//!
+//! The quorum wait happens in the DATA PLANE, NOT in Raft. The client ACK
+//! waits for data durability on a majority of nodes (data plane quorum),
+//! NOT for Raft consensus (control plane quorum).
+//!
+//! For control plane implementation, see `lnc-replication/src/raft.rs`.
+//!
+//! See `docs/Architecture.md` section "Control Plane vs Data Plane Architecture"
+//! for detailed explanation.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

@@ -1,6 +1,33 @@
-//! Peer connection management for replication networking.
+//! Peer connection management for replication networking (CONTROL PLANE).
 //!
-//! Handles TCP connections to peer nodes for Raft consensus and data replication.
+//! This module is part of the CONTROL PLANE. It handles TCP connections
+//! to peer nodes for Raft consensus operations only. These connections
+//! are used for control plane operations (leader election, AppendEntries,
+//! etc.), NOT for actual data replication.
+//!
+//! # Architecture Note: Control Plane vs Data Plane
+//!
+//! LANCE strictly separates control plane from data plane:
+//!
+//! - **Control Plane Connections (this module)**: Used for Raft consensus.
+//!   These handle leader election, AppendEntries RPCs for metadata, and
+//!   cluster state synchronization. Do NOT use these for data replication.
+//!
+//! - **Data Plane**: Uses independent replication mechanism completely separate
+//!   from these control plane connections. The data plane replicates actual
+//!   write data from leader to followers and operates independently.
+//!
+//! # Key Point
+//!
+//! The `PeerManager` in this module is for Raft control plane only.
+//! Data plane replication must use a separate mechanism - do not send
+//! actual data payloads through these connections.
+//!
+//! For data plane implementation, see `lance/src/server/mod.rs`.
+//!
+//! See `docs/Architecture.md` section "Control Plane vs Data Plane Architecture"
+//! for detailed explanation.
+//!
 //! Supports optional TLS encryption when the `tls` feature is enabled.
 
 use crate::codec::{AppendEntriesRequest, AppendEntriesResponse};
@@ -1179,6 +1206,35 @@ impl PeerManager {
                 Err(e)
             },
         }
+    }
+
+    /// Send data replication bytes directly to a peer (fire-and-forget, no response expected).
+    ///
+    /// Used for L3 quorum data replication where the forwarder tracks successful peers
+    /// via the return value, not via a response message.
+    pub async fn send_data_replication(
+        &self,
+        peer_id: u16,
+        data: bytes::Bytes,
+    ) -> Result<(), std::io::Error> {
+        let conn = self.get_peer_connection(peer_id).await?;
+        let mut conn = conn.lock().await;
+
+        if !conn.is_connected() {
+            conn.connect().await?;
+        }
+
+        // Write the length prefix + data directly
+        // Write the length prefix + data directly
+        let len_bytes = (data.len() as u32).to_le_bytes();
+        let stream = conn.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Stream not connected")
+        })?;
+        stream.write_all(&len_bytes).await?;
+        stream.write_all(&data).await?;
+        stream.flush().await?;
+
+        Ok(())
     }
 
     pub async fn connected_peer_count(&self) -> usize {

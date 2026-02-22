@@ -201,7 +201,7 @@ impl Compressor {
     /// Raw compression without header.
     pub fn compress_raw(&self, data: &[u8]) -> CompressionResult<Vec<u8>> {
         match self.algorithm {
-            CompressionAlgorithm::None => Ok(data.to_vec()),
+            CompressionAlgorithm::None => Ok(data.into()),
             CompressionAlgorithm::Lz4 => self.compress_lz4(data),
             CompressionAlgorithm::Zstd => self.compress_zstd(data),
         }
@@ -443,13 +443,13 @@ mod tests {
         assert_eq!(decompressed.as_ref(), original.as_slice());
     }
 
-    /// Benchmark: Measure to_vec() overhead for CompressionAlgorithm::None
+    /// Benchmark: Measure allocation overhead for CompressionAlgorithm::None
     ///
-    /// This test measures the cost of the data.to_vec() call in compress_raw()
+    /// This test measures the cost of the data copy in compress_raw()
     /// when compression is disabled. This is important for understanding the
     /// performance impact on the hot path when compression is not used.
     #[test]
-    fn benchmark_to_vec_overhead_none_compression() {
+    fn benchmark_allocation_overhead_none_compression() {
         use std::time::Instant;
 
         let compressor = Compressor::default(); // None algorithm
@@ -458,7 +458,7 @@ mod tests {
         let sizes = [1024, 4096, 16384, 65536, 262144]; // 1KB, 4KB, 16KB, 64KB, 256KB
         let iterations = 1000;
 
-        println!("\n=== to_vec() Overhead Benchmark (CompressionAlgorithm::None) ===");
+        println!("\n=== Allocation Overhead Benchmark (CompressionAlgorithm::None) ===");
         println!(
             "{:<12} {:>12} {:>12} {:>12}",
             "Size", "Total (µs)", "Per-op (ns)", "Throughput"
@@ -492,7 +492,7 @@ mod tests {
             assert_eq!(result.len(), data.len());
         }
 
-        println!("\nNote: to_vec() creates a full copy. Consider Bytes::copy_from_slice()");
+        println!("\nNote: data copy creates a full allocation. Consider Bytes::copy_from_slice()");
         println!("or Cow<[u8]> if zero-copy passthrough is needed on hot path.\n");
     }
 }

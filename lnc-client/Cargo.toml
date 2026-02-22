@@ -18,7 +18,7 @@ lnc-core = { workspace = true }
 lnc-network = { workspace = true, features = ["tls"] }
 bytes = { workspace = true }
 tokio = { workspace = true }
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tracing = { workspace = true }
 serde_json = { workspace = true }
 

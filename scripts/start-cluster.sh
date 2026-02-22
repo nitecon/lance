@@ -17,10 +17,11 @@ BASE_PORT=1992
 BASE_METRICS_PORT=9090
 BASE_HEALTH_PORT=8080
 BASE_REPLICATION_PORT=1993
-DATA_DIR_BASE="$PROJECT_DIR/test-data"
-LOG_DIR="$PROJECT_DIR/test-logs"
+ARTIFACTS_DIR="$PROJECT_DIR/.cassa_artifacts"
+DATA_DIR_BASE="$ARTIFACTS_DIR/test-data"
+LOG_DIR="$ARTIFACTS_DIR/test-logs"
 NODE_COUNT=3
-PID_FILE="$PROJECT_DIR/test-cluster.pids"
+PID_FILE="$ARTIFACTS_DIR/test-cluster.pids"
 
 stop_cluster() {
     echo "Stopping LANCE cluster..."

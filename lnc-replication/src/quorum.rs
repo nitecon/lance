@@ -256,6 +256,18 @@ impl AsyncQuorumManager {
         }
     }
 
+    #[inline]
+    #[must_use]
+    pub fn required_acks(&self) -> usize {
+        self.config.required_acks
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn timeout_ms(&self) -> u64 {
+        self.config.timeout_ms
+    }
+
     /// Register a new write and get a channel to await quorum
     /// Returns (write_id, receiver for quorum result)
     pub async fn register_write(&self) -> (u64, oneshot::Receiver<QuorumResult>) {

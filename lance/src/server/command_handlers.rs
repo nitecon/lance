@@ -224,6 +224,22 @@ pub async fn handle_create_topic(ctx: &CommandContext<'_>, payload: Option<&Byte
                     "Failed to converge existing topic creation"
                 );
                 coord.reemit_committed_topic_ops().await;
+                if let Some(metadata) = ctx.topic_registry.get_topic_by_id(existing_id) {
+                    info!(
+                        target: "lance::server",
+                        topic_id = metadata.id,
+                        topic_name = %metadata.name,
+                        error = %e,
+                        "Returning existing topic after convergence retry failed"
+                    );
+                    let response_data = serde_json::json!({
+                        "id": metadata.id,
+                        "name": metadata.name,
+                        "created_at": metadata.created_at,
+                        "topic_epoch": metadata.topic_epoch
+                    });
+                    return Frame::new_topic_response(Bytes::from(response_data.to_string()));
+                }
                 return Frame::new_error_response(&format!(
                     "Failed to replicate existing topic convergence: {}",
                     e
@@ -629,6 +645,26 @@ pub async fn handle_create_topic_with_retention(
                             "Failed to converge existing topic creation with retention"
                         );
                         coord.reemit_committed_topic_ops().await;
+                        if let Some(metadata) = ctx.topic_registry.get_topic_by_id(existing_id) {
+                            info!(
+                                target: "lance::server",
+                                topic_id = metadata.id,
+                                topic_name = %metadata.name,
+                                error = %e,
+                                "Returning existing topic after retention convergence retry failed"
+                            );
+                            let response_data = serde_json::json!({
+                                "id": metadata.id,
+                                "name": metadata.name,
+                                "created_at": metadata.created_at,
+                                "topic_epoch": metadata.topic_epoch,
+                                "max_age_secs": max_age_secs,
+                                "max_bytes": max_bytes
+                            });
+                            return Frame::new_topic_response(Bytes::from(
+                                response_data.to_string(),
+                            ));
+                        }
                         return Frame::new_error_response(&format!(
                             "Failed to replicate existing topic convergence: {}",
                             e

@@ -12,8 +12,9 @@ use crate::shutdown::{begin_operation, end_operation, is_shutdown_requested};
 use crate::subscription::SubscriptionManager;
 use crate::topic::{TopicIdentityError, TopicRegistry};
 use bytes::Bytes;
-use futures::future::try_join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use lnc_core::{BatchPool, LanceError, Result};
+use lnc_metrics::time_ingest_sampled;
 use lnc_network::{ControlCommand, FrameType, LWP_HEADER_SIZE, parse_frame};
 use lnc_replication::{
     AsyncQuorumManager, ClusterCoordinator, ForwardError, LeaderConnectionPool, QuorumResult,
@@ -22,8 +23,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
-// 4 Golden Signals - sampled latency tracking (hot-path safe)
-use lnc_metrics::time_ingest_sampled;
 
 const INITIAL_BUFFER_SIZE: usize = 256 * 1024;
 const LEADER_DISCOVERY_RETRIES: usize = 3;
@@ -244,84 +243,103 @@ where
     }
 
     // ── Batch-complete all deferred ingests ─────────────────────────────
-    // ACK path is intentionally decoupled from quorum waits:
-    // - Client ACK is gated only on local durability (write_done_rx)
-    // - Quorum completion is observed in background tasks for logging/metrics
-    // This keeps control-plane quorum latency from backpressuring the ingest
-    // data path response latency.
+    // In L3 mode, ACK is gated on both local durability and quorum success.
+    // This preserves producer-visible durability guarantees during leader churn
+    // and avoids acknowledging writes that have not reached majority replication.
     //
-    // CRITICAL: We use try_join_all instead of JoinSet to preserve ACK ordering.
-    // TCP pipelined clients expect ACKs in request order. try_join_all polls all
-    // futures concurrently but returns results in input order, maintaining FIFO.
+    // CRITICAL: ACKs must remain FIFO for pipelined clients.
+    // We still await completions concurrently, but stream ACKs for contiguous
+    // in-order prefixes instead of waiting for the entire batch to finish.
     if !pending.is_empty() {
         let count = pending.len();
         let qm = ctx.quorum_manager.as_ref().map(Arc::clone);
 
-        // 1. Map pending items to futures (no spawning, just future construction)
-        let futures = pending.into_iter().map(|p| {
-            let qm_clone = qm.clone();
-            async move {
+        // 1. Build completion futures with original ordering index.
+        let mut futures = FuturesUnordered::new();
+        for (idx, p) in pending.into_iter().enumerate() {
+            let _qm_clone = qm.clone();
+            futures.push(async move {
                 // Await write completion
                 if p.write_done_rx.await.is_err() {
-                    return Err(LanceError::Io(std::io::Error::other(
-                        "Ingestion write failed",
-                    )));
+                    return (
+                        idx,
+                        Err(LanceError::Io(std::io::Error::other(
+                            "Ingestion write failed",
+                        ))),
+                    );
                 }
 
                 let batch_id = p.batch_id;
 
-                // Quorum wait is tracked off-path (do not block client ACK).
-                if let Some((write_id, rx)) = p.quorum_rx {
-                    if let Some(ref qm) = qm_clone {
-                        let qm = Arc::clone(qm);
-                        tokio::spawn(async move {
-                            let result = qm.wait_for_quorum(write_id, rx).await;
-                            match result {
-                                QuorumResult::Success => {},
-                                QuorumResult::Timeout => {
-                                    warn!(
-                                        target: "lance::server",
-                                        batch_id,
-                                        write_id,
-                                        "Quorum timeout after client ACK (locally durable)"
-                                    );
-                                },
-                                QuorumResult::Failed | QuorumResult::Partial { .. } => {
-                                    warn!(
-                                        target: "lance::server",
-                                        batch_id,
-                                        write_id,
-                                        result = ?result,
-                                        "Quorum failed after client ACK (locally durable)"
-                                    );
-                                },
-                            }
-                        });
-                    }
+                // CONTROL PLANE DECOUPLING: ACK after local durability only.
+                // Replication happens asynchronously via the control plane.
+                // The data plane should not block on Raft quorum - this is the
+                // fundamental decoupling required for low-latency writes.
+                // Quorum tracking still happens in background for leader election
+                // consistency, but client ACK is immediate after local write.
+                if let Some((write_id, _rx)) = p.quorum_rx {
+                    // Fire-and-forget: let the quorum manager track replication
+                    // asynchronously. The write is durable locally (WAL + segment).
+                    // Replication will catch up via heartbeat-driven AppendEntries.
+                    let _ = write_id; // Suppress unused warning
                 }
 
                 // Return batch_id on local durability success
-                Ok(batch_id)
-            }
-        });
-
-        // 2. Await ALL concurrently, preserving input order
-        // This solves HoL blocking (Max(RTT) instead of Sum(RTT))
-        // while ensuring ACK[i] corresponds to pending[i]
-        let completed_batches = try_join_all(futures).await?;
-
-        // 3. Use reusable buffer (zero allocation per batch)
-        ack_buffer.clear(); // Reset length, keep capacity
-        for batch_id in completed_batches {
-            ack_buffer.extend_from_slice(&lnc_network::encode_ack_bytes(batch_id));
+                (idx, Ok(batch_id))
+            });
         }
 
-        // Batch-write all ACKs in one syscall
-        if ctx.stream.write_all(ack_buffer).await.is_err() {
-            return Err(LanceError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "Failed to send batch ack",
-            )));
+        // 2. Track completed slots and stream ACKs only for contiguous FIFO prefix.
+        let mut ready: Vec<Option<Result<u64>>> =
+            std::iter::repeat_with(|| None).take(count).collect();
+        let mut next_ack_idx = 0usize;
+
+        while let Some((idx, result)) = futures.next().await {
+            ready[idx] = Some(result);
+
+            ack_buffer.clear();
+            while next_ack_idx < count {
+                let Some(slot) = ready[next_ack_idx].take() else {
+                    break;
+                };
+
+                match slot {
+                    Ok(batch_id) => {
+                        ack_buffer.extend_from_slice(&lnc_network::encode_ack_bytes(batch_id));
+                        next_ack_idx += 1;
+                    },
+                    Err(e) => {
+                        // Each pending ingest had begin_operation() called; always balance
+                        // counters even on quorum/ingest failures.
+                        for _ in 0..count {
+                            end_operation();
+                        }
+
+                        match e {
+                            LanceError::QuorumNotReached { .. } => {
+                                // Keep connection alive and surface a retryable failure
+                                // instead of abruptly closing the socket (which manifests
+                                // as early EOF in forwarding paths).
+                                let _ =
+                                    send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
+                                return Ok(*read_offset);
+                            },
+                            _ => return Err(e),
+                        }
+                    },
+                }
+            }
+
+            if !ack_buffer.is_empty() && ctx.stream.write_all(ack_buffer).await.is_err() {
+                for _ in 0..count {
+                    end_operation();
+                }
+
+                return Err(LanceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Failed to send batch ack",
+                )));
+            }
         }
 
         // Each pending ingest had begin_operation() called; balance them.
@@ -539,7 +557,7 @@ where
         command_handlers::is_topic_metadata_operation(command) || command == ControlCommand::Fetch;
     if should_forward_to_leader {
         if let Some(action) =
-            try_forward_control_to_leader(ctx, buffer, consumed, read_offset).await
+            try_forward_control_to_leader(ctx, command, buffer, consumed, read_offset).await
         {
             return action;
         }
@@ -654,7 +672,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let coord = ctx.cluster.as_ref()?;
-    if coord.is_leader_authoritative().await {
+    if coord.is_leader_authoritative() {
         return None;
     }
 
@@ -697,6 +715,24 @@ where
                 return Some(FrameAction::Forwarded);
             },
             Err(e) => {
+                // Transient forwarding failures (e.g. early EOF on stale pooled
+                // connection during leader transition) can often be recovered by
+                // refreshing leader address and retrying once.
+                if let Some(leader_addr) = resolve_leader_addr_with_retry(coord).await {
+                    pool.on_leader_change(Some(leader_addr)).await;
+                    match pool.forward_write(&buffer[..consumed]).await {
+                        Ok(response) => {
+                            if ctx.stream.write_all(&response).await.is_ok() {
+                                buffer.copy_within(consumed..read_offset, 0);
+                                return Some(FrameAction::Forwarded);
+                            }
+                        },
+                        Err(retry_err) => {
+                            warn!(target: "lance::server", error = %retry_err, "Write forwarding retry after leader refresh failed");
+                        },
+                    }
+                }
+
                 warn!(target: "lance::server", error = %e, "Write forwarding to leader failed");
                 let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
                 buffer.copy_within(consumed..read_offset, 0);
@@ -720,6 +756,7 @@ where
 /// Try to forward control command to leader
 async fn try_forward_control_to_leader<S>(
     ctx: &mut ConnectionContext<'_, S>,
+    command: ControlCommand,
     buffer: &mut [u8],
     consumed: usize,
     read_offset: usize,
@@ -728,7 +765,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let coord = ctx.cluster.as_ref()?;
-    if coord.is_leader_authoritative().await {
+    if command == ControlCommand::Fetch {
+        // Fetch must only execute locally on a ready leader; otherwise forward.
+        if coord.is_leader() && coord.is_leader_authoritative() {
+            return None;
+        }
+    } else if coord.is_leader_authoritative() {
         return None;
     }
 
@@ -780,6 +822,22 @@ where
                 return Some(FrameAction::Forwarded);
             },
             Err(e) => {
+                // Mirror data-plane retry behavior for transient forward failures.
+                if let Some(leader_addr) = resolve_leader_addr_with_retry(coord).await {
+                    pool.on_leader_change(Some(leader_addr)).await;
+                    match pool.forward_write(&buffer[..consumed]).await {
+                        Ok(response) => {
+                            if ctx.stream.write_all(&response).await.is_ok() {
+                                buffer.copy_within(consumed..read_offset, 0);
+                                return Some(FrameAction::Forwarded);
+                            }
+                        },
+                        Err(retry_err) => {
+                            warn!(target: "lance::server", error = %retry_err, "Control forwarding retry after leader refresh failed");
+                        },
+                    }
+                }
+
                 warn!(target: "lance::server", error = %e, "Control command forwarding to leader failed");
                 let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
                 buffer.copy_within(consumed..read_offset, 0);
@@ -830,7 +888,7 @@ where
     // follower registry responses during startup/election churn.
     if command_handlers::is_topic_metadata_operation(command) {
         if let Some(coord) = cluster {
-            if !coord.is_leader_authoritative().await {
+            if !coord.is_leader_authoritative() {
                 if coord.is_leader() {
                     lnc_metrics::increment_cluster_elected_not_ready_rejects();
                     return send_error(

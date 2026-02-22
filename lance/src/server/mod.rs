@@ -33,6 +33,7 @@ use lnc_replication::{
     create_leader_pool, create_replication_channel,
 };
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, trace, warn};
@@ -347,6 +348,11 @@ pub async fn run(
         tokio::spawn(async move {
             // Track last known leader for change detection
             let mut last_leader = event_coord.leader_addr();
+            // Throttle repeated follower resync attempts for the same leader to
+            // avoid tight retry loops under churn (e.g. repeated BecameFollower / Lagged).
+            let mut last_resync_attempt: Option<Instant> = None;
+            let mut last_resync_leader: Option<u16> = None;
+            let resync_min_interval = Duration::from_secs(5);
             // Topic writers for follower data replication (only used by followers)
             // Enriched L3 path uses (topic_id, segment_name) to support concurrent
             // segment streams for hot topics without offset collisions.
@@ -557,6 +563,19 @@ pub async fn run(
                         // segments via manifest exchange — we only need to decide
                         // whether to attempt the resync connection at all.
                         if !resync_actor.is_active() {
+                            let throttled = last_resync_leader == Some(leader_id)
+                                && last_resync_attempt
+                                    .is_some_and(|t| t.elapsed() < resync_min_interval);
+                            if throttled {
+                                debug!(
+                                    target: "lance::resync",
+                                    leader_id,
+                                    min_retry_secs = resync_min_interval.as_secs(),
+                                    "Skipping follower bulk resync (cooldown active)"
+                                );
+                                continue;
+                            }
+
                             if let Some(leader_repl_addr) = event_coord.peer_addr(leader_id).await {
                                 // Compute local offset from segment files
                                 let local_data_dir = event_config.data_dir.clone();
@@ -577,28 +596,29 @@ pub async fn run(
                                 .await
                                 .unwrap_or(0);
 
-                                // Fresh node (no data) — always attempt resync to bootstrap.
-                                // initiate_resync handles the full protocol: connect to
-                                // leader's resync port (repl_port + port_offset), exchange
-                                // manifest, stream missing segments, and rebuild indices.
-                                if local_offset == 0 {
-                                    info!(
+                                // Always attempt bounded bulk resync on follower transition.
+                                // This allows non-fresh nodes with divergent/stale local data
+                                // to converge via manifest-guided transfer instead of looping
+                                // on AppendEntries catch-up failures.
+                                info!(
+                                    target: "lance::resync",
+                                    leader_id,
+                                    leader_addr = %leader_repl_addr,
+                                    local_offset,
+                                    "Follower transition detected, initiating bulk resync"
+                                );
+                                last_resync_attempt = Some(Instant::now());
+                                last_resync_leader = Some(leader_id);
+                                if let Err(e) = resync_actor
+                                    .initiate_resync(leader_repl_addr, local_offset)
+                                    .await
+                                {
+                                    warn!(
                                         target: "lance::resync",
-                                        leader_id,
-                                        leader_addr = %leader_repl_addr,
-                                        "Fresh node detected, initiating bulk resync"
+                                        error = %e,
+                                        "Bulk resync failed"
                                     );
-                                    if let Err(e) = resync_actor
-                                        .initiate_resync(leader_repl_addr, local_offset)
-                                        .await
-                                    {
-                                        warn!(
-                                            target: "lance::resync",
-                                            error = %e,
-                                            "Bulk resync failed"
-                                        );
-                                        resync_actor.reset();
-                                    }
+                                    resync_actor.reset();
                                 }
                             }
                         }
@@ -630,6 +650,20 @@ pub async fn run(
                         if !resync_actor.is_active() {
                             if let Some(leader_id) = event_coord.leader_id().await {
                                 if leader_id != event_config.node_id {
+                                    let throttled = last_resync_leader == Some(leader_id)
+                                        && last_resync_attempt
+                                            .is_some_and(|t| t.elapsed() < resync_min_interval);
+                                    if throttled {
+                                        debug!(
+                                            target: "lance::resync",
+                                            skipped = n,
+                                            leader_id,
+                                            min_retry_secs = resync_min_interval.as_secs(),
+                                            "Skipping lag-triggered resync (cooldown active)"
+                                        );
+                                        continue;
+                                    }
+
                                     if let Some(leader_repl_addr) =
                                         event_coord.peer_addr(leader_id).await
                                     {
@@ -640,6 +674,8 @@ pub async fn run(
                                             leader_addr = %leader_repl_addr,
                                             "Lagged apply receiver - initiating follower bulk resync"
                                         );
+                                        last_resync_attempt = Some(Instant::now());
+                                        last_resync_leader = Some(leader_id);
                                         if let Err(e) =
                                             resync_actor.initiate_resync(leader_repl_addr, 0).await
                                         {
@@ -691,7 +727,7 @@ pub async fn run(
             // total_nodes = peers + self
             let total_nodes = peer_count + 1;
             let qm_config = QuorumConfig::new(total_nodes)
-                .with_timeout(config.replication_quorum_timeout_ms.unwrap_or(1000));
+                .with_timeout(config.replication_quorum_timeout_ms.unwrap_or(5000));
             info!(
                 target: "lance::server",
                 total_nodes,

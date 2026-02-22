@@ -33,7 +33,7 @@ pub struct Config {
     /// TLS settings for secure connections
     #[serde(default)]
     pub tls: TlsSettings,
-    /// Quorum timeout in milliseconds for L3 replication (default: 100ms)
+    /// Quorum timeout in milliseconds for L3 replication (default: 5000ms)
     #[serde(default)]
     pub replication_quorum_timeout_ms: Option<u64>,
     /// Per-connection consumer read rate limit in bytes per second.
@@ -96,7 +96,7 @@ fn default_data_replication_channel_capacity() -> usize {
 }
 
 fn default_replication_max_inflight() -> usize {
-    1
+    8
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -506,11 +506,11 @@ impl Config {
             listen_addr: self.replication_addr,
             discovery,
             // Keep these aligned with RaftConfig production defaults.
-            // The old 150/300-500ms timings are too aggressive under real I/O + network jitter
-            // and cause frequent leader churn during benchmark/chaos runs.
+            // Use a wider election budget so transient replication stalls and
+            // control-plane jitter do not trigger avoidable leader churn.
             heartbeat_interval: Duration::from_millis(250),
-            election_timeout_min: Duration::from_millis(1000),
-            election_timeout_max: Duration::from_millis(2000),
+            election_timeout_min: Duration::from_millis(3000),
+            election_timeout_max: Duration::from_millis(6000),
             raw_peer_strings: self.peers.clone(),
         }
     }
@@ -532,7 +532,7 @@ mod tests {
         assert_eq!(config.replication_mode, "l1");
         assert!(config.peers.is_empty());
         assert_eq!(config.data_replication_channel_capacity, 65_536);
-        assert_eq!(config.replication_max_inflight, 1);
+        assert_eq!(config.replication_max_inflight, 8);
         assert_eq!(config.coordinator_pin_core, None);
         assert_eq!(config.forwarder_pin_core, None);
     }

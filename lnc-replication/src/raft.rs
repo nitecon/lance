@@ -295,6 +295,22 @@ impl RaftNode {
         self.last_log_term = self.current_term;
     }
 
+    /// Roll back follower log pointers if append durability fails after an
+    /// optimistic `handle_append_entries` accept path.
+    ///
+    /// This preserves RaftNode/log-store consistency by restoring in-memory
+    /// cursors to their pre-append values.
+    pub fn rollback_failed_append(
+        &mut self,
+        last_log_index: u64,
+        last_log_term: u64,
+        commit_index: u64,
+    ) {
+        self.last_log_index = last_log_index;
+        self.last_log_term = last_log_term;
+        self.commit_index = commit_index.min(last_log_index);
+    }
+
     // =========================================================================
     // Pre-Vote Protocol (Raft §9.6)
     // =========================================================================
@@ -502,6 +518,16 @@ impl RaftNode {
         false
     }
 
+    /// Revert a candidate back to follower after a failed/aborted election round.
+    ///
+    /// This allows the coordinator to restart from a clean pre-vote state on the
+    /// next election timeout instead of staying in candidate mode indefinitely.
+    pub fn revert_candidate_after_failed_election(&mut self) {
+        if self.state == RaftState::Candidate {
+            self.become_follower(self.current_term);
+        }
+    }
+
     // =========================================================================
     // AppendEntries (Heartbeat + Log Replication)
     // =========================================================================
@@ -544,7 +570,9 @@ impl RaftNode {
             };
         }
 
-        // Valid leader heartbeat - reset election timeout
+        // Term-valid AppendEntries (heartbeat or replication) confirms leader liveness.
+        // Reset election timeout before log-matching checks so followers don't start
+        // elections while the leader is actively backtracking next_index.
         self.last_leader_contact = Instant::now();
         self.leader_id = Some(req.leader_id);
 
@@ -553,13 +581,7 @@ impl RaftNode {
             self.state = RaftState::Follower;
         }
 
-        // Enforce Raft log matching property (best-effort with in-memory index/term state):
-        // reject appends whose declared prev_log does not align with our local log tail.
-        // This prevents stale leaders from rolling followers backward via blind success.
-        if req.prev_log_index == self.last_log_index
-            && req.prev_log_index > 0
-            && req.prev_log_term != self.last_log_term
-        {
+        if req.prev_log_index > self.last_log_index {
             return AppendEntriesResponse {
                 term: self.current_term,
                 success: false,
@@ -567,6 +589,21 @@ impl RaftNode {
                 follower_hlc: self.hlc.now(),
                 follower_id: self.node_id,
             };
+        }
+
+        if let Some(first_entry) = req.entries.first() {
+            // Reject out-of-order appends that do not start immediately after prev_log_index.
+            // This prevents accepting index gaps when concurrent replication RPCs arrive
+            // out-of-order on followers.
+            if first_entry.index != req.prev_log_index + 1 {
+                return AppendEntriesResponse {
+                    term: self.current_term,
+                    success: false,
+                    match_index: self.last_log_index,
+                    follower_hlc: self.hlc.now(),
+                    follower_id: self.node_id,
+                };
+            }
         }
 
         // Advance log index based on the actual entries received.
@@ -938,6 +975,9 @@ impl RaftNode {
 
         // Update the peer's match_index
         self.match_index.insert(peer_id, match_index);
+        // Successful replication means next probe can start after the acknowledged index.
+        self.next_index
+            .insert(peer_id, match_index.saturating_add(1));
 
         // Advance commit_index if a majority of peers have replicated up to some index N
         // Raft §5.3: Only commit entries from current term
@@ -966,6 +1006,42 @@ impl RaftNode {
         } else {
             None
         }
+    }
+
+    /// Return the leader-side replication cursor for a peer.
+    ///
+    /// If no cursor exists yet, default to `last_log_index + 1` per Raft §5.3.
+    pub fn next_index_for_peer(&self, peer_id: u16) -> Option<u64> {
+        if self.state != RaftState::Leader {
+            return None;
+        }
+
+        Some(
+            self.next_index
+                .get(&peer_id)
+                .copied()
+                .unwrap_or(self.last_log_index.saturating_add(1)),
+        )
+    }
+
+    /// Back off the peer replication cursor after a rejection.
+    ///
+    /// Followers report their local `match_index` on failure. We clamp to that
+    /// hint and never increase the cursor here.
+    pub fn backoff_next_index(&mut self, peer_id: u16, follower_match_index: u64) -> Option<u64> {
+        if self.state != RaftState::Leader {
+            return None;
+        }
+
+        let current = self
+            .next_index
+            .get(&peer_id)
+            .copied()
+            .unwrap_or(self.last_log_index.saturating_add(1));
+        let suggested = follower_match_index.saturating_add(1).max(1);
+        let new_next = current.min(suggested);
+        self.next_index.insert(peer_id, new_next);
+        Some(new_next)
     }
 
     /// Get the current commit index.

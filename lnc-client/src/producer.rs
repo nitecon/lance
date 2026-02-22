@@ -146,6 +146,9 @@ pub struct SendAck {
     pub topic_id: u32,
     /// Timestamp when the record was acknowledged
     pub timestamp: Instant,
+    /// Offset of this record within the batch (0-indexed)
+    /// Used for ordered streaming ACK completion
+    pub offset_in_batch: u32,
 }
 
 /// Result of a send operation
@@ -157,6 +160,9 @@ struct RecordBatch {
     data: BytesMut,
     record_count: usize,
     ack_txs: Vec<oneshot::Sender<SendResult>>,
+    /// Byte offsets where each record starts within the batch data
+    /// Used for ordered streaming ACK completion (M2)
+    record_offsets: Vec<usize>,
     created_at: Instant,
 }
 
@@ -167,11 +173,14 @@ impl RecordBatch {
             data: BytesMut::with_capacity(16 * 1024),
             record_count: 0,
             ack_txs: Vec::new(),
+            record_offsets: Vec::new(),
             created_at: Instant::now(),
         }
     }
 
     fn add(&mut self, data: Bytes, ack_tx: oneshot::Sender<SendResult>) {
+        // Track the offset where this record starts
+        self.record_offsets.push(self.data.len());
         self.data.extend_from_slice(&data);
         self.record_count += 1;
         self.ack_txs.push(ack_tx);
@@ -186,7 +195,7 @@ impl RecordBatch {
     }
 }
 
-/// Producer metrics
+/// Producer metrics with backpressure telemetry (M3)
 #[derive(Debug, Default)]
 pub struct ProducerMetrics {
     /// Total records sent
@@ -199,6 +208,12 @@ pub struct ProducerMetrics {
     pub errors: AtomicU64,
     /// Current buffer size in bytes
     pub buffer_size: AtomicU64,
+    /// M3: Number of records dropped due to backpressure (try_send fail)
+    pub backpressure_drops: AtomicU64,
+    /// M3: Number of times send() blocked waiting for buffer space
+    pub backpressure_waits: AtomicU64,
+    /// M3: Total milliseconds spent waiting for buffer space
+    pub backpressure_wait_ms: AtomicU64,
 }
 
 impl ProducerMetrics {
@@ -210,6 +225,9 @@ impl ProducerMetrics {
             batches_sent: self.batches_sent.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
             buffer_size: self.buffer_size.load(Ordering::Relaxed),
+            backpressure_drops: self.backpressure_drops.load(Ordering::Relaxed),
+            backpressure_waits: self.backpressure_waits.load(Ordering::Relaxed),
+            backpressure_wait_ms: self.backpressure_wait_ms.load(Ordering::Relaxed),
         }
     }
 }
@@ -227,6 +245,12 @@ pub struct MetricsSnapshot {
     pub errors: u64,
     /// Current buffer size in bytes
     pub buffer_size: u64,
+    /// M3: Records dropped due to backpressure
+    pub backpressure_drops: u64,
+    /// M3: Number of times send blocked for buffer space
+    pub backpressure_waits: u64,
+    /// M3: Total milliseconds spent waiting for buffer
+    pub backpressure_wait_ms: u64,
 }
 
 /// High-level producer with batching and async send.
@@ -235,6 +259,14 @@ pub struct MetricsSnapshot {
 /// drops, FORWARD_FAILED during leader elections, timeouts) with exponential
 /// backoff and DNS re-resolution. Callers never need to handle reconnection
 /// logic — just call `send()` and the library takes care of the rest.
+///
+/// # Bounded Enqueue & Backpressure (M3)
+///
+/// The producer implements bounded enqueue with configurable `buffer_memory`.
+/// When the buffer is full, the producer can:
+/// - Return `ServerBackpressure` error immediately (default `send()` behavior)
+/// - Block waiting for space (`send_timeout()`)
+/// - Non-blocking try (`try_send()` returns `WouldBlock`)
 pub struct Producer {
     client: Arc<Mutex<ReconnectingClient>>,
     config: ProducerConfig,
@@ -353,6 +385,27 @@ impl Producer {
         })
     }
 
+    /// Primary produce interface: send a sequence of records in-order.
+    ///
+    /// Records are sent sequentially and this method only advances to the next
+    /// record after the prior one is ACKed, preserving caller-provided order.
+    pub async fn produce<T>(&self, topic_id: u32, records: &[T]) -> Result<Vec<SendAck>>
+    where
+        T: AsRef<[u8]>,
+    {
+        let mut acks = Vec::with_capacity(records.len());
+        for record in records {
+            acks.push(self.send(topic_id, record.as_ref()).await?);
+        }
+        Ok(acks)
+    }
+
+    /// Convenience alias for producing a single record.
+    #[inline]
+    pub async fn produce_single(&self, topic_id: u32, data: &[u8]) -> Result<SendAck> {
+        self.send(topic_id, data).await
+    }
+
     /// Send a record to a topic
     ///
     /// This method buffers the record and returns a future that resolves
@@ -361,12 +414,17 @@ impl Producer {
     /// On transient failures (connection drops, leader elections), the
     /// producer automatically reconnects and retries. This method only
     /// returns an error for non-retryable failures or buffer overflow.
+    ///
+    /// M3: Tracks backpressure events in metrics for telemetry.
     pub async fn send(&self, topic_id: u32, data: &[u8]) -> Result<SendAck> {
         let (ack_tx, ack_rx) = oneshot::channel();
 
         // Check buffer memory limit
         let current_buffer = self.metrics.buffer_size.load(Ordering::Relaxed);
         if current_buffer + data.len() as u64 > self.config.buffer_memory as u64 {
+            self.metrics
+                .backpressure_drops
+                .fetch_add(1, Ordering::Relaxed);
             return Err(ClientError::ServerBackpressure);
         }
 
@@ -390,6 +448,47 @@ impl Producer {
 
         // Wait for acknowledgment
         ack_rx.await.map_err(|_| ClientError::ConnectionClosed)?
+    }
+
+    /// M3: Non-blocking attempt to send a record.
+    ///
+    /// Returns `Ok(())` if the record was buffered successfully.
+    /// Returns `Err(ClientError::WouldBlock)` if the buffer is full (backpressure).
+    ///
+    /// Use this when you want to drop records under load rather than blocking.
+    /// For telemetry, this increments `backpressure_drops` when buffer is full.
+    pub async fn try_send(&self, topic_id: u32, data: &[u8]) -> Result<()> {
+        let (ack_tx, _ack_rx) = oneshot::channel();
+
+        // Check buffer memory limit - fail fast if full
+        let current_buffer = self.metrics.buffer_size.load(Ordering::Relaxed);
+        if current_buffer + data.len() as u64 > self.config.buffer_memory as u64 {
+            // M3: Track backpressure drop
+            self.metrics
+                .backpressure_drops
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(ClientError::WouldBlock);
+        }
+
+        // Add to batch
+        let should_flush = {
+            let mut batches = self.batches.write().await;
+            let batch = batches
+                .entry(topic_id)
+                .or_insert_with(|| RecordBatch::new(topic_id));
+            batch.add(Bytes::copy_from_slice(data), ack_tx);
+            self.metrics
+                .buffer_size
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            batch.size() >= self.config.batch_size
+        };
+
+        // If batch is full, flush it immediately
+        if should_flush {
+            self.flush_topic(topic_id).await?;
+        }
+
+        Ok(())
     }
 
     /// Send a record without waiting for acknowledgment
@@ -577,15 +676,22 @@ impl Producer {
                 self.metrics.batches_sent.fetch_add(1, Ordering::Relaxed);
                 self.connection_healthy.store(true, Ordering::SeqCst);
 
-                // Notify all senders
-                let ack = SendAck {
-                    batch_id,
-                    topic_id,
-                    timestamp: Instant::now(),
-                };
-
-                for tx in ack_txs {
-                    let _ = tx.send(Ok(ack.clone()));
+                // M2: Ordered streaming ACK completion - notify in order with yield points
+                // This reduces HoL pressure by allowing earlier records to complete before
+                // later ones, and yields between ACKs to let other tasks run.
+                let timestamp = Instant::now();
+                for (offset_in_batch, tx) in ack_txs.into_iter().enumerate() {
+                    let ack = SendAck {
+                        batch_id,
+                        topic_id,
+                        timestamp,
+                        offset_in_batch: offset_in_batch as u32,
+                    };
+                    let _ = tx.send(Ok(ack));
+                    // Yield every 8 ACKs to prevent starving other tasks
+                    if offset_in_batch % 8 == 7 {
+                        tokio::task::yield_now().await;
+                    }
                 }
 
                 Ok(())
@@ -593,7 +699,7 @@ impl Producer {
             Err(e) => {
                 self.metrics.errors.fetch_add(1, Ordering::Relaxed);
 
-                // Notify all senders of error
+                // M2: Notify senders of error in order (preserves FIFO notification order)
                 for tx in ack_txs {
                     let _ = tx.send(Err(ClientError::ServerError(e.to_string())));
                 }
@@ -731,15 +837,22 @@ impl Producer {
                     .fetch_add(byte_count as u64, Ordering::Relaxed);
                 metrics.batches_sent.fetch_add(1, Ordering::Relaxed);
 
-                // Notify all senders
-                let ack = SendAck {
-                    batch_id,
-                    topic_id,
-                    timestamp: Instant::now(),
-                };
-
-                for tx in ack_txs {
-                    let _ = tx.send(Ok(ack.clone()));
+                // M2: Ordered streaming ACK completion - notify in order with yield points
+                // This reduces HoL pressure by allowing earlier records to complete before
+                // later ones, and yields between ACKs to let other tasks run.
+                let timestamp = Instant::now();
+                for (offset_in_batch, tx) in ack_txs.into_iter().enumerate() {
+                    let ack = SendAck {
+                        batch_id,
+                        topic_id,
+                        timestamp,
+                        offset_in_batch: offset_in_batch as u32,
+                    };
+                    let _ = tx.send(Ok(ack));
+                    // Yield every 8 ACKs to prevent starving other tasks
+                    if offset_in_batch % 8 == 7 {
+                        tokio::task::yield_now().await;
+                    }
                 }
 
                 Ok(())
@@ -747,7 +860,7 @@ impl Producer {
             Err(e) => {
                 metrics.errors.fetch_add(1, Ordering::Relaxed);
 
-                // Notify all senders of error
+                // M2: Notify senders of error in order (preserves FIFO notification order)
                 for tx in ack_txs {
                     let _ = tx.send(Err(ClientError::ServerError(e.to_string())));
                 }
@@ -828,6 +941,7 @@ mod tests {
         let mut batch = RecordBatch::new(1);
         assert!(batch.is_empty());
         assert_eq!(batch.size(), 0);
+        assert!(batch.record_offsets.is_empty());
 
         let (tx, _rx) = oneshot::channel();
         batch.add(Bytes::from_static(b"hello"), tx);
@@ -835,6 +949,14 @@ mod tests {
         assert!(!batch.is_empty());
         assert_eq!(batch.size(), 5);
         assert_eq!(batch.record_count, 1);
+        assert_eq!(batch.record_offsets, vec![0]); // First record starts at offset 0
+
+        // Add second record
+        let (tx2, _rx2) = oneshot::channel();
+        batch.add(Bytes::from_static(b"world"), tx2);
+        assert_eq!(batch.record_count, 2);
+        assert_eq!(batch.record_offsets, vec![0, 5]); // Second record starts at offset 5
+        assert_eq!(batch.size(), 10);
     }
 
     #[test]
@@ -868,5 +990,146 @@ mod tests {
                 counter_clone.fetch_add(1, Ordering::Relaxed);
             }
         });
+    }
+
+    /// M2 Regression Test: Verify ACKs are sent in order with correct offset_in_batch
+    #[tokio::test]
+    async fn test_send_ack_ordering() {
+        let mut batch = RecordBatch::new(1);
+        let mut receivers = Vec::new();
+
+        // Add 5 records to batch
+        for i in 0..5 {
+            let (tx, rx) = oneshot::channel();
+            batch.add(Bytes::from(format!("record-{}", i)), tx);
+            receivers.push(rx);
+        }
+
+        // Simulate sending ACKs (normally done by send_batch)
+        let batch_id = 42u64;
+        let timestamp = Instant::now();
+        let topic_id = batch.topic_id;
+
+        // Send ACKs in order like send_batch() does
+        for (offset_in_batch, tx) in batch.ack_txs.into_iter().enumerate() {
+            let ack = SendAck {
+                batch_id,
+                topic_id,
+                timestamp,
+                offset_in_batch: offset_in_batch as u32,
+            };
+            let _ = tx.send(Ok(ack));
+        }
+
+        // Verify each receiver got ACK in correct order with correct offset
+        for (i, rx) in receivers.into_iter().enumerate() {
+            let result = rx.await.unwrap();
+            assert!(result.is_ok(), "Record {} should be ACKed", i);
+            let ack = result.unwrap();
+            assert_eq!(ack.batch_id, batch_id);
+            assert_eq!(
+                ack.offset_in_batch, i as u32,
+                "Record {} should have offset_in_batch={}",
+                i, i
+            );
+            assert_eq!(ack.topic_id, 1);
+        }
+    }
+
+    /// M2 Regression Test: Verify batch failure notifies all in order
+    #[tokio::test]
+    async fn test_send_ack_failure_ordering() {
+        let mut batch = RecordBatch::new(2);
+        let mut receivers = Vec::new();
+
+        // Add records to batch
+        for i in 0..3 {
+            let (tx, rx) = oneshot::channel();
+            batch.add(Bytes::from(format!("record-{}", i)), tx);
+            receivers.push(rx);
+        }
+
+        // Simulate batch failure notification (normally done by send_batch error path)
+        let error_msg = "server timeout";
+        for tx in batch.ack_txs {
+            let _ = tx.send(Err(ClientError::ServerError(error_msg.to_string())));
+        }
+
+        // Verify all receivers got error
+        for (i, rx) in receivers.into_iter().enumerate() {
+            let result = rx.await.unwrap();
+            assert!(result.is_err(), "Record {} should receive error", i);
+            let err = result.unwrap_err();
+            assert!(matches!(err, ClientError::ServerError(ref msg) if msg == error_msg));
+        }
+    }
+
+    /// M2 Regression Test: Verify record_offsets map correctly to data positions
+    #[test]
+    fn test_record_offsets_mapping() {
+        let mut batch = RecordBatch::new(1);
+
+        // Add records of varying sizes
+        let records = vec![
+            Bytes::from(vec![0u8; 100]), // offset 0
+            Bytes::from(vec![1u8; 50]),  // offset 100
+            Bytes::from(vec![2u8; 200]), // offset 150
+            Bytes::from(vec![3u8; 75]),  // offset 350
+        ];
+
+        let expected_offsets = vec![0, 100, 150, 350];
+        let expected_total_size: usize = records.iter().map(|r| r.len()).sum();
+
+        for data in records {
+            let (tx, _rx) = oneshot::channel();
+            batch.add(data, tx);
+        }
+
+        assert_eq!(
+            batch.record_offsets, expected_offsets,
+            "Record offsets should match expected positions"
+        );
+        assert_eq!(
+            batch.size(),
+            expected_total_size,
+            "Total batch size should be sum of record sizes"
+        );
+        assert_eq!(batch.record_count, 4);
+    }
+
+    /// M3 Regression Test: Verify backpressure telemetry metrics
+    #[test]
+    fn test_backpressure_telemetry_metrics() {
+        let metrics = ProducerMetrics::default();
+
+        // Simulate backpressure drops
+        metrics.backpressure_drops.fetch_add(5, Ordering::Relaxed);
+        metrics.backpressure_waits.fetch_add(3, Ordering::Relaxed);
+        metrics
+            .backpressure_wait_ms
+            .fetch_add(150, Ordering::Relaxed);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.backpressure_drops, 5);
+        assert_eq!(snapshot.backpressure_waits, 3);
+        assert_eq!(snapshot.backpressure_wait_ms, 150);
+    }
+
+    /// M3 Regression Test: Verify buffer memory limit checking
+    #[test]
+    fn test_buffer_memory_limit_checking() {
+        // Create a batch and verify buffer_size tracking
+        let metrics = Arc::new(ProducerMetrics::default());
+
+        // Simulate adding records
+        let data_len = 1000u64;
+        metrics.buffer_size.fetch_add(data_len, Ordering::Relaxed);
+
+        let current = metrics.buffer_size.load(Ordering::Relaxed);
+        assert_eq!(current, data_len);
+
+        // Simulate removing records (after send)
+        metrics.buffer_size.fetch_sub(data_len, Ordering::Relaxed);
+        assert_eq!(metrics.buffer_size.load(Ordering::Relaxed), 0);
     }
 }

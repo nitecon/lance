@@ -5,6 +5,7 @@
 #   VERSION     - Version tag (default: from Cargo.toml)
 #   BUILD_MODE  - "release" (default) or "debug" for dev builds
 #   FEATURES    - Additional cargo features to enable
+#   CARGO_BUILD_JOBS - Cargo parallel jobs inside Docker build (default: 1)
 #
 # Examples:
 #   docker build -t lance .                                    # Production build
@@ -17,6 +18,7 @@
 ARG VERSION=latest
 ARG BUILD_MODE=release
 ARG FEATURES=""
+ARG CARGO_BUILD_JOBS=1
 
 # =============================================================================
 # Stage 1: Builder
@@ -25,14 +27,25 @@ FROM rust:1.85-bookworm AS builder
 
 ARG BUILD_MODE
 ARG FEATURES
+ARG CARGO_BUILD_JOBS
+
+# Keep Dockerized release builds memory-stable under Colima/QEMU.
+# The local benchmark binaries are still built natively in build.sh.
+ENV CARGO_PROFILE_RELEASE_LTO=false
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+ENV CARGO_PROFILE_RELEASE_OPT_LEVEL=2
+ENV CMAKE_BUILD_PARALLEL_LEVEL=1
 
 WORKDIR /build
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     cmake \
+    clang \
     libclang-dev \
     && rm -rf /var/lib/apt/lists/*
+
+ENV CC=clang
 
 # Copy entire project
 COPY . .
@@ -40,15 +53,15 @@ COPY . .
 # Build based on mode
 RUN if [ "$BUILD_MODE" = "debug" ]; then \
         if [ -n "$FEATURES" ]; then \
-            cargo build --package lance --features "$FEATURES"; \
+            cargo build -j "$CARGO_BUILD_JOBS" --package lance --features "$FEATURES"; \
         else \
-            cargo build --package lance; \
+            cargo build -j "$CARGO_BUILD_JOBS" --package lance; \
         fi \
     else \
         if [ -n "$FEATURES" ]; then \
-            cargo build --release --package lance --features "$FEATURES"; \
+            cargo build -j "$CARGO_BUILD_JOBS" --release --package lance --features "$FEATURES"; \
         else \
-            cargo build --release --package lance; \
+            cargo build -j "$CARGO_BUILD_JOBS" --release --package lance; \
         fi \
     fi
 

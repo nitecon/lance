@@ -27,8 +27,9 @@ $script:Processes = @()
 $BasePort = 1992
 $BaseMetricsPort = 9090
 $BaseHealthPort = 8080
-$DataDirBase = "$PSScriptRoot\..\test-data"
-$LogDir = "$PSScriptRoot\..\test-logs"
+$ArtifactsDir = "$PSScriptRoot\..\.cassa_artifacts"
+$DataDirBase = "$ArtifactsDir\test-data"
+$LogDir = "$ArtifactsDir\test-logs"
 $ProjectDir = "$PSScriptRoot\.."
 
 # Determine test mode

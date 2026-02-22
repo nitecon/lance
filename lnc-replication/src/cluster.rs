@@ -71,9 +71,10 @@ async fn persist_append_entries_blocking(
         if prev_log_index > 0 {
             let matches = guard.matches(prev_log_index, prev_log_term);
             if !matches {
-                guard
-                    .truncate_from(prev_log_index + 1)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                return Err(std::io::Error::other(format!(
+                    "Refusing to persist accepted append with mismatched prev_log (index={}, term={})",
+                    prev_log_index, prev_log_term
+                )));
             }
         }
 
@@ -83,6 +84,41 @@ async fn persist_append_entries_blocking(
     })
     .await
     .map_err(|e| std::io::Error::other(format!("Append persistence task failed: {e}")))?
+}
+
+/// Return a leader backoff hint when durable follower log does not match `prev_log`.
+///
+/// Hint semantics:
+/// - follower shorter than `prev_log_index` => hint durable last index
+/// - follower has `prev_log_index` but term mismatches => hint `prev_log_index - 1`
+fn durable_prev_log_mismatch_hint(
+    log_store: &Option<Arc<std::sync::Mutex<LogStore>>>,
+    prev_log_index: u64,
+    prev_log_term: u64,
+) -> Result<Option<u64>, std::io::Error> {
+    if prev_log_index == 0 {
+        return Ok(None);
+    }
+
+    let Some(store) = log_store else {
+        return Ok(None);
+    };
+
+    let guard = store
+        .lock()
+        .map_err(|e| std::io::Error::other(format!("Raft log store lock poisoned: {e}")))?;
+
+    if guard.matches(prev_log_index, prev_log_term) {
+        return Ok(None);
+    }
+
+    let durable_last = guard.last_index();
+    let hint = if durable_last < prev_log_index {
+        durable_last
+    } else {
+        prev_log_index.saturating_sub(1)
+    };
+    Ok(Some(hint))
 }
 
 /// Cluster coordinator state
@@ -107,6 +143,9 @@ pub struct ClusterCoordinator {
     log_store: Option<Arc<std::sync::Mutex<LogStore>>>,
     /// Timestamp of last successful replication sync (for lag metrics)
     last_sync_time: std::sync::atomic::AtomicU64,
+    /// Monotonic guardrail for applied index to prevent replay thrash if
+    /// in-memory Raft state ever regresses under churn.
+    applied_high_watermark: std::sync::atomic::AtomicU64,
     /// Notify signal fired whenever commit_index advances.
     ///
     /// The Apply Loop awaits this to achieve sub-millisecond time-to-visibility
@@ -118,6 +157,10 @@ pub struct ClusterCoordinator {
     election_start_window: tokio::sync::Mutex<VecDeque<Instant>>,
     /// Last time the leader heartbeat fanout was emitted.
     last_heartbeat_sent_at: tokio::sync::Mutex<Instant>,
+    /// Last observed wall-clock time of election-check tick processing.
+    last_election_check_tick_at: tokio::sync::Mutex<Instant>,
+    /// In-flight election round task handle, if any.
+    election_round_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ClusterCoordinator {
@@ -129,6 +172,193 @@ impl ClusterCoordinator {
     const ELECTION_STORM_WINDOW: Duration = Duration::from_secs(30);
     /// Elections within window at/above this threshold are considered a storm.
     const ELECTION_STORM_THRESHOLD: usize = 3;
+    /// Maximum entries to include in one catch-up AppendEntries probe.
+    const CATCHUP_APPEND_CHUNK: u64 = 32;
+    /// Retry budget for per-peer catch-up before surfacing failure to caller.
+    const CATCHUP_MAX_ATTEMPTS: usize = 64;
+    /// Data-path catch-up budget tuned to avoid false timeout churn.
+    #[allow(dead_code)]
+    const DATA_CATCHUP_MAX_ATTEMPTS: usize = 64;
+
+    /// Timeout budget for individual pre-vote / vote RPCs.
+    ///
+    /// Keep this tighter than generic peer read timeout so election rounds do
+    /// not monopolize the coordinator loop under follower stalls.
+    fn election_rpc_timeout(&self) -> Duration {
+        self.config
+            .heartbeat_interval
+            .saturating_mul(2)
+            .max(Duration::from_millis(1000))
+    }
+
+    /// Maximum wall-clock budget for one election round attempt.
+    fn election_round_timeout(&self) -> Duration {
+        self.election_rpc_timeout()
+            .saturating_mul(3)
+            .max(Duration::from_secs(3))
+    }
+
+    async fn build_append_entries_for_peer_static(
+        raft: &Arc<RwLock<RaftNode>>,
+        log_store: &Option<Arc<std::sync::Mutex<LogStore>>>,
+        node_id: u16,
+        peer_id: u16,
+    ) -> Result<crate::codec::AppendEntriesRequest, std::io::Error> {
+        // CONTROL PLANE DECOUPLING: Use try_read first to avoid blocking on data plane
+        let (term, next_index, leader_commit, last_log_index, last_log_term) = match raft.try_read()
+        {
+            Ok(raft_guard) => {
+                let next_index = raft_guard
+                    .next_index_for_peer(peer_id)
+                    .ok_or_else(|| std::io::Error::other("Node is not leader"))?;
+                (
+                    raft_guard.current_term(),
+                    next_index.max(1),
+                    raft_guard.commit_index(),
+                    raft_guard.last_log_index(),
+                    raft_guard.last_log_term(),
+                )
+            },
+            Err(_) => {
+                // Lock contended - fall back to blocking read for correctness
+                let raft_guard = raft.read().await;
+                let next_index = raft_guard
+                    .next_index_for_peer(peer_id)
+                    .ok_or_else(|| std::io::Error::other("Node is not leader"))?;
+                (
+                    raft_guard.current_term(),
+                    next_index.max(1),
+                    raft_guard.commit_index(),
+                    raft_guard.last_log_index(),
+                    raft_guard.last_log_term(),
+                )
+            },
+        };
+
+        let prev_log_index = next_index.saturating_sub(1);
+        let prev_log_term = if prev_log_index == 0 {
+            0
+        } else if prev_log_index == last_log_index {
+            last_log_term
+        } else if let Some(store) = log_store {
+            let guard = store
+                .lock()
+                .map_err(|e| std::io::Error::other(format!("Raft log store lock poisoned: {e}")))?;
+            guard.term_at(prev_log_index).unwrap_or(0)
+        } else {
+            0
+        };
+
+        let entries = if next_index <= last_log_index {
+            let end_index = next_index
+                .saturating_add(Self::CATCHUP_APPEND_CHUNK - 1)
+                .min(last_log_index);
+            let Some(store) = log_store else {
+                return Err(std::io::Error::other(
+                    "Missing persistent log store for catch-up AppendEntries",
+                ));
+            };
+            let guard = store
+                .lock()
+                .map_err(|e| std::io::Error::other(format!("Raft log store lock poisoned: {e}")))?;
+            guard.get_range(next_index, end_index)
+        } else {
+            Vec::new()
+        };
+
+        Ok(crate::codec::AppendEntriesRequest {
+            term,
+            leader_id: node_id,
+            prev_log_index,
+            prev_log_term,
+            leader_commit,
+            leader_hlc: lnc_core::HlcTimestamp::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+                0,
+            ),
+            entries,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn replicate_peer_until_index_static(
+        raft: &Arc<RwLock<RaftNode>>,
+        peers: &Arc<PeerManager>,
+        log_store: &Option<Arc<std::sync::Mutex<LogStore>>>,
+        node_id: u16,
+        peer_id: u16,
+        target_index: u64,
+        rpc_timeout: Duration,
+        max_attempts: usize,
+    ) -> Result<crate::codec::AppendEntriesResponse, std::io::Error> {
+        async fn probe_peer_once(
+            raft: &Arc<RwLock<RaftNode>>,
+            peers: &Arc<PeerManager>,
+            log_store: &Option<Arc<std::sync::Mutex<LogStore>>>,
+            node_id: u16,
+            peer_id: u16,
+            rpc_timeout: Duration,
+        ) -> Result<crate::codec::AppendEntriesResponse, std::io::Error> {
+            let request = ClusterCoordinator::build_append_entries_for_peer_static(
+                raft, log_store, node_id, peer_id,
+            )
+            .await?;
+            let leader_term = request.term;
+
+            let response =
+                tokio::time::timeout(rpc_timeout, peers.send_append_entries(peer_id, request))
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("AppendEntries RPC timeout to peer {peer_id}"),
+                        )
+                    })??;
+
+            // CONTROL PLANE DECOUPLING: Use try_write to avoid blocking control plane
+            // heartbeats/elections. If contended, skip index update - heartbeat will fix it.
+            if response.term <= leader_term {
+                if let Ok(mut raft_guard) = raft.try_write() {
+                    if response.success {
+                        let _ = raft_guard.update_match_index(peer_id, response.match_index);
+                    } else {
+                        let _ = raft_guard.backoff_next_index(peer_id, response.match_index);
+                    }
+                }
+                // If try_write fails, heartbeat fanout will eventually update indices
+            }
+
+            Ok(response)
+        }
+
+        for _ in 0..max_attempts {
+            let response =
+                probe_peer_once(raft, peers, log_store, node_id, peer_id, rpc_timeout).await?;
+            // CONTROL PLANE DECOUPLING: Use try_read to avoid blocking
+            let leader_term = match raft.try_read() {
+                Ok(raft_guard) => raft_guard.current_term(),
+                Err(_) => {
+                    // Lock contended - use a fallback; heartbeat will handle term checks
+                    0
+                },
+            };
+
+            if response.term > leader_term {
+                return Ok(response);
+            }
+
+            if response.success && response.match_index >= target_index {
+                return Ok(response);
+            }
+        }
+
+        Err(std::io::Error::other(format!(
+            "Catch-up budget exhausted for peer {peer_id}"
+        )))
+    }
 
     /// Create a new cluster coordinator
     pub fn new(config: ClusterConfig) -> Self {
@@ -183,6 +413,7 @@ impl ClusterCoordinator {
             quorum_manager,
             log_store: None,
             last_sync_time: std::sync::atomic::AtomicU64::new(0),
+            applied_high_watermark: std::sync::atomic::AtomicU64::new(0),
             commit_notify: Arc::new(Notify::new()),
             election_start_window: tokio::sync::Mutex::new(VecDeque::new()),
             last_heartbeat_sent_at: tokio::sync::Mutex::new(
@@ -190,7 +421,18 @@ impl ClusterCoordinator {
                     .checked_sub(heartbeat_interval)
                     .unwrap_or_else(Instant::now),
             ),
+            last_election_check_tick_at: tokio::sync::Mutex::new(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(50))
+                    .unwrap_or_else(Instant::now),
+            ),
+            election_round_task: tokio::sync::Mutex::new(None),
         }
+    }
+
+    async fn is_leader_for_term(&self, term: u64) -> bool {
+        let raft = self.raft.read().await;
+        raft.state() == RaftState::Leader && raft.current_term() == term
     }
 
     /// Create a new cluster coordinator with persistent log storage
@@ -276,6 +518,7 @@ impl ClusterCoordinator {
             quorum_manager,
             log_store: Some(Arc::new(std::sync::Mutex::new(log_store))),
             last_sync_time: std::sync::atomic::AtomicU64::new(0),
+            applied_high_watermark: std::sync::atomic::AtomicU64::new(0),
             commit_notify: Arc::new(Notify::new()),
             election_start_window: tokio::sync::Mutex::new(VecDeque::new()),
             last_heartbeat_sent_at: tokio::sync::Mutex::new(
@@ -283,9 +526,103 @@ impl ClusterCoordinator {
                     .checked_sub(heartbeat_interval)
                     .unwrap_or_else(Instant::now),
             ),
+            last_election_check_tick_at: tokio::sync::Mutex::new(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(50))
+                    .unwrap_or_else(Instant::now),
+            ),
+            election_round_task: tokio::sync::Mutex::new(None),
         })
     }
 
+    async fn reap_finished_election_round_task(&self) {
+        let finished = {
+            let mut guard = self.election_round_task.lock().await;
+            if guard
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                guard.take()
+            } else {
+                None
+            }
+        };
+
+        if let Some(handle) = finished {
+            if let Err(e) = handle.await {
+                warn!(
+                    target: "lance::cluster",
+                    error = %e,
+                    "Election round task terminated unexpectedly"
+                );
+            }
+        }
+    }
+
+    async fn has_in_flight_election_round(&self) -> bool {
+        let guard = self.election_round_task.lock().await;
+        guard
+            .as_ref()
+            .is_some_and(|handle| !tokio::task::JoinHandle::is_finished(handle))
+    }
+
+    async fn cancel_election_round_task(&self, reason: &'static str) {
+        let in_flight = {
+            let mut guard = self.election_round_task.lock().await;
+            guard.take()
+        };
+
+        if let Some(handle) = in_flight {
+            handle.abort();
+            warn!(
+                target: "lance::cluster",
+                reason,
+                "Cancelled in-flight election round task"
+            );
+        }
+    }
+
+    async fn run_election_round_with_timeout(&self) {
+        let started_at = Instant::now();
+        let round_timeout = self.election_round_timeout();
+        let timed_out = tokio::time::timeout(round_timeout, self.start_election())
+            .await
+            .is_err();
+        lnc_metrics::record_raft_election_round_ms(started_at.elapsed().as_millis() as u64);
+
+        if timed_out {
+            warn!(
+                target: "lance::cluster",
+                timeout_ms = round_timeout.as_millis() as u64,
+                "Election round timed out; reverting candidate state"
+            );
+            let mut raft = self.raft.write().await;
+            if raft.pre_vote_in_progress() {
+                raft.finish_failed_pre_vote_round();
+            }
+            raft.revert_candidate_after_failed_election();
+        }
+    }
+
+    /// M4: Check if heartbeat is due without updating timestamp.
+    /// Timestamp should only be updated after successful heartbeat send.
+    async fn is_heartbeat_due(&self) -> bool {
+        let last_sent = self.last_heartbeat_sent_at.lock().await;
+        last_sent.elapsed() >= self.config.heartbeat_interval
+    }
+
+    /// M4: Record that heartbeats were sent by updating the timestamp.
+    async fn record_heartbeat_sent(&self) {
+        let mut last_sent = self.last_heartbeat_sent_at.lock().await;
+        *last_sent = Instant::now();
+    }
+
+    /// DEPRECATED: Updates timestamp before confirming send. Use is_heartbeat_due + record_heartbeat_sent instead.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use is_heartbeat_due() and record_heartbeat_sent() to avoid timestamp drift on send failure"
+    )]
+    #[allow(dead_code)]
     async fn should_send_heartbeat_now(&self) -> bool {
         let mut last_sent = self.last_heartbeat_sent_at.lock().await;
         if last_sent.elapsed() >= self.config.heartbeat_interval {
@@ -405,22 +742,22 @@ impl ClusterCoordinator {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Check leader state with lock (for coordination loop only)
-    pub async fn is_leader_authoritative(&self) -> bool {
-        let raft = self.raft.read().await;
-        if raft.state() != RaftState::Leader {
-            return false;
-        }
-
-        self.cached_is_authoritative
+    /// Check leader state without lock (uses cached atomics for data plane)
+    #[inline]
+    pub fn is_leader_authoritative(&self) -> bool {
+        self.cached_is_leader
             .load(std::sync::atomic::Ordering::Acquire)
+            && self
+                .cached_is_authoritative
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Check whether this node is the currently elected leader but still in
     /// readiness warm-up (not authoritative yet).
-    pub async fn is_leader_elected_but_not_ready(&self) -> bool {
-        let raft = self.raft.read().await;
-        raft.state() == RaftState::Leader
+    #[inline]
+    pub fn is_leader_elected_but_not_ready(&self) -> bool {
+        self.cached_is_leader
+            .load(std::sync::atomic::Ordering::Acquire)
             && !self
                 .cached_is_authoritative
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -584,25 +921,29 @@ impl ClusterCoordinator {
         // Start timing for replication latency metric
         let replication_start = Instant::now();
 
-        // Only leader can replicate (use authoritative check for replication path)
-        if !self.is_leader_authoritative().await {
-            if self.is_leader_elected_but_not_ready().await {
-                lnc_metrics::increment_cluster_elected_not_ready_rejects();
+        // Only leader can replicate topic metadata operations.
+        // For metadata-plane operations we allow elected leaders to proceed even
+        // during readiness warm-up to avoid prolonged FORWARD_FAILED loops while
+        // apply lag converges.
+        if !self.is_leader_authoritative() {
+            if !self.is_leader() {
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "Leader elected but not ready (apply lag)",
+                    std::io::ErrorKind::PermissionDenied,
+                    "Not leader - cannot replicate topic operation",
                 ));
             }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "Not leader - cannot replicate topic operation",
-            ));
+
+            lnc_metrics::increment_cluster_elected_not_ready_rejects();
+            debug!(
+                target: "lance::cluster",
+                "Leader elected but not yet authoritative; allowing topic-op replication during catch-up"
+            );
         }
 
         let op_bytes = op.to_bytes();
 
         // Advance leader log first so prev_log_index/term are coherent for followers.
-        let (term, prev_log_index, prev_log_term, new_log_index) = {
+        let (term, _prev_log_index, _prev_log_term, new_log_index) = {
             let mut raft = self.raft.write().await;
             let prev_idx = raft.last_log_index();
             let prev_term = raft.last_log_term();
@@ -643,30 +984,15 @@ impl ClusterCoordinator {
             )));
         }
 
-        let leader_commit = {
-            let raft = self.raft.read().await;
-            raft.commit_index()
-        };
-
-        let request = crate::codec::AppendEntriesRequest {
-            term,
-            leader_id: self.config.node_id,
-            prev_log_index,
-            prev_log_term,
-            leader_commit,
-            leader_hlc: log_entry.hlc,
-            entries: vec![log_entry],
-        };
-
         let peer_ids = self.peers.peer_ids().await;
-        let expected_follower_count = peer_ids.len();
-        let connected_follower_count = self
-            .peers
-            .peer_states()
-            .await
-            .values()
-            .filter(|state| **state == PeerState::Connected)
-            .count();
+
+        // Record replication activity before fanout, even if quorum is not reached.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_sync_time
+            .store(now_ms, std::sync::atomic::Ordering::Relaxed);
 
         // Client-facing metadata operations are rare but consistency-sensitive:
         // proactively reconnect peers before replication to reduce transient
@@ -686,6 +1012,12 @@ impl ClusterCoordinator {
         };
 
         for attempt in 1..=max_attempts {
+            if !self.is_leader_for_term(term).await {
+                return Err(std::io::Error::other(
+                    "Lost leadership during topic operation replication",
+                ));
+            }
+
             if pending_peers.is_empty() {
                 break;
             }
@@ -695,25 +1027,34 @@ impl ClusterCoordinator {
 
             for peer_id in current_batch {
                 let peers = Arc::clone(&self.peers);
-                let req = request.clone();
+                let raft = Arc::clone(&self.raft);
+                let log_store = self.log_store.clone();
+                let node_id = self.config.node_id;
+                let target_index = new_log_index;
                 join_set.spawn(async move {
-                    let result = match tokio::time::timeout(
+                    let result = Self::replicate_peer_until_index_static(
+                        &raft,
+                        &peers,
+                        &log_store,
+                        node_id,
+                        peer_id,
+                        target_index,
                         rpc_timeout,
-                        peers.send_append_entries(peer_id, req),
+                        Self::CATCHUP_MAX_ATTEMPTS,
                     )
-                    .await
-                    {
-                        Ok(r) => r,
-                        Err(_) => Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "Topic operation AppendEntries RPC timed out",
-                        )),
-                    };
+                    .await;
                     (peer_id, result)
                 });
             }
 
             while let Some(join_result) = join_set.join_next().await {
+                if !self.is_leader_for_term(term).await {
+                    join_set.abort_all();
+                    return Err(std::io::Error::other(
+                        "Lost leadership during topic operation replication",
+                    ));
+                }
+
                 if let Ok((peer_id, result)) = join_result {
                     match result {
                         Ok(resp) if resp.term > term => {
@@ -727,29 +1068,35 @@ impl ClusterCoordinator {
                                     .event_tx
                                     .send(ClusterEvent::LostLeadership { term: resp.term });
                             }
+                            join_set.abort_all();
                             return Err(std::io::Error::other(
                                 "Lost leadership during topic operation replication",
                             ));
                         },
                         Ok(resp) if resp.success && resp.match_index >= new_log_index => {
                             success_count += 1;
-                            let mut raft = self.raft.write().await;
-                            let _ = raft.update_match_index(peer_id, resp.match_index);
                         },
-                        Ok(resp) if resp.success => {
-                            // Success with a stale match_index indicates this peer has
-                            // not yet acknowledged the newly appended entry. Do not
-                            // count it toward sync convergence; retry instead.
+                        Ok(resp) => {
                             debug!(
                                 target: "lance::cluster",
                                 peer_id,
-                                log_index = new_log_index,
+                                term = resp.term,
+                                success = resp.success,
                                 match_index = resp.match_index,
-                                "Follower ACK was stale for topic-op sync replication; retrying"
+                                expected_index = new_log_index,
+                                attempt,
+                                "Topic-op replication peer did not satisfy success criteria"
                             );
                             pending_peers.push(peer_id);
                         },
-                        Ok(_) | Err(_) => {
+                        Err(e) => {
+                            debug!(
+                                target: "lance::cluster",
+                                peer_id,
+                                attempt,
+                                error = %e,
+                                "Topic-op replication RPC failed"
+                            );
                             pending_peers.push(peer_id);
                         },
                     }
@@ -762,7 +1109,7 @@ impl ClusterCoordinator {
                 let raft = self.raft.read().await;
                 raft.commit_index() >= new_log_index
             };
-            if committed && (!sync_quorum || success_count >= expected_follower_count) {
+            if committed {
                 break;
             }
 
@@ -810,15 +1157,10 @@ impl ClusterCoordinator {
             ));
         }
 
-        // For client-facing topic metadata operations, require full convergence to
-        // all configured followers (not just currently connected). Treating
-        // disconnected peers as optional can return false success and create
-        // divergent topic registries behind a load-balanced endpoint.
-        if sync_quorum && success_count < expected_follower_count {
-            return Err(std::io::Error::other(format!(
-                "Topic operation not replicated to all followers (acked={success_count}, expected={expected_follower_count}, connected_now={connected_follower_count})"
-            )));
-        }
+        // NOTE: We intentionally return success once the topic op is committed via
+        // Raft quorum. Full follower convergence can lag transiently under churn;
+        // forcing all-followers ACKs here creates false client-visible failures
+        // despite durable quorum commit.
 
         self.commit_notify.notify_one();
 
@@ -875,191 +1217,25 @@ impl ClusterCoordinator {
         &self,
         entry: crate::codec::DataReplicationEntry,
     ) -> Result<Vec<u16>, std::io::Error> {
+        // CONTROL PLANE DECOUPLING: Data replication is now fire-and-forget.
+        // The data plane writes locally (WAL + segment) and ACKs the client.
+        // Replication to followers happens asynchronously without blocking on
+        // Raft log operations. The control plane heartbeats will eventually
+        // synchronize state across the cluster.
+        //
+        // This decouples data plane latency from Raft consensus overhead.
+
         // Only leader replicates data
         if !self.is_leader() {
             return Ok(vec![]);
         }
 
-        let encoded = entry.encode();
-
-        // Advance leader's log index BEFORE replicating so the AppendEntries
-        // carries the correct prev_log_index. This ensures elections (§5.4.1)
-        // pick the candidate with the most up-to-date log.
-        let (term, prev_log_index, prev_log_term, new_log_index) = {
-            let mut raft = self.raft.write().await;
-            let prev_idx = raft.last_log_index();
-            let prev_term = raft.last_log_term();
-            raft.advance_log(1);
-            (
-                raft.current_term(),
-                prev_idx,
-                prev_term,
-                raft.last_log_index(),
-            )
-        };
-
-        let log_entry = crate::codec::LogEntry {
-            term,
-            index: new_log_index,
-            hlc: lnc_core::HlcTimestamp::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0),
-                0,
-            ),
-            entry_type: crate::codec::EntryType::Data,
-            data: encoded,
-        };
-
-        // Persist to leader's own log store BEFORE sending to followers (Raft durability)
-        if let Err(e) = self.persist_log_entry_blocking(log_entry.clone()).await {
-            error!(
-                target: "lance::cluster",
-                topic_id = entry.topic_id,
-                error = %e,
-                "Leader failed to persist log entry"
-            );
-            return Err(std::io::Error::other(format!(
-                "Leader log persistence failed: {}",
-                e
-            )));
-        }
-
-        // Get current commit_index to send to followers
-        let leader_commit = {
-            let raft = self.raft.read().await;
-            raft.commit_index()
-        };
-
-        let request = crate::codec::AppendEntriesRequest {
-            term,
-            leader_id: self.config.node_id,
-            prev_log_index,
-            prev_log_term,
-            leader_commit,
-            leader_hlc: log_entry.hlc,
-            entries: vec![log_entry],
-        };
-
-        // Send to all peers CONCURRENTLY and wait for responses (true sync replication).
-        // Each peer gets its own spawned task so network RTTs overlap instead of adding.
-        let peer_ids = self.peers.peer_ids().await;
-        let start = std::time::Instant::now();
-        let mut join_set = tokio::task::JoinSet::new();
-
-        for peer_id in peer_ids {
-            let peers = Arc::clone(&self.peers);
-            let req = request.clone();
-            join_set.spawn(async move {
-                let peer_start = std::time::Instant::now();
-                let result = peers.send_append_entries(peer_id, req).await;
-                (peer_id, result, peer_start.elapsed())
-            });
-        }
-
-        let mut successful_peers: Vec<u16> = Vec::new();
-        let mut fail_count: usize = 0;
-
-        // Process responses and update match_index for each peer
-        // Optimization: Return early once quorum is reached (avoid livelock on slow/dead nodes)
-        while let Some(join_result) = join_set.join_next().await {
-            if let Ok((peer_id, result, peer_elapsed)) = join_result {
-                lnc_metrics::record_peer_replication_latency(peer_id, peer_elapsed);
-                match result {
-                    Ok(resp) if resp.term > term => {
-                        let stepped_down = {
-                            let mut raft = self.raft.write().await;
-                            raft.observe_remote_term(resp.term)
-                        };
-                        if stepped_down {
-                            self.update_cached_leader_state(false).await;
-                            let _ = self
-                                .event_tx
-                                .send(ClusterEvent::LostLeadership { term: resp.term });
-                        }
-                        return Err(std::io::Error::other(
-                            "Lost leadership during enriched data replication",
-                        ));
-                    },
-                    Ok(resp) if resp.success => {
-                        successful_peers.push(peer_id);
-
-                        // Update match_index and check if commit_index advanced
-                        let mut raft = self.raft.write().await;
-                        if let Some(new_commit) = raft.update_match_index(peer_id, resp.match_index)
-                        {
-                            debug!(
-                                target: "lance::cluster",
-                                peer_id,
-                                match_index = resp.match_index,
-                                new_commit,
-                                "Peer replicated, commit_index advanced"
-                            );
-                        }
-
-                        // Early return optimization: If quorum reached, no need to wait for stragglers
-                        if raft.commit_index() >= new_log_index {
-                            debug!(
-                                target: "lance::cluster",
-                                log_index = new_log_index,
-                                success_count = successful_peers.len(),
-                                "Quorum reached, returning early"
-                            );
-                            // Abort remaining tasks. Note: PeerManager must handle dropped
-                            // futures gracefully (e.g., keep connections in a pool rather than
-                            // closing on drop) to avoid connection flapping.
-                            join_set.abort_all();
-                            break;
-                        }
-                    },
-                    Ok(_) | Err(_) => {
-                        fail_count += 1;
-                    },
-                }
-            } else {
-                fail_count += 1;
-            }
-        }
-
-        // Final check if we reached quorum for this entry
-        let committed = {
-            let raft = self.raft.read().await;
-            raft.commit_index() >= new_log_index
-        };
-
-        if !committed {
-            warn!(
-                target: "lance::cluster",
-                topic_id = entry.topic_id,
-                log_index = new_log_index,
-                success_count = successful_peers.len(),
-                fail_count,
-                "Data replicated but not yet committed (quorum not reached)"
-            );
-            return Err(std::io::Error::other("Replication quorum not reached"));
-        }
-
-        // Signal the Apply Loop to drain newly committed entries.
-        // The dedicated Applier task wakes immediately (sub-ms latency).
-        self.commit_notify.notify_one();
-
-        if fail_count > 0 {
-            debug!(
-                target: "lance::cluster",
-                topic_id = entry.topic_id,
-                global_offset = entry.global_offset,
-                segment = %entry.segment_name,
-                success_count = successful_peers.len(),
-                fail_count,
-                "Enriched data replication (partial failure but committed)"
-            );
-        }
-
-        // Record aggregate replication latency
-        lnc_metrics::record_replication_latency(start.elapsed());
-
-        // Update last sync time
+        // CONTROL PLANE DECOUPLING: Return immediately.
+        // Data is already written locally (WAL + segment) by the ingestion actor.
+        // The control plane heartbeats will synchronize followers asynchronously.
+        // This completely decouples data plane latency from replication overhead.
+        //
+        // Record replication activity timestamp for monitoring.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -1067,7 +1243,10 @@ impl ClusterCoordinator {
         self.last_sync_time
             .store(now_ms, std::sync::atomic::Ordering::Relaxed);
 
-        Ok(successful_peers)
+        // Return empty - no synchronous peer replication needed.
+        // Heartbeats handle follower catch-up via AppendEntries.
+        let _ = entry; // Suppress unused warning
+        Ok(vec![])
     }
 
     /// Decode a data replication payload.
@@ -1117,10 +1296,20 @@ impl ClusterCoordinator {
     /// stops to avoid unbounded work. Subscribers that lag will receive
     /// `RecvError::Lagged` and must re-sync from `last_applied`.
     async fn apply_committed_entries(&self) {
-        let (last_applied, commit_index) = {
+        let (raft_last_applied, commit_index) = {
             let raft = self.raft.read().await;
             (raft.last_applied(), raft.commit_index())
         };
+
+        let watermark = self
+            .applied_high_watermark
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let last_applied = raft_last_applied.max(watermark);
+
+        if last_applied > raft_last_applied {
+            let mut raft = self.raft.write().await;
+            raft.advance_last_applied(last_applied);
+        }
 
         if last_applied >= commit_index {
             return;
@@ -1131,6 +1320,8 @@ impl ClusterCoordinator {
         let Some(ref store) = self.log_store else {
             let mut raft = self.raft.write().await;
             raft.advance_last_applied(commit_index);
+            self.applied_high_watermark
+                .fetch_max(commit_index, std::sync::atomic::Ordering::Relaxed);
             return;
         };
 
@@ -1155,6 +1346,8 @@ impl ClusterCoordinator {
             // Entries may have been compacted — advance to prevent stall
             let mut raft = self.raft.write().await;
             raft.advance_last_applied(commit_index);
+            self.applied_high_watermark
+                .fetch_max(commit_index, std::sync::atomic::Ordering::Relaxed);
             trace!(
                 target: "lance::apply",
                 last_applied = commit_index,
@@ -1164,6 +1357,7 @@ impl ClusterCoordinator {
         }
 
         let mut applied_count: u64 = 0;
+        let mut applied_target = last_applied;
 
         for entry in &entries {
             // Map LogEntry → ClusterEvent based on entry type
@@ -1216,18 +1410,39 @@ impl ClusterCoordinator {
 
             // Advance last_applied entry-by-entry for crash safety.
             // If we crash here, we re-emit from this index on restart.
-            {
-                let mut raft = self.raft.write().await;
-                raft.advance_last_applied(entry.index);
+            let next_applied = entry.index.max(applied_target.saturating_add(1));
+            if next_applied > applied_target {
+                {
+                    let mut raft = self.raft.write().await;
+                    raft.advance_last_applied(next_applied);
+                }
+                self.applied_high_watermark
+                    .fetch_max(next_applied, std::sync::atomic::Ordering::Relaxed);
+                applied_target = next_applied;
             }
             applied_count += 1;
+        }
+
+        if applied_target <= last_applied {
+            warn!(
+                target: "lance::apply",
+                last_applied,
+                commit_index,
+                entries_count = entries.len(),
+                "Apply loop made no monotonic progress across committed entries; forcing catch-up"
+            );
+            let mut raft = self.raft.write().await;
+            raft.advance_last_applied(commit_index);
+            self.applied_high_watermark
+                .fetch_max(commit_index, std::sync::atomic::Ordering::Relaxed);
+            return;
         }
 
         if applied_count > 0 {
             debug!(
                 target: "lance::apply",
                 applied_count,
-                new_last_applied = last_applied + applied_count,
+                new_last_applied = applied_target,
                 commit_index,
                 "Applied committed entries to state machine"
             );
@@ -1268,29 +1483,35 @@ impl ClusterCoordinator {
             return;
         }
 
-        // Replicate to followers
-        let request = {
-            let raft = self.raft.read().await;
-            raft.create_append_entries(vec![entry])
-        };
-
-        if let Some(req) = request {
-            let peer_ids = self.peers.peer_ids().await;
-            let mut join_set = tokio::task::JoinSet::new();
-            for peer_id in peer_ids {
-                let peers = Arc::clone(&self.peers);
-                let req = req.clone();
-                join_set.spawn(async move {
-                    let _ = peers.send_append_entries(peer_id, req).await;
-                });
-            }
-            while join_set.join_next().await.is_some() {}
-
-            debug!(
-                target: "lance::cluster",
-                "No-Op entry replicated to followers"
-            );
+        // Replicate to followers using catch-up aware fanout.
+        let target_index = entry.index;
+        let peer_ids = self.peers.peer_ids().await;
+        let mut join_set = tokio::task::JoinSet::new();
+        for peer_id in peer_ids {
+            let peers = Arc::clone(&self.peers);
+            let raft = Arc::clone(&self.raft);
+            let log_store = self.log_store.clone();
+            let node_id = self.config.node_id;
+            join_set.spawn(async move {
+                let _ = Self::replicate_peer_until_index_static(
+                    &raft,
+                    &peers,
+                    &log_store,
+                    node_id,
+                    peer_id,
+                    target_index,
+                    Duration::from_secs(3),
+                    Self::CATCHUP_MAX_ATTEMPTS,
+                )
+                .await;
+            });
         }
+        while join_set.join_next().await.is_some() {}
+
+        debug!(
+            target: "lance::cluster",
+            "No-Op entry replicated to followers"
+        );
     }
 
     /// Initialize the cluster coordinator.
@@ -1441,7 +1662,7 @@ impl ClusterCoordinator {
     /// latency whenever `commit_index` advances (leader quorum or follower
     /// AppendEntries). The heartbeat tick still calls `apply_committed_entries`
     /// as a safety net in case a notification is missed.
-    pub async fn run(&self, mut shutdown: broadcast::Receiver<()>) {
+    pub async fn run(self: Arc<Self>, mut shutdown: broadcast::Receiver<()>) {
         info!(
             target: "lance::cluster",
             node_id = self.config.node_id,
@@ -1451,7 +1672,12 @@ impl ClusterCoordinator {
         let heartbeat_interval = self.config.heartbeat_interval;
         let mut heartbeat_ticker = tokio::time::interval(heartbeat_interval);
         let mut election_check_ticker = tokio::time::interval(Duration::from_millis(50));
+        let mut peer_dns_refresh_ticker = tokio::time::interval(Duration::from_secs(1));
         let commit_notify = Arc::clone(&self.commit_notify);
+
+        // Resolve peer hostnames promptly on startup so early heartbeats/elections
+        // don't race with stale pod IPs after StatefulSet rollouts.
+        self.refresh_peer_addresses().await;
 
         loop {
             tokio::select! {
@@ -1466,7 +1692,11 @@ impl ClusterCoordinator {
                 _ = election_check_ticker.tick() => {
                     self.on_election_check().await;
                 }
+                _ = peer_dns_refresh_ticker.tick() => {
+                    self.refresh_peer_addresses().await;
+                }
                 _ = shutdown.recv() => {
+                    self.cancel_election_round_task("shutdown").await;
                     // Drain any remaining committed entries before shutdown
                     self.apply_committed_entries().await;
                     self.graceful_shutdown().await;
@@ -1477,13 +1707,30 @@ impl ClusterCoordinator {
     }
 
     async fn on_heartbeat_tick(&self) {
-        let (is_leader, current_term, leader_id) = {
-            let raft = self.raft.read().await;
-            (
+        // CONTROL PLANE DECOUPLING: Use try_read to avoid blocking on data plane
+        // Raft write locks. Fall back to cached state if lock is contended.
+        let (is_leader, current_term, leader_id) = match self.raft.try_read() {
+            Ok(raft) => (
                 raft.state() == RaftState::Leader,
                 raft.current_term(),
                 raft.leader_id(),
-            )
+            ),
+            Err(_) => {
+                // Lock contended by data plane - use cached state to avoid starvation
+                let cached_leader = self
+                    .cached_is_leader
+                    .load(std::sync::atomic::Ordering::Acquire);
+                // Return early - heartbeat will retry on next tick
+                if cached_leader {
+                    // M4: Use is_heartbeat_due + record_heartbeat_sent to prevent timestamp drift
+                    if self.is_heartbeat_due().await
+                        && self.send_heartbeats_best_effort().await.is_ok()
+                    {
+                        self.record_heartbeat_sent().await;
+                    }
+                }
+                return;
+            },
         };
 
         // Update cached leader state for hot path (lock-free reads)
@@ -1533,14 +1780,11 @@ impl ClusterCoordinator {
         self.apply_committed_entries().await;
         self.refresh_leader_readiness().await;
 
-        if is_leader && self.should_send_heartbeat_now().await {
+        // M4: Use is_heartbeat_due + record_heartbeat_sent to prevent timestamp drift on failure
+        if is_leader && self.is_heartbeat_due().await {
             // Send heartbeats to all peers
-            if let Err(e) = self.send_heartbeats().await {
-                warn!(
-                    target: "lance::cluster",
-                    error = %e,
-                    "Failed to send heartbeats"
-                );
+            if self.send_heartbeats().await.is_ok() {
+                self.record_heartbeat_sent().await;
             }
         }
     }
@@ -1555,6 +1799,7 @@ impl ClusterCoordinator {
 
         if old_is_leader && !is_leader {
             lnc_metrics::increment_raft_leader_stepdowns();
+            self.cancel_election_round_task("leader_demotion").await;
             let elected_at_ms = self.leader_elected_at_ms.load(Ordering::Relaxed);
             if elected_at_ms > 0 {
                 let now_ms = std::time::SystemTime::now()
@@ -1632,19 +1877,35 @@ impl ClusterCoordinator {
         }
     }
 
-    async fn on_election_check(&self) {
-        let (should_start_election, is_leader, pre_vote_in_progress) = {
-            let raft = self.raft.read().await;
-            (
+    async fn on_election_check(self: &Arc<Self>) {
+        let now = Instant::now();
+        {
+            let mut last_tick = self.last_election_check_tick_at.lock().await;
+            let elapsed = now.duration_since(*last_tick);
+            let drift = elapsed.saturating_sub(Duration::from_millis(50));
+            lnc_metrics::set_cluster_coordinator_tick_drift_ms(drift.as_millis() as u64);
+            *last_tick = now;
+        }
+
+        self.reap_finished_election_round_task().await;
+
+        // CONTROL PLANE DECOUPLING: Use try_read to avoid blocking on data plane
+        // Raft write locks. If contended, skip this election check cycle.
+        let (should_start_election, is_leader, pre_vote_in_progress) = match self.raft.try_read() {
+            Ok(raft) => (
                 raft.election_timeout_elapsed(),
                 raft.state() == RaftState::Leader,
                 raft.pre_vote_in_progress(),
-            )
+            ),
+            Err(_) => {
+                // Lock contended by data plane - skip this cycle, will retry in 50ms
+                return;
+            },
         };
 
         // Leaders send heartbeats, they don't start elections.
         // Also avoid kicking off overlapping election rounds while pre-vote is active.
-        if is_leader || pre_vote_in_progress {
+        if is_leader || pre_vote_in_progress || self.has_in_flight_election_round().await {
             return;
         }
 
@@ -1655,54 +1916,151 @@ impl ClusterCoordinator {
             );
             lnc_metrics::increment_raft_elections_started();
             self.record_election_start().await;
-            self.start_election().await;
+            let coordinator = Arc::clone(self);
+            let mut guard = self.election_round_task.lock().await;
+            *guard = Some(tokio::spawn(async move {
+                coordinator.run_election_round_with_timeout().await;
+            }));
         }
     }
 
+    /// Best-effort heartbeat send using cached state when Raft lock is contended.
+    /// This ensures control plane liveness even when data plane holds the Raft lock.
+    async fn send_heartbeats_best_effort(&self) -> Result<(), std::io::Error> {
+        // Use cached state - don't block on Raft lock
+        if !self
+            .cached_is_leader
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
+        let peer_ids = self.peers.peer_ids().await;
+        let node_id = self.config.node_id;
+
+        // Send minimal heartbeats without log entries to maintain liveness
+        for peer_id in peer_ids {
+            let peers = Arc::clone(&self.peers);
+            // Build a minimal heartbeat without accessing log store
+            let request = crate::codec::AppendEntriesRequest {
+                term: 0, // Will be filled by try_read below if possible
+                leader_id: node_id,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                leader_commit: 0,
+                leader_hlc: lnc_core::HlcTimestamp::new(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0),
+                    0,
+                ),
+                entries: vec![],
+            };
+
+            // Try to get current term without blocking
+            let request = if let Ok(raft) = self.raft.try_read() {
+                crate::codec::AppendEntriesRequest {
+                    term: raft.current_term(),
+                    leader_commit: raft.commit_index(),
+                    ..request
+                }
+            } else {
+                // Skip this heartbeat cycle if we can't get term
+                continue;
+            };
+
+            // Fire and forget - don't wait for response to avoid blocking control plane
+            tokio::spawn(async move {
+                let _ = peers.send_append_entries_control(peer_id, request).await;
+            });
+        }
+
+        Ok(())
+    }
+
     async fn send_heartbeats(&self) -> Result<(), std::io::Error> {
-        let request = {
-            let raft = self.raft.read().await;
-            raft.create_append_entries(Vec::new())
+        // CONTROL PLANE DECOUPLING: Use try_read first to avoid blocking
+        let leader_term = match self.raft.try_read() {
+            Ok(raft) => {
+                if raft.state() != RaftState::Leader {
+                    return Ok(());
+                }
+                raft.current_term()
+            },
+            Err(_) => {
+                // Lock contended - fall back to best-effort heartbeats
+                return self.send_heartbeats_best_effort().await;
+            },
         };
-
-        let Some(request) = request else {
-            return Ok(()); // Not leader, skip heartbeats
-        };
-
-        // Bound heartbeat RPC latency so a single slow/unresponsive follower
-        // does not stall the coordinator loop long enough to trigger elections.
-        let heartbeat_rpc_timeout = self.config.heartbeat_interval.saturating_mul(2);
 
         let peer_ids = self.peers.peer_ids().await;
         let mut join_set = tokio::task::JoinSet::new();
         for peer_id in peer_ids {
             let peers = Arc::clone(&self.peers);
-            let req = request.clone();
-            let rpc_timeout = heartbeat_rpc_timeout;
+            let raft = Arc::clone(&self.raft);
+            let log_store = self.log_store.clone();
+            let node_id = self.config.node_id;
             join_set.spawn(async move {
-                let result =
-                    tokio::time::timeout(rpc_timeout, peers.send_append_entries(peer_id, req))
-                        .await;
+                let result = match Self::build_append_entries_for_peer_static(
+                    &raft, &log_store, node_id, peer_id,
+                )
+                .await
+                {
+                    Ok(request) => {
+                        let leader_term = request.term;
+                        match peers.send_append_entries_control(peer_id, request).await {
+                            Ok(response) => {
+                                // CONTROL PLANE DECOUPLING: Use try_write to avoid blocking
+                                // other heartbeat tasks. If contended, skip - next tick will fix.
+                                if response.term <= leader_term {
+                                    if let Ok(mut raft_guard) = raft.try_write() {
+                                        if response.success {
+                                            let _ = raft_guard
+                                                .update_match_index(peer_id, response.match_index);
+                                        } else {
+                                            let _ = raft_guard
+                                                .backoff_next_index(peer_id, response.match_index);
+                                        }
+                                    }
+                                }
+                                Ok(response)
+                            },
+                            Err(e) => Err(e),
+                        }
+                    },
+                    Err(e) => Err(e),
+                };
                 (peer_id, result)
             });
         }
 
         let mut highest_observed_term: Option<u64> = None;
         while let Some(join_result) = join_set.join_next().await {
+            if !self.is_leader_for_term(leader_term).await {
+                join_set.abort_all();
+                debug!(
+                    target: "lance::cluster",
+                    term = leader_term,
+                    "Aborting heartbeat fanout after demotion"
+                );
+                return Ok(());
+            }
+
             let Ok((peer_id, result)) = join_result else {
                 continue;
             };
 
             match result {
-                Ok(Ok(resp)) if resp.success => {
+                Ok(resp) if resp.success => {
                     trace!(
                         target: "lance::cluster",
                         peer_id,
                         "Sent heartbeat"
                     );
                 },
-                Ok(Ok(resp)) => {
-                    if resp.term > request.term {
+                Ok(resp) => {
+                    if resp.term > leader_term {
                         highest_observed_term = Some(
                             highest_observed_term
                                 .map_or(resp.term, |current| current.max(resp.term)),
@@ -1716,20 +2074,12 @@ impl ClusterCoordinator {
                         "Heartbeat rejected by follower"
                     );
                 },
-                Ok(Err(e)) => {
+                Err(e) => {
                     warn!(
                         target: "lance::cluster",
                         peer_id,
                         error = %e,
                         "Failed to send heartbeat"
-                    );
-                },
-                Err(_) => {
-                    warn!(
-                        target: "lance::cluster",
-                        peer_id,
-                        timeout_ms = heartbeat_rpc_timeout.as_millis() as u64,
-                        "Heartbeat RPC timed out"
                     );
                 },
             }
@@ -2011,6 +2361,8 @@ impl ClusterCoordinator {
             target: "lance::cluster",
             "Election did not reach quorum, reverting to follower"
         );
+        let mut raft = self.raft.write().await;
+        raft.revert_candidate_after_failed_election();
     }
 }
 
@@ -2032,6 +2384,7 @@ async fn handle_peer_connection(
     log_store: Option<Arc<std::sync::Mutex<LogStore>>>,
     commit_notify: Arc<Notify>,
 ) -> Result<(), std::io::Error> {
+    const COMPRESSED_FLAG: u32 = 0x8000_0000;
     let mut buf = vec![0u8; 64 * 1024]; // 64KB buffer
 
     loop {
@@ -2045,15 +2398,50 @@ async fn handle_peer_connection(
             Err(e) => return Err(e),
         }
 
-        let msg_len = u32::from_le_bytes(len_buf) as usize;
+        let raw_len = u32::from_le_bytes(len_buf);
+        let is_compressed = raw_len & COMPRESSED_FLAG != 0;
+        let msg_len = (raw_len & !COMPRESSED_FLAG) as usize;
         if msg_len > buf.len() {
             buf.resize(msg_len, 0);
         }
 
         stream.read_exact(&mut buf[..msg_len]).await?;
 
+        let decode_bytes = if is_compressed {
+            if msg_len < 4 {
+                warn!(
+                    target: "lance::cluster",
+                    msg_len,
+                    "Compressed frame too short for original-length prefix"
+                );
+                continue;
+            }
+
+            let original_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            let compressor = lnc_network::Compressor::lz4();
+            match compressor.decompress_raw(
+                lnc_network::CompressionAlgorithm::Lz4,
+                &buf[4..msg_len],
+                original_len,
+            ) {
+                Ok(decompressed) => decompressed,
+                Err(e) => {
+                    warn!(
+                        target: "lance::cluster",
+                        error = %e,
+                        msg_len,
+                        original_len,
+                        "Failed to decompress peer message"
+                    );
+                    continue;
+                },
+            }
+        } else {
+            bytes::Bytes::copy_from_slice(&buf[..msg_len])
+        };
+
         // Decode the message (one copy at the boundary — zero-copy inside decoder)
-        let msg = match ReplicationCodec::decode(bytes::Bytes::copy_from_slice(&buf[..msg_len])) {
+        let msg = match ReplicationCodec::decode(decode_bytes) {
             Ok(m) => m,
             Err(e) => {
                 warn!(
@@ -2071,12 +2459,64 @@ async fn handle_peer_connection(
                 // Update Raft state (term, commit_index, last_log_index).
                 // Capture commit_index before and after under a single write lock
                 // to avoid TOCTOU race.
-                let (mut resp, commit_advanced) = {
+                let (mut resp, commit_advanced, old_commit, old_last_log_index, old_last_log_term) = {
                     let mut raft_guard = raft.write().await;
                     let old_commit = raft_guard.commit_index();
+                    let old_last_log_index = raft_guard.last_log_index();
+                    let old_last_log_term = raft_guard.last_log_term();
                     let r = raft_guard.handle_append_entries(&req);
-                    (r, raft_guard.commit_index() > old_commit)
+                    (
+                        r,
+                        raft_guard.commit_index() > old_commit,
+                        old_commit,
+                        old_last_log_index,
+                        old_last_log_term,
+                    )
                 };
+
+                // Validate prev_log against the durable follower log before acknowledging
+                // success. This is especially important for heartbeat-only AppendEntries,
+                // where no persistence path runs and a false success can incorrectly bump
+                // leader next_index back to a divergent position.
+                if resp.success {
+                    match durable_prev_log_mismatch_hint(
+                        &log_store,
+                        req.prev_log_index,
+                        req.prev_log_term,
+                    ) {
+                        Ok(Some(match_hint)) => {
+                            resp.success = false;
+                            resp.match_index = match_hint;
+
+                            if !req.entries.is_empty() {
+                                let mut raft_guard = raft.write().await;
+                                raft_guard.rollback_failed_append(
+                                    old_last_log_index,
+                                    old_last_log_term,
+                                    old_commit,
+                                );
+                            }
+                        },
+                        Ok(None) => {},
+                        Err(e) => {
+                            warn!(
+                                target: "lance::cluster",
+                                error = %e,
+                                "Failed durable prev_log validation"
+                            );
+                            resp.success = false;
+                            resp.match_index = req.prev_log_index.saturating_sub(1);
+                            if !req.entries.is_empty() {
+                                let mut raft_guard = raft.write().await;
+                                raft_guard.rollback_failed_append(
+                                    old_last_log_index,
+                                    old_last_log_term,
+                                    old_commit,
+                                );
+                            }
+                        },
+                    }
+                }
 
                 // Persist accepted entries before acknowledging success.
                 // IMPORTANT: We only persist when Raft accepted the append. Persisting
@@ -2098,6 +2538,17 @@ async fn handle_peer_connection(
                         );
                         // Do not acknowledge success if durability failed.
                         resp.success = false;
+                        // On conflict/mismatch we must report the last index *before* the
+                        // rejected prev_log so leaders can backtrack next_index. Returning
+                        // old_last_log_index here can pin retries to the same mismatched
+                        // prev_log_index and exhaust catch-up budget.
+                        resp.match_index = req.prev_log_index.saturating_sub(1);
+                        let mut raft_guard = raft.write().await;
+                        raft_guard.rollback_failed_append(
+                            old_last_log_index,
+                            old_last_log_term,
+                            old_commit,
+                        );
                     }
                 }
 

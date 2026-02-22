@@ -26,6 +26,8 @@ pub enum ClientError {
     },
     /// Server is applying backpressure, client should slow down
     ServerBackpressure,
+    /// M3: Operation would block (non-blocking mode), client buffer is full
+    WouldBlock,
     /// Server returned an error message
     ServerError(String),
     /// Server has not yet replicated to the requested offset — backoff and retry
@@ -59,6 +61,7 @@ impl fmt::Display for ClientError {
                 )
             },
             Self::ServerBackpressure => write!(f, "Server signaled backpressure"),
+            Self::WouldBlock => write!(f, "Operation would block (buffer full)"),
             Self::ServerError(msg) => write!(f, "Server error: {}", msg),
             Self::ServerCatchingUp { server_offset } => {
                 write!(f, "Server catching up (at offset {})", server_offset)

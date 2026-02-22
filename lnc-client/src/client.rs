@@ -651,6 +651,17 @@ impl LanceClient {
 
     /// Create a new topic with the given name
     pub async fn create_topic(&mut self, name: &str) -> Result<TopicInfo> {
+        const DEFAULT_CREATE_TOPIC_ATTEMPTS: usize = 20;
+        const DEFAULT_CREATE_TOPIC_BACKOFF_MS: u64 = 500;
+        self.ensure_topic(
+            name,
+            DEFAULT_CREATE_TOPIC_ATTEMPTS,
+            DEFAULT_CREATE_TOPIC_BACKOFF_MS,
+        )
+        .await
+    }
+
+    async fn create_topic_once(&mut self, name: &str) -> Result<TopicInfo> {
         let frame = Frame::new_create_topic(name);
         let frame_bytes = encode_frame(&frame);
 
@@ -684,7 +695,7 @@ impl LanceClient {
         for attempt in 1..=attempts {
             let mut retryable_this_attempt = false;
 
-            match self.create_topic(name).await {
+            match self.create_topic_once(name).await {
                 Ok(info) => {
                     trace!(
                         topic_id = info.id,

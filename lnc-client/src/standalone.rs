@@ -20,9 +20,9 @@
 //!             .with_offset_dir(Path::new("/var/lib/lance/offsets")),
 //!     ).await?;
 //!
-//!     // Poll for records
+//!     // Receive records
 //!     loop {
-//!         if let Some(records) = consumer.poll().await? {
+//!         if let Some(records) = consumer.next_batch().await? {
 //!             for record in records.data.chunks(256) {
 //!                 // Process record
 //!             }
@@ -218,24 +218,36 @@ impl StandaloneConsumer {
         })
     }
 
-    /// Poll for new records
+    /// Receive the next batch for an active subscription.
     ///
     /// Returns `Ok(Some(PollResult))` if records are available,
     /// `Ok(None)` if no records are ready (non-blocking behavior).
     ///
     /// This method may trigger auto-commit if configured.
-    pub async fn poll(&mut self) -> Result<Option<PollResult>> {
+    pub async fn next_batch(&mut self) -> Result<Option<PollResult>> {
         // Check for auto-commit
         self.maybe_auto_commit().await?;
 
-        // Poll the inner consumer
-        let result = self.inner.poll().await?;
+        // Pull from the inner streaming consumer
+        let result = self.inner.next_batch().await?;
 
         if let Some(ref poll_result) = result {
             self.pending_offset = poll_result.current_offset;
         }
 
         Ok(result)
+    }
+
+    /// Primary consume interface alias.
+    #[inline]
+    pub async fn consume(&mut self) -> Result<Option<PollResult>> {
+        self.next_batch().await
+    }
+
+    /// Compatibility wrapper for callers still using polling terminology.
+    #[inline]
+    pub async fn poll(&mut self) -> Result<Option<PollResult>> {
+        self.next_batch().await
     }
 
     /// Poll for records, blocking until data is available or timeout
@@ -246,7 +258,7 @@ impl StandaloneConsumer {
         let deadline = Instant::now() + timeout;
 
         while Instant::now() < deadline {
-            if let Some(result) = self.poll().await? {
+            if let Some(result) = self.next_batch().await? {
                 return Ok(Some(result));
             }
             // Small sleep to avoid busy-waiting

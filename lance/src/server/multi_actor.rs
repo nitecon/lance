@@ -435,45 +435,15 @@ fn flush_and_signal_sync(
     replication_tx: &Option<tokio::sync::mpsc::Sender<DataReplicationRequest>>,
     wal: &mut Option<lnc_io::Wal>,
 ) {
-    // Sync WAL before segment fsyncs (batched, not per-append)
-    if let Some(w) = wal {
-        if let Err(e) = w.sync() {
-            tracing::error!(
-                target: "lance::ingestion",
-                error = %e,
-                "WAL batch sync failed"
-            );
-        }
-    }
-    for topic_id in dirty_topics.iter() {
-        if let Some(tw) = topic_writers.get_mut(topic_id) {
-            if let Err(e) = tw.writer.fsync() {
-                tracing::error!(
-                    target: "lance::ingestion",
-                    topic_id,
-                    error = %e,
-                    "Batch fsync failed"
-                );
-            }
-        }
-    }
-    dirty_topics.clear();
-
-    // Phase 1: release all client waiters now that data is durable locally.
-    // This keeps ACK latency independent from replication channel backpressure.
-    for s in pending_signals.iter_mut() {
-        if let Some(tx) = s.write_done_tx.take() {
-            let _ = tx.send(());
-        }
-    }
-
-    // Phase 2: enqueue replication work after client waiters are released.
-    for s in pending_signals.drain(..) {
-        if let Some(tx) = replication_tx {
+    // Phase 0: enqueue replication work first so follower replication can overlap
+    // with local durability flush below. Client ACK is still gated on write_done,
+    // which is only sent after WAL/data sync completes.
+    if let Some(tx) = replication_tx {
+        for s in pending_signals.iter() {
             let repl_req = DataReplicationRequest {
                 topic_id: s.topic_id,
-                payload: s.payload,
-                segment_name: s.meta.segment_name,
+                payload: s.payload.clone(),
+                segment_name: s.meta.segment_name.clone(),
                 write_offset: s.meta.write_offset,
                 global_offset: s.meta.write_offset + s.payload_len as u64,
                 is_new_segment: s.meta.is_new_segment,
@@ -481,8 +451,6 @@ fn flush_and_signal_sync(
                 write_id: s.write_id,
             };
 
-            // Fast path: avoid blocking/context switch if channel has capacity.
-            // Fallback: block to preserve replication request delivery semantics.
             match tx.try_send(repl_req) {
                 Ok(()) => {},
                 Err(TrySendError::Full(repl_req)) => {
@@ -496,6 +464,45 @@ fn flush_and_signal_sync(
             }
         }
     }
+
+    // Sync WAL before segment fsyncs (batched, not per-append)
+    if let Some(w) = wal {
+        if let Err(e) = w.sync() {
+            tracing::error!(
+                target: "lance::ingestion",
+                error = %e,
+                "WAL batch sync failed"
+            );
+        }
+    }
+    // If WAL is enabled and synced above, segment fsync is redundant on the ACK
+    // hot path. Crash recovery can replay WAL + committed Raft log to rebuild
+    // segment bytes, so we preserve durability while avoiding duplicate flush cost.
+    if wal.is_none() {
+        for topic_id in dirty_topics.iter() {
+            if let Some(tw) = topic_writers.get_mut(topic_id) {
+                if let Err(e) = tw.writer.fsync() {
+                    tracing::error!(
+                        target: "lance::ingestion",
+                        topic_id,
+                        error = %e,
+                        "Batch fsync failed"
+                    );
+                }
+            }
+        }
+    }
+    dirty_topics.clear();
+
+    // Phase 1: release all client waiters now that data is durable locally.
+    // This keeps ACK latency independent from replication channel backpressure.
+    for s in pending_signals.iter_mut() {
+        if let Some(tx) = s.write_done_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+
+    pending_signals.clear();
 }
 
 /// Process a single ingestion request (synchronous), returning write metadata for replication.

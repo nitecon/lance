@@ -96,7 +96,9 @@ pub struct PeerConfig {
 impl Default for PeerConfig {
     fn default() -> Self {
         Self {
-            connect_timeout: Duration::from_secs(1),
+            // 1s connect timeout is too aggressive during election/restart churn.
+            // Allow a slightly wider budget before forcing disconnect/reconnect loops.
+            connect_timeout: Duration::from_secs(3),
             // 2s was too aggressive under benchmark/chaos load and caused
             // repeated disconnect/reconnect churn during legitimate follower stalls.
             read_timeout: Duration::from_secs(10),
@@ -247,8 +249,11 @@ impl PeerConnection {
         false
     }
 
-    /// Minimum message size to apply LZ4 compression (1KB).
-    const COMPRESSION_THRESHOLD: usize = 1024;
+    /// Minimum message size to apply LZ4 compression (4KB).
+    ///
+    /// 1KB data-plane frames are latency-sensitive and often incompressible,
+    /// so attempting compression on every append adds avoidable CPU overhead.
+    const COMPRESSION_THRESHOLD: usize = 4 * 1024;
     /// High bit of the length prefix signals LZ4 compression.
     const COMPRESSED_FLAG: u32 = 0x8000_0000;
 
@@ -491,14 +496,23 @@ impl PeerConnection {
 /// Manages connections to all peer nodes with health tracking
 pub struct PeerManager {
     peers: PeerConnectionMap,
+    control_peers: PeerConnectionMap,
+    election_peers: PeerConnectionMap,
     health: Arc<RwLock<HashMap<u16, FollowerHealth>>>,
     config: PeerConfig,
 }
 
 impl PeerManager {
+    /// Synthetic latency sample applied when an AppendEntries RPC fails before a
+    /// valid response is decoded. This drives health eviction for persistently
+    /// failing peers so fanout can focus on healthy quorum members.
+    const RPC_FAILURE_PENALTY_LATENCY: Duration = Duration::from_secs(1);
+
     pub fn new(_node_id: u16, config: PeerConfig) -> Self {
         Self {
             peers: Arc::new(RwLock::new(HashMap::new())),
+            control_peers: Arc::new(RwLock::new(HashMap::new())),
+            election_peers: Arc::new(RwLock::new(HashMap::new())),
             health: Arc::new(RwLock::new(HashMap::new())),
             config,
         }
@@ -506,19 +520,42 @@ impl PeerManager {
 
     pub async fn add_peer(&self, peer_id: u16, addr: SocketAddr) {
         let mut inserted = false;
-        let conn = {
+        let (conn, control_conn, election_conn) = {
             let mut peers = self.peers.write().await;
-            if let Some(existing) = peers.get(&peer_id) {
-                Arc::clone(existing)
+            let mut control_peers = self.control_peers.write().await;
+            let mut election_peers = self.election_peers.write().await;
+
+            if let (Some(existing), Some(existing_control), Some(existing_election)) = (
+                peers.get(&peer_id),
+                control_peers.get(&peer_id),
+                election_peers.get(&peer_id),
+            ) {
+                (
+                    Arc::clone(existing),
+                    Arc::clone(existing_control),
+                    Arc::clone(existing_election),
+                )
             } else {
                 let conn = Arc::new(Mutex::new(PeerConnection::new(
                     peer_id,
                     addr,
                     self.config.clone(),
                 )));
+                let control_conn = Arc::new(Mutex::new(PeerConnection::new(
+                    peer_id,
+                    addr,
+                    self.config.clone(),
+                )));
+                let election_conn = Arc::new(Mutex::new(PeerConnection::new(
+                    peer_id,
+                    addr,
+                    self.config.clone(),
+                )));
                 peers.insert(peer_id, Arc::clone(&conn));
+                control_peers.insert(peer_id, Arc::clone(&control_conn));
+                election_peers.insert(peer_id, Arc::clone(&election_conn));
                 inserted = true;
-                conn
+                (conn, control_conn, election_conn)
             }
         };
 
@@ -537,6 +574,8 @@ impl PeerManager {
         }
 
         let mut existing = conn.lock().await;
+        let mut existing_control = control_conn.lock().await;
+        let mut existing_election = election_conn.lock().await;
         if existing.addr != addr {
             info!(
                 target: "lance::replication",
@@ -546,12 +585,22 @@ impl PeerManager {
                 "Peer address changed, updating connection"
             );
             *existing = PeerConnection::new(peer_id, addr, self.config.clone());
+            *existing_control = PeerConnection::new(peer_id, addr, self.config.clone());
+            *existing_election = PeerConnection::new(peer_id, addr, self.config.clone());
         }
     }
 
     pub async fn remove_peer(&self, peer_id: u16) {
         let removed = {
             let mut peers = self.peers.write().await;
+            peers.remove(&peer_id)
+        };
+        let removed_control = {
+            let mut peers = self.control_peers.write().await;
+            peers.remove(&peer_id)
+        };
+        let removed_election = {
+            let mut peers = self.election_peers.write().await;
             peers.remove(&peer_id)
         };
 
@@ -569,6 +618,16 @@ impl PeerManager {
                 peer_id,
                 "Removed peer"
             );
+        }
+
+        if let Some(conn) = removed_control {
+            let mut conn = conn.lock().await;
+            conn.disconnect();
+        }
+
+        if let Some(conn) = removed_election {
+            let mut conn = conn.lock().await;
+            conn.disconnect();
         }
     }
 
@@ -616,6 +675,36 @@ impl PeerManager {
                 );
             }
         }
+
+        let control_peers: Vec<(u16, Arc<Mutex<PeerConnection>>)> = {
+            let peers = self.control_peers.read().await;
+            peers
+                .iter()
+                .map(|(peer_id, conn)| (*peer_id, Arc::clone(conn)))
+                .collect()
+        };
+
+        for (_peer_id, conn) in control_peers {
+            let mut conn = conn.lock().await;
+            if conn.is_connected() {
+                conn.disconnect();
+            }
+        }
+
+        let election_peers: Vec<(u16, Arc<Mutex<PeerConnection>>)> = {
+            let peers = self.election_peers.read().await;
+            peers
+                .iter()
+                .map(|(peer_id, conn)| (*peer_id, Arc::clone(conn)))
+                .collect()
+        };
+
+        for (_peer_id, conn) in election_peers {
+            let mut conn = conn.lock().await;
+            if conn.is_connected() {
+                conn.disconnect();
+            }
+        }
     }
 
     async fn get_peer_connection(
@@ -623,6 +712,28 @@ impl PeerManager {
         peer_id: u16,
     ) -> Result<PeerConnectionHandle, std::io::Error> {
         let peers = self.peers.read().await;
+        peers
+            .get(&peer_id)
+            .cloned()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Peer not found"))
+    }
+
+    async fn get_election_peer_connection(
+        &self,
+        peer_id: u16,
+    ) -> Result<PeerConnectionHandle, std::io::Error> {
+        let peers = self.election_peers.read().await;
+        peers
+            .get(&peer_id)
+            .cloned()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Peer not found"))
+    }
+
+    async fn get_control_peer_connection(
+        &self,
+        peer_id: u16,
+    ) -> Result<PeerConnectionHandle, std::io::Error> {
+        let peers = self.control_peers.read().await;
         peers
             .get(&peer_id)
             .cloned()
@@ -654,23 +765,86 @@ impl PeerManager {
 
         let conn = self.get_peer_connection(peer_id).await?;
         let mut conn = conn.lock().await;
-        if !conn.is_connected() {
-            conn.connect().await?;
+        let outcome = async {
+            if !conn.is_connected() {
+                conn.connect().await?;
+            }
+            conn.send(&msg).await?;
+            conn.recv().await
         }
-        conn.send(&msg).await?;
-        let response_msg = conn.recv().await?;
+        .await;
         let latency = start.elapsed();
-
-        // Record latency for health tracking
         drop(conn);
-        self.record_peer_latency(peer_id, latency).await;
 
-        match response_msg {
-            ReplicationMessage::AppendEntriesResponse(resp) => Ok(resp),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Expected AppendEntriesResponse",
-            )),
+        match outcome {
+            Ok(ReplicationMessage::AppendEntriesResponse(resp)) => {
+                self.record_peer_latency(peer_id, latency).await;
+                Ok(resp)
+            },
+            Ok(_) => {
+                self.record_peer_latency(peer_id, Self::RPC_FAILURE_PENALTY_LATENCY)
+                    .await;
+                let conn = self.get_peer_connection(peer_id).await?;
+                conn.lock().await.disconnect();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Expected AppendEntriesResponse",
+                ))
+            },
+            Err(e) => {
+                self.record_peer_latency(peer_id, Self::RPC_FAILURE_PENALTY_LATENCY)
+                    .await;
+                Err(e)
+            },
+        }
+    }
+
+    /// Send AppendEntries over the control-plane connection.
+    ///
+    /// This isolates heartbeats from data replication so a busy data stream does
+    /// not starve liveness RPCs on the same peer mutex/stream.
+    pub async fn send_append_entries_control(
+        &self,
+        peer_id: u16,
+        request: AppendEntriesRequest,
+    ) -> Result<AppendEntriesResponse, std::io::Error> {
+        let msg = ReplicationMessage::AppendEntriesRequest(request);
+        let start = Instant::now();
+        let conn = self.get_control_peer_connection(peer_id).await?;
+        if conn.try_lock().is_err() {
+            lnc_metrics::increment_control_rpc_starvation();
+        }
+        lnc_metrics::increment_control_rpc_in_flight();
+
+        let mut conn = conn.lock().await;
+        let result = async {
+            if !conn.is_connected() {
+                conn.connect().await?;
+            }
+            conn.send(&msg).await?;
+            let response_msg = conn.recv().await?;
+
+            match response_msg {
+                ReplicationMessage::AppendEntriesResponse(resp) => Ok(resp),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Expected AppendEntriesResponse",
+                )),
+            }
+        }
+        .await;
+
+        lnc_metrics::decrement_control_rpc_in_flight();
+        lnc_metrics::record_raft_vote_rpc_latency_ms(start.elapsed().as_millis() as u64);
+
+        match result {
+            Ok(resp) => Ok(resp),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                let conn = self.get_control_peer_connection(peer_id).await?;
+                conn.lock().await.disconnect();
+                Err(e)
+            },
+            Err(e) => Err(e),
         }
     }
 
@@ -681,20 +855,42 @@ impl PeerManager {
         request: PreVoteRequest,
     ) -> Result<PreVoteResponse, std::io::Error> {
         let msg = ReplicationMessage::PreVoteRequest(request);
-        let conn = self.get_peer_connection(peer_id).await?;
-        let mut conn = conn.lock().await;
-        if !conn.is_connected() {
-            conn.connect().await?;
+        let start = Instant::now();
+        let conn = self.get_election_peer_connection(peer_id).await?;
+        if conn.try_lock().is_err() {
+            lnc_metrics::increment_control_rpc_starvation();
         }
-        conn.send(&msg).await?;
-        let response_msg = conn.recv().await?;
+        lnc_metrics::increment_control_rpc_in_flight();
 
-        match response_msg {
-            ReplicationMessage::PreVoteResponse(resp) => Ok(resp),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Expected PreVoteResponse",
-            )),
+        let mut conn = conn.lock().await;
+        let result = async {
+            if !conn.is_connected() {
+                conn.connect().await?;
+            }
+            conn.send(&msg).await?;
+            let response_msg = conn.recv().await?;
+
+            match response_msg {
+                ReplicationMessage::PreVoteResponse(resp) => Ok(resp),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Expected PreVoteResponse",
+                )),
+            }
+        }
+        .await;
+
+        lnc_metrics::decrement_control_rpc_in_flight();
+        lnc_metrics::record_raft_pre_vote_rpc_latency_ms(start.elapsed().as_millis() as u64);
+
+        match result {
+            Ok(resp) => Ok(resp),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                let conn = self.get_election_peer_connection(peer_id).await?;
+                conn.lock().await.disconnect();
+                Err(e)
+            },
+            Err(e) => Err(e),
         }
     }
 
@@ -705,20 +901,42 @@ impl PeerManager {
         request: VoteRequest,
     ) -> Result<VoteResponse, std::io::Error> {
         let msg = ReplicationMessage::VoteRequest(request);
-        let conn = self.get_peer_connection(peer_id).await?;
-        let mut conn = conn.lock().await;
-        if !conn.is_connected() {
-            conn.connect().await?;
+        let start = Instant::now();
+        let conn = self.get_election_peer_connection(peer_id).await?;
+        if conn.try_lock().is_err() {
+            lnc_metrics::increment_control_rpc_starvation();
         }
-        conn.send(&msg).await?;
-        let response_msg = conn.recv().await?;
+        lnc_metrics::increment_control_rpc_in_flight();
 
-        match response_msg {
-            ReplicationMessage::VoteResponse(resp) => Ok(resp),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Expected VoteResponse",
-            )),
+        let mut conn = conn.lock().await;
+        let result = async {
+            if !conn.is_connected() {
+                conn.connect().await?;
+            }
+            conn.send(&msg).await?;
+            let response_msg = conn.recv().await?;
+
+            match response_msg {
+                ReplicationMessage::VoteResponse(resp) => Ok(resp),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Expected VoteResponse",
+                )),
+            }
+        }
+        .await;
+
+        lnc_metrics::decrement_control_rpc_in_flight();
+        lnc_metrics::record_raft_vote_rpc_latency_ms(start.elapsed().as_millis() as u64);
+
+        match result {
+            Ok(resp) => Ok(resp),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                let conn = self.get_peer_connection(peer_id).await?;
+                conn.lock().await.disconnect();
+                Err(e)
+            },
+            Err(e) => Err(e),
         }
     }
 
@@ -929,23 +1147,37 @@ impl PeerManager {
 
         let conn = self.get_peer_connection(peer_id).await?;
         let mut conn = conn.lock().await;
-        if !conn.is_connected() {
-            conn.connect().await?;
+        let outcome = async {
+            if !conn.is_connected() {
+                conn.connect().await?;
+            }
+            conn.send(&msg).await?;
+            conn.recv().await
         }
-        conn.send(&msg).await?;
-        let response_msg = conn.recv().await?;
+        .await;
         let latency = start.elapsed();
-
-        // Record latency for health tracking
         drop(conn);
-        self.record_peer_latency(peer_id, latency).await;
 
-        match response_msg {
-            ReplicationMessage::AppendEntriesResponse(resp) => Ok((resp, latency)),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Expected AppendEntriesResponse",
-            )),
+        match outcome {
+            Ok(ReplicationMessage::AppendEntriesResponse(resp)) => {
+                self.record_peer_latency(peer_id, latency).await;
+                Ok((resp, latency))
+            },
+            Ok(_) => {
+                self.record_peer_latency(peer_id, Self::RPC_FAILURE_PENALTY_LATENCY)
+                    .await;
+                let conn = self.get_peer_connection(peer_id).await?;
+                conn.lock().await.disconnect();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Expected AppendEntriesResponse",
+                ))
+            },
+            Err(e) => {
+                self.record_peer_latency(peer_id, Self::RPC_FAILURE_PENALTY_LATENCY)
+                    .await;
+                Err(e)
+            },
         }
     }
 
@@ -992,7 +1224,26 @@ impl PeerManager {
     /// Get all known peer IDs
     pub async fn peer_ids(&self) -> Vec<u16> {
         let peers = self.peers.read().await;
-        peers.keys().copied().collect()
+        let health = self.health.read().await;
+
+        let mut ids = Vec::with_capacity(peers.len());
+        for peer_id in peers.keys() {
+            let evicted = health
+                .get(peer_id)
+                .map(|follower_health| follower_health.is_evicted())
+                .unwrap_or(false);
+            if !evicted {
+                ids.push(*peer_id);
+            }
+        }
+
+        // Safety fallback: if all peers are currently evicted, return the full set
+        // so replication can still probe for recovery.
+        if ids.is_empty() {
+            return peers.keys().copied().collect();
+        }
+
+        ids
     }
 }
 
@@ -1004,7 +1255,7 @@ mod tests {
     #[test]
     fn test_peer_config_default() {
         let config = PeerConfig::default();
-        assert_eq!(config.connect_timeout, Duration::from_secs(1));
+        assert_eq!(config.connect_timeout, Duration::from_secs(3));
         assert_eq!(config.read_timeout, Duration::from_secs(10));
         assert_eq!(config.write_timeout, Duration::from_secs(2));
         assert_eq!(config.reconnect_delay, Duration::from_millis(250));

@@ -100,8 +100,8 @@ impl PollResult {
 /// let config = ConsumerConfig::new(topic_id);
 /// let mut consumer = Consumer::connect("lance.example.com:1992", config).await?;
 ///
-/// // Poll for records — auto-reconnects on failure
-/// while let Some(result) = consumer.poll().await? {
+/// // Receive batches — auto-reconnects on failure
+/// while let Some(result) = consumer.next_batch().await? {
 ///     process_data(&result.data);
 ///     if result.end_of_stream {
 ///         break;
@@ -308,15 +308,15 @@ impl Consumer {
         self.seek(SeekPosition::End).await
     }
 
-    /// Poll for the next batch of records
+    /// Receive the next batch of records.
     ///
     /// Returns `Ok(Some(result))` if data was fetched, or `Ok(None)` if
     /// there was no new data available (end of stream reached).
     ///
     /// The consumer's offset is automatically advanced after each successful
-    /// poll. On transient errors, the consumer auto-reconnects and retries
+    /// fetch. On transient errors, the consumer auto-reconnects and retries
     /// from the same offset.
-    pub async fn poll(&mut self) -> Result<Option<PollResult>> {
+    pub async fn next_batch(&mut self) -> Result<Option<PollResult>> {
         // Handle SeekPosition::End that hasn't been resolved yet
         if self.current_offset == u64::MAX {
             let end_offset = self.discover_end_offset().await?;
@@ -335,8 +335,14 @@ impl Consumer {
             end_of_stream,
         };
 
-        // Advance offset
-        self.current_offset = fetch_result.next_offset;
+        // Advance offset only when data is returned.
+        //
+        // During leader churn/catch-up windows, servers may temporarily reply with
+        // empty batches while advertising a later next_offset. Blindly advancing on
+        // empty responses can skip unread records and create apparent gaps.
+        if !result.is_empty() {
+            self.current_offset = fetch_result.next_offset;
+        }
         self.cached_end_offset = Some(fetch_result.next_offset);
 
         if result.is_empty() {
@@ -344,6 +350,18 @@ impl Consumer {
         } else {
             Ok(Some(result))
         }
+    }
+
+    /// Primary consume interface alias.
+    #[inline]
+    pub async fn consume(&mut self) -> Result<Option<PollResult>> {
+        self.next_batch().await
+    }
+
+    /// Compatibility wrapper for callers still using polling terminology.
+    #[inline]
+    pub async fn poll(&mut self) -> Result<Option<PollResult>> {
+        self.next_batch().await
     }
 
     /// Poll for records, blocking until data is available or timeout
@@ -504,7 +522,7 @@ impl Consumer {
     ///
     /// # Example
     /// ```ignore
-    /// let records = consumer.poll().await?;
+    /// let records = consumer.next_batch().await?;
     /// process(records);
     /// consumer.commit().await?;  // Persist offset for crash recovery
     /// ```
@@ -627,7 +645,7 @@ impl StreamingConsumerConfig {
 /// consumer.start().await?;
 ///
 /// // Process records
-/// while let Some(result) = consumer.poll().await? {
+/// while let Some(result) = consumer.next_batch().await? {
 ///     process_data(&result.data);
 ///     consumer.commit().await?; // Checkpoint progress
 /// }
@@ -726,11 +744,11 @@ impl StreamingConsumer {
         Ok(())
     }
 
-    /// Poll for the next batch of records
+    /// Receive the next batch of records for an active subscription.
     ///
     /// Returns `Ok(Some(result))` if data was fetched, or `Ok(None)` if
     /// no new data is available.
-    pub async fn poll(&mut self) -> Result<Option<PollResult>> {
+    pub async fn next_batch(&mut self) -> Result<Option<PollResult>> {
         if !self.is_subscribed {
             return Err(ClientError::ProtocolError(
                 "Consumer not subscribed - call start() first".to_string(),
@@ -767,6 +785,18 @@ impl StreamingConsumer {
         } else {
             Ok(Some(result))
         }
+    }
+
+    /// Primary consume interface alias.
+    #[inline]
+    pub async fn consume(&mut self) -> Result<Option<PollResult>> {
+        self.next_batch().await
+    }
+
+    /// Compatibility wrapper for callers still using polling terminology.
+    #[inline]
+    pub async fn poll(&mut self) -> Result<Option<PollResult>> {
+        self.next_batch().await
     }
 
     /// Commit the current offset to the server

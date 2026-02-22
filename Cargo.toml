@@ -56,7 +56,7 @@ memmap2 = "0.9"
 flatbuffers = "24.3"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
-opentelemetry = "0.27"
+opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = "0.27"
 tonic = "0.12"

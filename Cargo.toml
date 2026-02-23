@@ -58,7 +58,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = "0.27"
+opentelemetry-otlp = "0.31"
 tonic = "0.12"
 tempfile = "3.10"
 rayon = "1.10"

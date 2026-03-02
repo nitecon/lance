@@ -14,16 +14,14 @@ pub struct TopicWriter {
 
 /// Create a new topic writer for the given topic
 pub fn create_topic_writer(
-    config: &Config,
+    _config: &Config,
     topic_registry: &TopicRegistry,
     topic_id: u32,
 ) -> Result<TopicWriter> {
-    let topic_dir = if topic_id == 0 {
-        // Legacy/default topic uses segments/ directly
-        config.data_dir.join("segments").join("0")
-    } else {
-        topic_registry.get_topic_dir(topic_id)
-    };
+    // Name-based storage: all topics resolve through the registry.
+    // topic_id==0 is the legacy/default topic and also goes through
+    // the registry lookup (which falls back to "0" if not registered).
+    let topic_dir = topic_registry.get_topic_dir(topic_id);
 
     std::fs::create_dir_all(&topic_dir)?;
 
@@ -52,7 +50,7 @@ pub fn create_topic_writer(
 
 /// Rotate to a new segment when the current one reaches max size
 pub fn rotate_topic_segment(
-    config: &Config,
+    _config: &Config,
     topic_registry: &TopicRegistry,
     topic_id: u32,
     topic_writer: &mut TopicWriter,
@@ -67,11 +65,7 @@ pub fn rotate_topic_segment(
     let closed_path = topic_writer.writer.close(end_timestamp)?;
     topic_writer.index_builder.write_indexes(&closed_path)?;
 
-    let topic_dir = if topic_id == 0 {
-        config.data_dir.join("segments").join("0")
-    } else {
-        topic_registry.get_topic_dir(topic_id)
-    };
+    let topic_dir = topic_registry.get_topic_dir(topic_id);
 
     let new_start_index = topic_writer.writer.start_index() + topic_writer.writer.record_count();
     let new_segment_path = topic_dir.join(format!("{}_{}.lnc", new_start_index, end_timestamp));
@@ -89,9 +83,15 @@ pub fn rotate_topic_segment(
     Ok(())
 }
 
-/// Find the next segment index for a topic directory
+/// Find the next available segment index for a topic directory.
+///
+/// Returns 0 for an empty directory, or `max_existing_index + 1` when
+/// segments already exist.  This prevents multiple writers (e.g. with
+/// `actor_count > 1`) from creating segments with overlapping start
+/// indices, which would corrupt the cumulative byte-offset addressing
+/// used by `read_from_offset`.
 pub fn find_next_segment_index(segments_dir: &std::path::Path) -> Result<u64> {
-    let mut max_index = 0u64;
+    let mut max_index: Option<u64> = None;
 
     if segments_dir.exists() {
         for entry in std::fs::read_dir(segments_dir)? {
@@ -102,7 +102,7 @@ pub fn find_next_segment_index(segments_dir: &std::path::Path) -> Result<u64> {
                 if let Some(filename) = path.file_stem().and_then(|s| s.to_str()) {
                     if let Some(index_str) = filename.split('_').next() {
                         if let Ok(index) = index_str.parse::<u64>() {
-                            max_index = max_index.max(index);
+                            max_index = Some(max_index.map_or(index, |cur: u64| cur.max(index)));
                         }
                     }
                 }
@@ -110,5 +110,5 @@ pub fn find_next_segment_index(segments_dir: &std::path::Path) -> Result<u64> {
         }
     }
 
-    Ok(max_index)
+    Ok(max_index.map_or(0, |idx| idx + 1))
 }

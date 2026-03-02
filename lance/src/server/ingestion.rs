@@ -130,18 +130,15 @@ pub fn write_replicated_data(
 /// - Write offset must match the follower's current segment position
 /// - Segment names are dictated by the leader — followers never create segments independently
 pub fn write_replicated_data_enriched(
-    config: &Config,
+    _config: &Config,
     topic_registry: &TopicRegistry,
     topic_writers: &mut HashMap<(u32, String), TopicWriter>,
     entry: &lnc_replication::DataReplicationEntry,
 ) -> Result<()> {
     let topic_id = entry.topic_id;
     let writer_key = (topic_id, entry.segment_name.clone());
-    let topic_dir = if topic_id == 0 {
-        config.data_dir.join("segments").join("0")
-    } else {
-        topic_registry.get_topic_dir(topic_id)
-    };
+    // Name-based storage: all topics resolve through the registry
+    let topic_dir = topic_registry.get_topic_dir(topic_id);
     std::fs::create_dir_all(&topic_dir)?;
 
     fn find_closed_segment_variant(

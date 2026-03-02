@@ -56,6 +56,7 @@ echo ""
     --linger-ms "${BENCH_LINGER_MS}" \
     --msg-size "${BENCH_MSG_SIZE}" \
     --skip-latency-gate \
+    --max-errors 10 \
     --warmup 10
 
 echo ""

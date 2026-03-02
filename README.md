@@ -138,6 +138,26 @@ At 100Gbps, crossing the QPI/UPI link between CPU sockets adds 30-50ns per acces
 
 ## Storage Format
 
+### Topic Storage Layout
+
+Topics are stored on disk under `{data_dir}/segments/{topic_name}/`. Each topic directory contains segment files (`.lnc`), index files (`.idx`), and a `metadata.json`.
+
+```
+/var/lib/lance/segments/
+  rithmic-dev/
+    0_1700000000000000000.lnc
+    0_1700000000000000000.idx
+    metadata.json
+  market-data/
+    0_1700000000000000000.lnc
+    0_1700000000000000000.idx
+    metadata.json
+```
+
+Topic names must match `[a-zA-Z0-9-]` (alphanumeric and dashes only).
+
+> **Upgrading from an earlier version?** Prior versions stored topics under numeric ID directories (`segments/1/`, `segments/2/`). See the [CHANGELOG](docs/CHANGELOG.md) for migration instructions.
+
 ### Segment Files (`.lnc`)
 
 Immutable, append-only files containing TLV-encoded records:
@@ -585,6 +605,7 @@ cargo add lnc-client
 
 | Document                                          | Description                             |
 |---------------------------------------------------|-----------------------------------------|
+| [CHANGELOG](docs/CHANGELOG.md)                    | Breaking changes and migration guides   |
 | [Architecture](docs/Architecture.md)              | Deep-dive into system design            |
 | [Coding Guidelines](docs/CodingGuidelines.md)     | Engineering standards and requirements  |
 | [Kubernetes Deployment](k8s/lance-cluster.yaml)   | Production StatefulSet configuration    |

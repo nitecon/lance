@@ -327,7 +327,7 @@ impl LanceClient {
         Ok(Self {
             stream: ClientStream::Tcp(stream),
             config,
-            batch_id: AtomicU64::new(0),
+            batch_id: AtomicU64::new(1),
             read_buffer: vec![0u8; 64 * 1024],
             read_offset: 0,
         })
@@ -391,7 +391,7 @@ impl LanceClient {
         Ok(Self {
             stream: ClientStream::Tls(tls_stream),
             config,
-            batch_id: AtomicU64::new(0),
+            batch_id: AtomicU64::new(1),
             read_buffer: vec![0u8; 64 * 1024],
             read_offset: 0,
         })
@@ -414,7 +414,7 @@ impl LanceClient {
     }
 
     fn next_batch_id(&self) -> u64 {
-        self.batch_id.fetch_add(1, Ordering::SeqCst) + 1
+        self.batch_id.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Sends an ingest frame to the default topic (ID 0) while preserving the
@@ -534,35 +534,53 @@ impl LanceClient {
     /// Surfaces protocol mismatches, server backpressure, or error frames so
     /// callers can react immediately.
     async fn wait_for_ack(&mut self, expected_batch_id: u64) -> Result<u64> {
-        let frame = self.recv_frame().await?;
+        // Defensive drain: if a stale ack (batch_id < expected) is in the read
+        // buffer -- e.g. from a prior forwarding-path mismatch -- skip it and
+        // keep reading until we see the expected batch_id or a non-ack frame.
+        // This prevents a single stale ack from cascading into every subsequent
+        // send on this connection.
+        loop {
+            let frame = self.recv_frame().await?;
 
-        match frame.frame_type {
-            FrameType::Ack => {
-                let acked_id = frame.batch_id();
-                if acked_id != expected_batch_id {
+            match frame.frame_type {
+                FrameType::Ack => {
+                    let acked_id = frame.batch_id();
+                    if acked_id == expected_batch_id {
+                        trace!(batch_id = acked_id, "Received ack");
+                        return Ok(acked_id);
+                    }
+                    if acked_id < expected_batch_id {
+                        warn!(
+                            expected = expected_batch_id,
+                            received = acked_id,
+                            "Draining stale ack with lower batch_id"
+                        );
+                        continue;
+                    }
+                    // acked_id > expected: this is a protocol violation, not a stale ack.
                     return Err(ClientError::InvalidResponse(format!(
-                        "Ack batch_id mismatch: sent {}, received {}",
+                        "Ack batch_id mismatch: sent {}, received {} (ahead)",
                         expected_batch_id, acked_id
                     )));
-                }
-                trace!(batch_id = acked_id, "Received ack");
-                Ok(acked_id)
-            },
-            FrameType::Control(ControlCommand::ErrorResponse) => {
-                let error_msg = frame
-                    .payload
-                    .map(|p| String::from_utf8_lossy(&p).to_string())
-                    .unwrap_or_else(|| "Unknown error".to_string());
-                Err(ClientError::ServerError(error_msg))
-            },
-            FrameType::Backpressure => {
-                warn!("Server signaled backpressure");
-                Err(ClientError::ServerBackpressure)
-            },
-            other => Err(ClientError::InvalidResponse(format!(
-                "Expected Ack, got {:?}",
-                other
-            ))),
+                },
+                FrameType::Control(ControlCommand::ErrorResponse) => {
+                    let error_msg = frame
+                        .payload
+                        .map(|p| String::from_utf8_lossy(&p).to_string())
+                        .unwrap_or_else(|| "Unknown error".to_string());
+                    return Err(ClientError::ServerError(error_msg));
+                },
+                FrameType::Backpressure => {
+                    warn!("Server signaled backpressure");
+                    return Err(ClientError::ServerBackpressure);
+                },
+                other => {
+                    return Err(ClientError::InvalidResponse(format!(
+                        "Expected Ack, got {:?}",
+                        other
+                    )));
+                },
+            }
         }
     }
 

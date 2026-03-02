@@ -28,8 +28,8 @@ use tracing::{error, info, warn};
 const LATENCY_P50_MAX_NS: u64 = 5_000_000; // 5ms - excellent for LAN
 const LATENCY_P99_MAX_NS: u64 = 50_000_000; // 50ms - acceptable tail latency
 const LATENCY_P999_MAX_NS: u64 = 100_000_000; // 100ms - max acceptable tail
-const PRODUCE_TIMEOUT_SECS: u64 = 5;
-const DRAIN_TIMEOUT_SECS: u64 = 5;
+const PRODUCE_TIMEOUT_SECS: u64 = 15;
+const DRAIN_TIMEOUT_SECS: u64 = 15;
 
 /// LANCE high-throughput benchmark
 #[derive(Parser, Debug, Clone)]

@@ -2,6 +2,7 @@
 
 ## Documents
 
+- [CHANGELOG](CHANGELOG.md)
 - [Technical Design: Project LANCE](Architecture.md)
 - [LANCE Engineering Standards](CodingGuidelines.md)
 - [Lance Wire Protocol (LWP) Specification](LWP-Specification.md)

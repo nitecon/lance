@@ -60,7 +60,7 @@ opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = "0.27"
 tonic = "0.12"
-tempfile = "3.10"
+tempfile = "3.26"
 rayon = "1.10"
 socket2 = "0.5"
 io-uring = "0.7"

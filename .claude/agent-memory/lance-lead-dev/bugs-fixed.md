@@ -44,3 +44,28 @@
 **Files changed**:
 - `lance/src/topic.rs` -- `read_from_offset()`, `total_data_size()`, clippy fixes
 - `lance/src/server/writer.rs` -- `find_next_segment_index()` returns `max_index + 1`
+
+## Multi-Actor Ordering Bug — LeaderConnectionPool Routing Key Scatter (2026-03-02)
+
+**Symptom**: lnc-chaos with `--payload-size 4096` and `--ingestion-actor-count 8` in K8s passes all 465 messages (no data loss) but shows 237 gaps and 35 dups — messages arrive OUT OF ORDER. With `--payload-size 512` passes cleanly (same rate). 0 parse errors, 0 reconnects.
+
+**Root Cause**: `MultiActorSender::send()` computed actor dispatch as:
+```
+mixed = (topic_id * GOLDEN_RATIO) ^ routing_key
+actor_id = mixed % actor_count
+```
+The `routing_key` is a per-TCP-connection counter assigned in `handle_connection`. When the client connects to a **follower** node, the follower's `LeaderConnectionPool` (default `pool_size: 8`) maintains up to 8 TCP connections to the leader. Each pooled connection gets a different `routing_key` on the leader side. This caused XOR to produce different `mixed` values for the same `topic_id`, scattering a single topic's messages across multiple ingestion actors. Each actor writes to its own segment file. When the consumer reads via `read_from_offset`, segments are assembled by `start_index` order which does NOT match produce order, causing the ordering violations.
+
+**Why 512-byte payloads passed**: The forwarding pool reuses connections. With small 512-byte payloads, messages are forwarded quickly over a single reused connection (low latency = low pool concurrency). With 4096-byte payloads, higher latency per forward increases pool concurrency, making it more likely that different messages use different pooled connections (and thus different routing_keys).
+
+**Fix**: Changed `MultiActorSender::send()` to hash on `topic_id` ONLY:
+```
+hashed = (topic_id * GOLDEN_RATIO)
+actor_id = hashed % actor_count
+```
+This guarantees all messages for the same topic always go to the same actor regardless of which connection they arrive on. Multi-actor parallelism is preserved across different topics.
+
+**Files changed**:
+- `lance/src/server/multi_actor.rs` -- topic-only hash dispatch, updated tests
+- `lance/src/server/ingestion.rs` -- updated `routing_key` doc comment, `#[allow(dead_code)]`
+- `lance/src/server/connection.rs` -- updated `routing_key` doc comment

@@ -35,10 +35,15 @@ fn payload_matches_existing_segment(
 }
 
 /// Request to ingest data into a topic
+#[allow(dead_code)]
 pub struct IngestionRequest {
     pub topic_id: u32,
-    /// Connection-scoped routing key used to shard hot topics across actors
-    /// while preserving per-connection ordering.
+    /// Connection-scoped routing key (retained for diagnostic tracing).
+    ///
+    /// Previously used to shard hot topics across actors, but this broke
+    /// per-topic ordering when writes were forwarded from followers via a
+    /// connection pool (each pooled connection had a different routing_key).
+    /// Actor dispatch now uses `topic_id` only — see `MultiActorSender::send`.
     pub routing_key: u64,
     pub timestamp_ns: u64,
     pub record_count: u32,

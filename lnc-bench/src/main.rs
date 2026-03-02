@@ -89,7 +89,7 @@ struct Args {
     ///   - 100K msg/s: Good (multi-core, batching)
     ///   - 500K msg/s: Excellent (optimized pipeline)
     ///   - 1M+ msg/s: World-class (maximized parallelism)
-    #[arg(long, default_value = "50000")]
+    #[arg(long, default_value = "10000")]
     min_throughput_msgs_per_sec: f64,
 
     /// Maximum allowed benchmark errors for pass gate

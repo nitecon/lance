@@ -45,7 +45,8 @@ struct ConnectionContext<'a, S> {
     quorum_manager: &'a Option<Arc<AsyncQuorumManager>>,
     /// This node's ID (for recording leader's own quorum ACK)
     node_id: u16,
-    /// Stable connection-scoped key for hot-topic actor sharding.
+    /// Stable connection-scoped key (retained for diagnostic tracing).
+    /// Actor dispatch now uses topic_id only for per-topic ordering.
     routing_key: u64,
 }
 

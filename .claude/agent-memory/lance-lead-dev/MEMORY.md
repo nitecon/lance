@@ -7,13 +7,15 @@
 - **Cursor-based parsing**: `process_frames` in `connection.rs` uses cursor to avoid O(N^2) copy_within per frame. Single shift at end of loop.
 - **Forwarding path**: Non-leader nodes forward raw frame bytes to leader via `try_forward_to_leader`. Leader acks are relayed back to client.
 - **Error retryability**: `InvalidResponse` is NOT retryable (connection stays open), `ServerBackpressure`/`Timeout`/`ConnectionClosed` are retryable.
-- **Multi-actor ingestion**: `actor_count` routes requests via topic_id hash. Each actor has its own segment writers. Production uses `actor_count=8`.
+- **Multi-actor ingestion**: `actor_count` routes requests via `topic_id`-only hash (NOT XOR'd with routing_key). Each actor has its own segment writers. Production uses `actor_count=8`. Per-topic ordering is guaranteed; multi-topic parallelism across actors.
 - **BufWriter 4 MiB buffer**: SegmentWriter uses BufWriter with 4 MiB capacity. Auto-flush can make file visible to readers before explicit fsync.
 - **DirEntry metadata staleness (Windows)**: `DirEntry::metadata()` from `read_dir` caches file size at scan time. On Windows, this can be stale vs `File::metadata()`.
+- **LeaderConnectionPool**: Follower nodes maintain a pool of up to 8 TCP connections to the leader for write forwarding (`lnc-replication/src/forward.rs`). Each pooled connection gets a unique `routing_key` on the leader side. This is why actor dispatch must NOT use `routing_key` — it would scatter one topic across actors.
 
 ## Known Bugs Fixed
 - See [bugs-fixed.md](bugs-fixed.md) for details on the batch_id mismatch forwarding bug.
 - See [bugs-fixed.md](bugs-fixed.md) for the large payload corruption, stale metadata, and segment index collision bugs.
+- See [bugs-fixed.md](bugs-fixed.md) for the multi-actor ordering bug caused by LeaderConnectionPool routing_key scatter.
 
 ## File Locations
 - Server connection handler: `lance/src/server/connection.rs`
@@ -27,6 +29,8 @@
 - Topic registry/read path: `lance/src/topic.rs`
 - Segment writer: `lance/src/server/writer.rs`
 - Multi-actor ingestion: `lance/src/server/multi_actor.rs`
+- Leader forwarding pool: `lnc-replication/src/forward.rs`
+- Chaos test: `lnc-chaos/src/main.rs`
 
 ## Test Infrastructure
 - Unit tests: `cargo test -p lance`, `cargo test -p lnc-client`, `cargo test -p lnc-network`

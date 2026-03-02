@@ -87,7 +87,7 @@ pub struct StandaloneConfig {
     pub consumer_id: String,
     /// Topic ID to consume from.
     ///
-    /// When this is `0` and [`topic_name`] is `Some`, the consumer will
+    /// When this is `0` and [`topic_name`](Self::topic_name) is `Some`, the consumer will
     /// resolve the name to an ID on the first call to
     /// [`StandaloneConsumer::connect`].
     pub topic_id: u32,
@@ -584,7 +584,7 @@ impl StandaloneConsumerBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::InvalidTopicName`] if `topic_name` contains
+    /// Returns [`ClientError::InvalidTopicName`](crate::ClientError::InvalidTopicName) if `topic_name` contains
     /// characters outside `[a-zA-Z0-9-]` or is empty.
     pub async fn build_for_topic_name(
         &self,

@@ -144,6 +144,25 @@ impl DataPlaneConnection {
         self.state = DataPlaneState::Disconnected;
     }
 
+    /// Update the target address. Disconnects any existing stream and resets
+    /// reconnect state so the next `replicate_with_ack` connects to the new address.
+    pub async fn update_address(&mut self, new_addr: SocketAddr) {
+        let old_addr = self.addr;
+        if let Some(mut stream) = self.stream.take() {
+            let _ = stream.shutdown().await;
+        }
+        self.addr = new_addr;
+        self.state = DataPlaneState::Disconnected;
+        self.reconnect_attempts = 0;
+        info!(
+            target: "lance::data_plane",
+            node_id = self.node_id,
+            old_addr = %old_addr,
+            new_addr = %new_addr,
+            "Updated data plane connection address"
+        );
+    }
+
     /// Send data replication entry and wait for ACK
     pub async fn replicate_with_ack(
         &mut self,
@@ -243,6 +262,32 @@ impl DataPlaneManager {
                 node_id,
                 "Removed follower from data plane"
             );
+        }
+    }
+
+    /// Update address for an existing follower. Returns true if address was changed.
+    pub async fn update_follower_address(&self, node_id: u16, addr: SocketAddr) -> bool {
+        let conn = {
+            let connections = self.connections.read().await;
+            connections.get(&node_id).cloned()
+        };
+        if let Some(conn) = conn {
+            let mut conn = conn.lock().await;
+            if conn.addr != addr {
+                conn.update_address(addr).await;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get the current address for a follower's data plane connection.
+    pub async fn get_follower_addr(&self, node_id: u16) -> Option<SocketAddr> {
+        let connections = self.connections.read().await;
+        if let Some(conn) = connections.get(&node_id) {
+            Some(conn.lock().await.addr)
+        } else {
+            None
         }
     }
 

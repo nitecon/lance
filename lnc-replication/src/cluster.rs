@@ -976,6 +976,34 @@ impl ClusterCoordinator {
             }
         }
 
+        // Update existing followers whose address has changed (e.g. pod restart)
+        for peer_id in &peer_ids {
+            if *peer_id == my_node_id {
+                continue;
+            }
+            if data_plane_ids.contains(peer_id) {
+                if let Some(control_addr) = self.peers.get_peer_addr(*peer_id).await {
+                    let expected_dp_addr = SocketAddr::new(control_addr.ip(), 1995);
+                    if let Some(current_dp_addr) =
+                        self.data_plane_manager.get_follower_addr(*peer_id).await
+                    {
+                        if current_dp_addr != expected_dp_addr {
+                            info!(
+                                target: "lance::cluster",
+                                node_id = peer_id,
+                                old_addr = %current_dp_addr,
+                                new_addr = %expected_dp_addr,
+                                "Updating stale data plane address for follower"
+                            );
+                            self.data_plane_manager
+                                .update_follower_address(*peer_id, expected_dp_addr)
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+
         // Remove followers that are no longer in control plane (or self)
         for dp_id in &data_plane_ids {
             if !peer_ids.contains(dp_id) || *dp_id == my_node_id {
@@ -1377,6 +1405,7 @@ impl ClusterCoordinator {
         );
 
         let mut successful_peers = Vec::new();
+        let mut failed_peers = Vec::new();
         let mut join_set = tokio::task::JoinSet::new();
 
         // Clone follower_ids for use in spawned tasks (they need 'static lifetime)
@@ -1414,6 +1443,7 @@ impl ClusterCoordinator {
                         follower_id = follower_id,
                         "Data replication failed to follower"
                     );
+                    failed_peers.push(follower_id);
                 },
                 Err(e) => {
                     warn!(
@@ -1422,6 +1452,28 @@ impl ClusterCoordinator {
                         "Data replication task panicked"
                     );
                 },
+            }
+        }
+
+        // Reactively check for stale addresses on failed followers.
+        // Updates take effect on the NEXT replication call (no retry here).
+        if !failed_peers.is_empty() {
+            for &failed_id in &failed_peers {
+                if let Some(control_addr) = self.peers.get_peer_addr(failed_id).await {
+                    let expected_dp_addr = SocketAddr::new(control_addr.ip(), 1995);
+                    if self
+                        .data_plane_manager
+                        .update_follower_address(failed_id, expected_dp_addr)
+                        .await
+                    {
+                        info!(
+                            target: "lance::cluster",
+                            follower_id = failed_id,
+                            new_addr = %expected_dp_addr,
+                            "Reactively updated stale data plane address after replication failure"
+                        );
+                    }
+                }
             }
         }
 

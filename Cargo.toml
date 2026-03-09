@@ -53,7 +53,7 @@ hyper = { version = "1.1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 memmap2 = "0.9"
-flatbuffers = "24.3"
+flatbuffers = "25.12"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 opentelemetry = "0.27"

@@ -27,6 +27,7 @@ lnc = { path = "../lnc" }
 
 bytes = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 flume = { workspace = true }
@@ -34,7 +35,7 @@ crossbeam = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
@@ -47,7 +48,7 @@ default = []
 tls = ["lnc-network/tls"]
 
 [dev-dependencies]
-tempfile = "3.10"
+tempfile = "3.27"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]

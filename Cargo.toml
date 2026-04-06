@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.0.0-source"
 edition = "2024"
 authors = ["LANCE Team"]
 license = "Apache-2.0"
@@ -26,14 +26,14 @@ homepage = "https://github.com/nitecon/lance"
 documentation = "https://docs.rs/lnc-client"
 
 [workspace.dependencies]
-lnc-core = { path = "lnc-core", version = "0.1.4" }
-lnc-io = { path = "lnc-io", version = "0.1.4" }
-lnc-network = { path = "lnc-network", version = "0.1.4" }
-lnc-index = { path = "lnc-index", version = "0.1.4" }
-lnc-metrics = { path = "lnc-metrics", version = "0.1.4" }
-lnc-replication = { path = "lnc-replication", version = "0.1.4" }
-lnc-recovery = { path = "lnc-recovery", version = "0.1.4" }
-lnc-client = { path = "lnc-client", version = "0.1.4" }
+lnc-core = { path = "lnc-core", version = "0.0.0-source" }
+lnc-io = { path = "lnc-io", version = "0.0.0-source" }
+lnc-network = { path = "lnc-network", version = "0.0.0-source" }
+lnc-index = { path = "lnc-index", version = "0.0.0-source" }
+lnc-metrics = { path = "lnc-metrics", version = "0.0.0-source" }
+lnc-replication = { path = "lnc-replication", version = "0.0.0-source" }
+lnc-recovery = { path = "lnc-recovery", version = "0.0.0-source" }
+lnc-client = { path = "lnc-client", version = "0.0.0-source" }
 
 bytes = "1.5"
 zerocopy = { version = "0.8", features = ["derive"] }
@@ -41,26 +41,31 @@ thiserror = "2.0"
 crossbeam = "0.8"
 crc32fast = "1.3"
 libc = "0.2"
-tokio = { version = "1.35", features = ["full"] }
+tokio = { version = "1.51", features = ["full"] }
+futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 flume = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
-hyper = { version = "1.1", features = ["server", "http1"] }
+hyper = { version = "1.9", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 memmap2 = "0.9"
-flatbuffers = "24.3"
+flatbuffers = "25.12"
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = "0.27"
 tonic = "0.12"
-tempfile = "3.10"
+tempfile = "3.27"
+rayon = "1.10"
+socket2 = "0.5"
 io-uring = "0.7"
+dashmap = "6.1"
+parking_lot = "0.12"
 
 [profile.release]
 lto = true

@@ -1,3 +1,43 @@
+//! Quorum tracking for data plane replication (DATA PLANE).
+//!
+//! This module is part of the DATA PLANE, not the control plane.
+//! It manages quorum tracking for client write operations, ensuring that
+//! writes are acknowledged to clients only after a majority of nodes have
+//! received the data.
+//!
+//! # Architecture Note: Control Plane vs Data Plane
+//!
+//! LANCE separates control plane (Raft) from data plane (independent replication):
+//!
+//! - **Control Plane (Raft)**: Handles leader election and metadata consensus.
+//!   See `lnc-replication/src/raft.rs` and `lnc-replication/src/cluster.rs`.
+//!
+//! - **Data Plane (this module)**: Handles actual data replication with quorum
+//!   tracking. This is the "fast path" focused on throughput. Client writes
+//!   are acknowledged only after a majority of nodes have the data.
+//!
+//! # Write Flow with Quorum
+//!
+//! 1. Leader receives write from client
+//! 2. Leader writes locally (immediate durability)
+//! 3. Leader registers write with `AsyncQuorumManager`
+//! 4. Leader replicates to followers via data plane (concurrent)
+//! 5. Followers receive data, write locally, ACK back to leader
+//! 6. Leader counts local write + follower ACKs
+//! 7. Once quorum reached (e.g., 2/3 for 3-node cluster), leader ACKs client
+//! 8. Control plane tracks offsets separately via periodic reports (~50ms)
+//!
+//! # Key Point
+//!
+//! The quorum wait happens in the DATA PLANE, NOT in Raft. The client ACK
+//! waits for data durability on a majority of nodes (data plane quorum),
+//! NOT for Raft consensus (control plane quorum).
+//!
+//! For control plane implementation, see `lnc-replication/src/raft.rs`.
+//!
+//! See `docs/Architecture.md` section "Control Plane vs Data Plane Architecture"
+//! for detailed explanation.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +56,10 @@ impl QuorumConfig {
         Self {
             total_nodes,
             required_acks,
-            timeout_ms: 100,
+            // Increased from 100ms to 1000ms for production stability.
+            // 100ms was causing OOMKilled cascades under benchmark load due to
+            // quorum timeouts triggering retries and memory pressure.
+            timeout_ms: 1000,
         }
     }
 
@@ -25,15 +68,30 @@ impl QuorumConfig {
         self
     }
 
+    /// Recalculate quorum based on current healthy node count.
+    ///
+    /// **Safety-first invariant** (Architecture §4.1.1): The required ACKs
+    /// can never drop below the static majority of `total_nodes`. This
+    /// prevents a scenario where a 5-node cluster with 4 degraded nodes
+    /// accepts writes with quorum=1, which would violate Raft's safety
+    /// guarantee and risk split-brain during network partitions.
+    ///
+    /// The floor is `(total_nodes / 2) + 1` — the same majority required
+    /// when all nodes are healthy. Adaptive eviction improves *latency*
+    /// (by not waiting for slow followers) but never weakens *durability*.
     pub fn recalculate(&mut self, healthy_nodes: usize) {
-        self.required_acks = (healthy_nodes / 2) + 1;
-        self.required_acks = self.required_acks.max(1);
+        let adaptive_quorum = (healthy_nodes / 2) + 1;
+        let static_floor = (self.total_nodes / 2) + 1;
+
+        self.required_acks = adaptive_quorum.max(static_floor).max(1);
 
         tracing::info!(
             target: "lance::replication",
-            healthy_nodes = healthy_nodes,
+            healthy_nodes,
+            adaptive_quorum,
+            static_floor,
             required_acks = self.required_acks,
-            "Quorum recalculated"
+            "Quorum recalculated (floor enforced)"
         );
     }
 
@@ -139,13 +197,93 @@ struct PendingWrite {
     created_at: std::time::Instant,
 }
 
+/// Number of shards for the pending write map.
+///
+/// At 100Gbps with 10,000+ in-flight writes, a single `RwLock<HashMap>` becomes
+/// a massive synchronization point that flushes CPU caches and stalls ingestion.
+/// Sharding by `write_id % NUM_SHARDS` reduces lock contention probability by 64x.
+const NUM_SHARDS: usize = 64;
+
+/// Sharded pending-write map that eliminates global lock contention.
+///
+/// Instead of one `RwLock<HashMap>`, we maintain `NUM_SHARDS` independent
+/// `RwLock<HashMap>` slots. Each ACK/NACK only locks the shard that owns
+/// the target `write_id`, so concurrent operations on different shards
+/// never contend.
+struct ShardedPendingMap {
+    shards: Box<[RwLock<HashMap<u64, PendingWrite>>]>,
+}
+
+impl ShardedPendingMap {
+    fn new() -> Self {
+        let shards: Vec<RwLock<HashMap<u64, PendingWrite>>> = (0..NUM_SHARDS)
+            .map(|_| RwLock::new(HashMap::new()))
+            .collect();
+        Self {
+            shards: shards.into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    fn shard_for(&self, write_id: u64) -> &RwLock<HashMap<u64, PendingWrite>> {
+        &self.shards[(write_id as usize) % NUM_SHARDS]
+    }
+
+    async fn insert(&self, write_id: u64, write: PendingWrite) {
+        let mut shard = self.shard_for(write_id).write().await;
+        shard.insert(write_id, write);
+    }
+
+    async fn remove(&self, write_id: u64) -> Option<PendingWrite> {
+        let mut shard = self.shard_for(write_id).write().await;
+        shard.remove(&write_id)
+    }
+
+    /// Total pending writes across all shards (for metrics).
+    async fn len(&self) -> usize {
+        let mut total = 0;
+        for shard in self.shards.iter() {
+            total += shard.read().await.len();
+        }
+        total
+    }
+
+    /// Clean up stale writes across all shards.
+    async fn cleanup_stale(&self, max_age: Duration) {
+        let now = std::time::Instant::now();
+        for shard in self.shards.iter() {
+            let mut map = shard.write().await;
+            let stale_ids: Vec<u64> = map
+                .iter()
+                .filter(|(_, w)| now.duration_since(w.created_at) > max_age)
+                .map(|(id, _)| *id)
+                .collect();
+
+            for write_id in stale_ids {
+                if let Some(write) = map.remove(&write_id) {
+                    tracing::warn!(
+                        target: "lance::replication",
+                        write_id,
+                        "Cleaning up stale pending write"
+                    );
+                    let _ = write.result_tx.send(QuorumResult::Timeout);
+                }
+            }
+        }
+    }
+}
+
 /// Manages async quorum waiting for L3 quorum replication
 ///
 /// When a write is submitted, it returns a channel that will receive
 /// the quorum result once enough ACKs are received or timeout occurs.
+///
+/// Uses a sharded pending-write map (`NUM_SHARDS` = 64) so that
+/// concurrent ACK/NACK processing on different write IDs never
+/// contends on the same lock.
 pub struct AsyncQuorumManager {
     config: QuorumConfig,
-    pending: Arc<RwLock<HashMap<u64, PendingWrite>>>,
+    pending: Arc<ShardedPendingMap>,
     next_write_id: std::sync::atomic::AtomicU64,
 }
 
@@ -153,9 +291,21 @@ impl AsyncQuorumManager {
     pub fn new(config: QuorumConfig) -> Self {
         Self {
             config,
-            pending: Arc::new(RwLock::new(HashMap::new())),
+            pending: Arc::new(ShardedPendingMap::new()),
             next_write_id: std::sync::atomic::AtomicU64::new(1),
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn required_acks(&self) -> usize {
+        self.config.required_acks
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn timeout_ms(&self) -> u64 {
+        self.config.timeout_ms
     }
 
     /// Register a new write and get a channel to await quorum
@@ -172,10 +322,7 @@ impl AsyncQuorumManager {
             created_at: std::time::Instant::now(),
         };
 
-        {
-            let mut pending = self.pending.write().await;
-            pending.insert(write_id, pending_write);
-        }
+        self.pending.insert(write_id, pending_write).await;
 
         tracing::debug!(
             target: "lance::replication",
@@ -189,9 +336,9 @@ impl AsyncQuorumManager {
 
     /// Record an ACK from a follower for a specific write
     pub async fn record_ack(&self, write_id: u64, node_id: u16) {
-        let mut pending = self.pending.write().await;
+        let mut shard = self.pending.shard_for(write_id).write().await;
 
-        if let Some(write) = pending.get_mut(&write_id) {
+        if let Some(write) = shard.get_mut(&write_id) {
             if let Some(result) = write.tracker.record_ack() {
                 tracing::info!(
                     target: "lance::replication",
@@ -201,7 +348,7 @@ impl AsyncQuorumManager {
                 );
 
                 // Remove and notify - take ownership to send
-                if let Some(write) = pending.remove(&write_id) {
+                if let Some(write) = shard.remove(&write_id) {
                     let _ = write.result_tx.send(result);
                 }
             } else {
@@ -219,9 +366,9 @@ impl AsyncQuorumManager {
 
     /// Record a NACK (failure) from a follower for a specific write
     pub async fn record_nack(&self, write_id: u64, node_id: u16) {
-        let mut pending = self.pending.write().await;
+        let mut shard = self.pending.shard_for(write_id).write().await;
 
-        if let Some(write) = pending.get_mut(&write_id) {
+        if let Some(write) = shard.get_mut(&write_id) {
             if let Some(result) = write.tracker.record_nack() {
                 tracing::warn!(
                     target: "lance::replication",
@@ -230,7 +377,7 @@ impl AsyncQuorumManager {
                     "Quorum failed - too many NACKs"
                 );
 
-                if let Some(write) = pending.remove(&write_id) {
+                if let Some(write) = shard.remove(&write_id) {
                     let _ = write.result_tx.send(result);
                 }
             }
@@ -275,8 +422,7 @@ impl AsyncQuorumManager {
 
     /// Clean up a timed-out or failed write
     async fn cleanup_write(&self, write_id: u64) {
-        let mut pending = self.pending.write().await;
-        if let Some(write) = pending.remove(&write_id) {
+        if let Some(write) = self.pending.remove(write_id).await {
             let result = write.tracker.finalize();
             let _ = write.result_tx.send(result);
         }
@@ -284,30 +430,12 @@ impl AsyncQuorumManager {
 
     /// Get current pending write count (for metrics)
     pub async fn pending_count(&self) -> usize {
-        self.pending.read().await.len()
+        self.pending.len().await
     }
 
     /// Clean up stale pending writes (call periodically)
     pub async fn cleanup_stale(&self, max_age: Duration) {
-        let mut pending = self.pending.write().await;
-        let now = std::time::Instant::now();
-
-        let stale_ids: Vec<u64> = pending
-            .iter()
-            .filter(|(_, w)| now.duration_since(w.created_at) > max_age)
-            .map(|(id, _)| *id)
-            .collect();
-
-        for write_id in stale_ids {
-            if let Some(write) = pending.remove(&write_id) {
-                tracing::warn!(
-                    target: "lance::replication",
-                    write_id,
-                    "Cleaning up stale pending write"
-                );
-                let _ = write.result_tx.send(QuorumResult::Timeout);
-            }
-        }
+        self.pending.cleanup_stale(max_age).await;
     }
 }
 

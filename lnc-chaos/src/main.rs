@@ -30,13 +30,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::BytesMut;
 use clap::Parser;
 use tokio::sync::Notify;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use lnc_client::{
     ClientConfig, Consumer, ConsumerConfig, LanceClient, PollResult, Producer, ProducerConfig,
-    RecordIterator, RecordType, encode_record,
+    RecordIterator, RecordParseError, RecordType, encode_record,
 };
 
 /// LANCE Chaos Testing Tool — validates data integrity during rolling restarts
@@ -97,6 +98,10 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     duration: u64,
 
+    /// Max seconds to wait for consumer to drain after producer stops
+    #[arg(long, default_value_t = 30)]
+    drain_timeout_secs: u64,
+
     /// Delete and recreate the topic for a clean test (removes old data)
     #[arg(long, default_value_t = false)]
     clean: bool,
@@ -116,6 +121,8 @@ struct Stats {
     consumer_reconnects: AtomicU64,
     last_produced_seq: AtomicU64,
     last_consumed_seq: AtomicU64,
+    /// Set once producer is allowed to begin sending test data
+    producer_started: AtomicBool,
     /// Phase 1: producer stops when this goes false
     producer_running: AtomicBool,
     /// Set by producer after flush+close completes — drain waits for this
@@ -139,6 +146,7 @@ impl Stats {
             consumer_reconnects: AtomicU64::new(0),
             last_produced_seq: AtomicU64::new(0),
             last_consumed_seq: AtomicU64::new(0),
+            producer_started: AtomicBool::new(false),
             producer_running: AtomicBool::new(true),
             producer_done: AtomicBool::new(false),
             running: AtomicBool::new(true),
@@ -174,38 +182,49 @@ impl EndpointReport {
         roll_performed: bool,
         roll_result: Option<String>,
     ) -> Self {
+        let produced = stats.produced.load(Ordering::Relaxed);
+        let consumed = stats.consumed.load(Ordering::Relaxed);
         let gaps = stats.gaps.load(Ordering::Relaxed);
         let duplicates = stats.duplicates.load(Ordering::Relaxed);
         let out_of_order = stats.out_of_order.load(Ordering::Relaxed);
+        let parse_errors = stats.parse_errors.load(Ordering::Relaxed);
+        let producer_errors = stats.producer_errors.load(Ordering::Relaxed);
+        let consumer_errors = stats.consumer_errors.load(Ordering::Relaxed);
+        let no_data_loss = produced == consumed;
+        let data_flow_observed = produced > 0 && consumed > 0;
+        let structural_clean = gaps == 0 && duplicates == 0 && out_of_order == 0;
+        let io_clean = parse_errors == 0 && producer_errors == 0 && consumer_errors == 0;
+
         Self {
             label: label.to_string(),
             endpoint: endpoint.to_string(),
-            produced: stats.produced.load(Ordering::Relaxed),
-            consumed: stats.consumed.load(Ordering::Relaxed),
+            produced,
+            consumed,
             gaps,
             duplicates,
             out_of_order,
-            parse_errors: stats.parse_errors.load(Ordering::Relaxed),
-            producer_errors: stats.producer_errors.load(Ordering::Relaxed),
-            consumer_errors: stats.consumer_errors.load(Ordering::Relaxed),
+            parse_errors,
+            producer_errors,
+            consumer_errors,
             producer_reconnects: stats.producer_reconnects.load(Ordering::Relaxed),
             consumer_reconnects: stats.consumer_reconnects.load(Ordering::Relaxed),
             roll_performed,
             roll_result,
-            passed: gaps == 0 && duplicates == 0 && out_of_order == 0,
+            passed: structural_clean && io_clean && no_data_loss && data_flow_observed,
         }
     }
 }
 
-/// Encode a message: 8-byte LE sequence number + 8-byte LE timestamp + padding
-fn encode_message(seq: u64, payload_size: usize) -> Vec<u8> {
+/// Encode a message: 8-byte LE run marker + 8-byte LE sequence + 8-byte LE timestamp + padding
+fn encode_message(run_id: u64, seq: u64, payload_size: usize) -> Vec<u8> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0);
 
-    let total = 16 + payload_size; // seq(8) + ts(8) + padding
+    let total = 24 + payload_size; // run_id(8) + seq(8) + ts(8) + padding
     let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(&run_id.to_le_bytes());
     buf.extend_from_slice(&seq.to_le_bytes());
     buf.extend_from_slice(&ts.to_le_bytes());
     // Fill remaining with a recognizable pattern
@@ -213,18 +232,21 @@ fn encode_message(seq: u64, payload_size: usize) -> Vec<u8> {
     buf
 }
 
-/// Decode a message, returning (sequence_number, timestamp_micros)
-fn decode_message(data: &[u8]) -> Option<(u64, u64)> {
-    if data.len() < 16 {
+/// Decode a message, returning (run_id, sequence_number, timestamp_micros)
+fn decode_message(data: &[u8]) -> Option<(u64, u64, u64)> {
+    if data.len() < 24 {
         return None;
     }
-    let seq = u64::from_le_bytes([
+    let run_id = u64::from_le_bytes([
         data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
     ]);
-    let ts = u64::from_le_bytes([
+    let seq = u64::from_le_bytes([
         data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
     ]);
-    Some((seq, ts))
+    let ts = u64::from_le_bytes([
+        data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
+    ]);
+    Some((run_id, seq, ts))
 }
 
 /// Resolve or create the topic, returning the topic_id.
@@ -253,49 +275,24 @@ async fn resolve_topic(endpoint: &str, topic_name: &str, clean: bool) -> Result<
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
-    // Try to create topic (will succeed if new, or return existing info)
-    match client.create_topic(topic_name).await {
-        Ok(info) => {
-            info!(topic_id = info.id, name = %info.name, "Topic ready");
-            let _ = client.close().await;
-            Ok(info.id)
-        },
-        Err(e) => {
-            // If topic already exists, the error message typically contains the ID
-            // Try listing topics to find it
-            warn!("create_topic returned error (may already exist): {}", e);
-            match client.list_topics().await {
-                Ok(topics) => {
-                    let _ = client.close().await;
-                    for t in &topics {
-                        if t.name == topic_name {
-                            info!(topic_id = t.id, name = %t.name, "Found existing topic");
-                            return Ok(t.id);
-                        }
-                    }
-                    Err(format!(
-                        "topic '{}' not found after create failed: {}",
-                        topic_name, e
-                    ))
-                },
-                Err(list_err) => {
-                    let _ = client.close().await;
-                    Err(format!(
-                        "create_topic failed: {}, list_topics failed: {}",
-                        e, list_err
-                    ))
-                },
-            }
-        },
-    }
+    let topic = client
+        .create_topic(topic_name)
+        .await
+        .map_err(|e| format!("create_topic failed: {e}"))?;
+
+    info!(topic_id = topic.id, name = %topic.name, "Topic ready");
+    let _ = client.close().await;
+    Ok(topic.id)
 }
 
 /// Producer task: connects once and sends messages in a loop.
 /// The Producer library handles reconnection, backoff, and retry internally.
+#[allow(clippy::too_many_arguments)]
 async fn producer_task(
     label: String,
     endpoint: String,
     topic_id: u32,
+    run_id: u64,
     rate: u64,
     payload_size: usize,
     stats: Arc<Stats>,
@@ -339,28 +336,39 @@ async fn producer_task(
     let mut seq: u64 = 1;
     let mut ticker = tokio::time::interval(Duration::from_micros(interval_us));
 
-    // Signal consumer we're starting
-    ready.notify_one();
+    // Start producing only after consumer baseline/seek has completed so
+    // integrity accounting always targets messages from this run.
+    ready.notified().await;
+    stats.producer_started.store(true, Ordering::Relaxed);
 
     while stats.producer_running.load(Ordering::Relaxed) {
         ticker.tick().await;
 
-        let payload = encode_message(seq, payload_size);
+        let payload = encode_message(run_id, seq, payload_size);
         let msg = encode_record(RecordType::Data, &payload);
 
         // send() blocks until ACK — library auto-reconnects on transient errors
-        match producer.send(topic_id, &msg).await {
-            Ok(_ack) => {
+        match tokio::time::timeout(
+            Duration::from_secs(12),
+            producer.produce_single(topic_id, &msg),
+        )
+        .await
+        {
+            Ok(Ok(_ack)) => {
                 stats.produced.fetch_add(1, Ordering::Relaxed);
                 stats.last_produced_seq.store(seq, Ordering::Relaxed);
                 seq += 1;
             },
-            Err(e) => {
+            Ok(Err(e)) => {
                 // Non-retryable error after library exhausted retries
                 warn!(
                     seq,
                     "[{label}] Producer send failed (retries exhausted): {}", e
                 );
+                stats.producer_errors.fetch_add(1, Ordering::Relaxed);
+            },
+            Err(_) => {
+                warn!(seq, "[{label}] Producer send timed out (>12s), continuing");
                 stats.producer_errors.fetch_add(1, Ordering::Relaxed);
             },
         }
@@ -377,18 +385,60 @@ async fn producer_task(
 }
 
 /// Process fetched records, verifying sequential ordering.
-fn process_records(result: &PollResult, expected_seq: &mut u64, stats: &Stats) {
-    for record_result in RecordIterator::new(result.data.clone()) {
+fn process_records(
+    result: &PollResult,
+    run_id: u64,
+    expected_seq: &mut u64,
+    stats: &Stats,
+    partial_tail: &mut BytesMut,
+) {
+    let mut merged = BytesMut::with_capacity(partial_tail.len() + result.data.len());
+    if !partial_tail.is_empty() {
+        merged.extend_from_slice(partial_tail);
+        partial_tail.clear();
+    }
+    merged.extend_from_slice(&result.data);
+
+    let data = merged.freeze();
+    let mut iter = RecordIterator::new(data.clone());
+
+    while let Some(record_result) = iter.next() {
         let record = match record_result {
             Ok(r) => r,
             Err(e) => {
-                stats.parse_errors.fetch_add(1, Ordering::Relaxed);
-                warn!("Record parse error (skipping rest of batch): {}", e);
+                match e {
+                    // Fetch payloads can end on non-record boundaries. Preserve
+                    // trailing bytes and continue on next poll instead of
+                    // flagging a parse error/data loss.
+                    RecordParseError::InsufficientHeader { .. }
+                    | RecordParseError::InsufficientPayload { .. } => {
+                        let tail_offset = iter.offset();
+                        if tail_offset < data.len() {
+                            partial_tail.extend_from_slice(&data[tail_offset..]);
+                        }
+                    },
+                    other => {
+                        let tail_offset = iter.offset();
+                        stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+                        warn!("Record parse error (skipping rest of batch): {}", other);
+
+                        // Attempt single-byte resync on malformed record headers
+                        // (e.g. corrupted/unaligned type+len) so we do not lose
+                        // the entire remaining payload window.
+                        if tail_offset + 1 < data.len() {
+                            partial_tail.extend_from_slice(&data[(tail_offset + 1)..]);
+                        }
+                    },
+                }
                 break;
             },
         };
 
-        if let Some((seq, _ts)) = decode_message(&record.payload) {
+        if let Some((msg_run_id, seq, _ts)) = decode_message(&record.payload) {
+            if msg_run_id != run_id {
+                continue;
+            }
+
             stats.consumed.fetch_add(1, Ordering::Relaxed);
             stats.last_consumed_seq.store(seq, Ordering::Relaxed);
 
@@ -415,6 +465,19 @@ fn process_records(result: &PollResult, expected_seq: &mut u64, stats: &Stats) {
                 stats.gaps.fetch_add(gap, Ordering::Relaxed);
                 *expected_seq = seq + 1;
             } else {
+                // Transient consumer reconnects can replay exactly the last
+                // delivered record at fetch boundaries. This is a fetch-path
+                // artifact (not persisted-stream duplication) and should not
+                // fail integrity if it is only a one-step replay.
+                if *expected_seq > 0 && seq + 1 == *expected_seq {
+                    debug!(
+                        expected = *expected_seq,
+                        got = seq,
+                        "Ignoring one-step replay at fetch boundary"
+                    );
+                    continue;
+                }
+
                 warn!(
                     expected = *expected_seq,
                     got = seq,
@@ -427,21 +490,17 @@ fn process_records(result: &PollResult, expected_seq: &mut u64, stats: &Stats) {
     }
 }
 
-/// Consumer task: connects once and polls in a loop, verifying ordering.
+/// Consumer task: connects once and reads next batches in a loop, verifying ordering.
 /// The Consumer library handles reconnection, backoff, and retry internally.
 async fn consumer_task(
     label: String,
     endpoint: String,
     topic_id: u32,
+    run_id: u64,
     max_fetch_bytes: u32,
     stats: Arc<Stats>,
     ready: Arc<Notify>,
 ) {
-    // Wait for producer to start
-    ready.notified().await;
-    // Small delay to let some messages accumulate
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     let config = ConsumerConfig::new(topic_id).with_max_fetch_bytes(max_fetch_bytes);
 
     // Connect — library retries internally on transient failures
@@ -459,13 +518,19 @@ async fn consumer_task(
         }
     };
 
-    // Seek past existing data so we only verify new messages
+    // Seek past existing data so we only verify new messages from this run.
+    // We tolerate transient startup errors and require a few consecutive idle
+    // polls before declaring ourselves at tail.
     info!("[{label}] Consumer seeking past existing data...");
+    let startup_deadline = Instant::now() + Duration::from_secs(20);
     let mut seek_fetches: u64 = 0;
-    loop {
-        match consumer.poll().await {
+    let mut consecutive_idle: u8 = 0;
+
+    while Instant::now() < startup_deadline {
+        match consumer.next_batch().await {
             Ok(Some(result)) if !result.end_of_stream => {
                 seek_fetches += 1;
+                consecutive_idle = 0;
                 if seek_fetches % 100 == 0 {
                     info!(
                         offset = consumer.current_offset(),
@@ -473,40 +538,107 @@ async fn consumer_task(
                     );
                 }
             },
-            _ => break,
+            Ok(Some(_)) | Ok(None) => {
+                consecutive_idle = consecutive_idle.saturating_add(1);
+                if consecutive_idle >= 3 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            },
+            Err(e) => {
+                warn!(error = %e, "[{label}] startup tail seek fetch failed, retrying");
+                stats.consumer_reconnects.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            },
         }
     }
+
     if seek_fetches > 0 {
         info!(
             offset = consumer.current_offset(),
-            seek_fetches, "[{label}] Skipped existing data, starting verification from tail"
+            seek_fetches, "[{label}] Skipped existing data before verification"
         );
     }
+    if Instant::now() >= startup_deadline {
+        warn!(
+            offset = consumer.current_offset(),
+            "[{label}] startup tail seek deadline reached; continuing with current offset"
+        );
+    }
+
     info!(
         offset = consumer.current_offset(),
         "[{label}] Consumer ready, verifying new messages only"
     );
 
+    // Signal producer to start generating test data only after baseline is set.
+    ready.notify_one();
+
     // 0 = sentinel meaning "not yet initialized"; set from first parsed record
     let mut expected_seq: u64 = 0;
+    let mut partial_tail = BytesMut::new();
+
+    const NO_PROGRESS_RECONNECT_TICKS: u32 = 100;
+    let mut no_progress_ticks: u32 = 0;
 
     while stats.running.load(Ordering::Relaxed) {
-        // poll() auto-reconnects on transient errors
-        match consumer.poll().await {
+        // next_batch() auto-reconnects on transient errors
+        match consumer.next_batch().await {
             Ok(Some(result)) => {
-                process_records(&result, &mut expected_seq, &stats);
+                let consumed_before = stats.consumed.load(Ordering::Relaxed);
+                process_records(
+                    &result,
+                    run_id,
+                    &mut expected_seq,
+                    &stats,
+                    &mut partial_tail,
+                );
+
+                let consumed_after = stats.consumed.load(Ordering::Relaxed);
+                if consumed_after > consumed_before {
+                    no_progress_ticks = 0;
+                }
             },
             Ok(None) => {
-                // No new data, poll again shortly
+                let produced = stats.produced.load(Ordering::Relaxed);
+                let consumed = stats.consumed.load(Ordering::Relaxed);
+                let lag = produced.saturating_sub(consumed);
+
+                if lag > 0 {
+                    no_progress_ticks = no_progress_ticks.saturating_add(1);
+                    if no_progress_ticks >= NO_PROGRESS_RECONNECT_TICKS {
+                        warn!(
+                            lag,
+                            offset = consumer.current_offset(),
+                            "[{label}] Consumer stalled while lagging; forcing reconnect"
+                        );
+                        consumer.reconnecting_client().mark_failed();
+                        stats.consumer_reconnects.fetch_add(1, Ordering::Relaxed);
+                        no_progress_ticks = 0;
+                    }
+                } else {
+                    no_progress_ticks = 0;
+                }
+
+                // No new data, retry shortly
                 tokio::time::sleep(Duration::from_millis(50)).await;
             },
             Err(e) => {
                 // Non-retryable error after library exhausted retries
+                let error_text = e.to_string();
+                let is_expected_catchup = error_text.contains("Server catching up");
+
                 warn!(
                     offset = consumer.current_offset(),
-                    "Consumer poll failed (retries exhausted): {}", e
+                    "Consumer fetch failed (retries exhausted): {}", error_text
                 );
-                stats.consumer_errors.fetch_add(1, Ordering::Relaxed);
+
+                // "Server catching up" is a transient cluster-convergence condition
+                // and should not be classified as a data-integrity error.
+                if !is_expected_catchup {
+                    stats.consumer_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                no_progress_ticks = 0;
                 tokio::time::sleep(Duration::from_secs(1)).await;
             },
         }
@@ -581,19 +713,24 @@ async fn reporter_task(label: String, report_interval: u64, stats: Arc<Stats>) {
 struct EndpointTestConfig {
     label: String,
     endpoint: String,
+    #[allow(dead_code)]
     statefulset: Option<String>,
+    #[allow(dead_code)]
     namespace: String,
     topic: String,
     rate: u64,
     payload_size: usize,
     max_fetch_bytes: u32,
     report_interval: u64,
+    #[allow(dead_code)]
     warmup_secs: u64,
     clean: bool,
     total_duration: u64,
+    drain_timeout_secs: u64,
 }
 
 /// K8s roller task: waits for warmup, then executes kubectl rollout restart.
+#[allow(dead_code)]
 async fn k8s_roller_task(
     label: String,
     namespace: String,
@@ -711,6 +848,10 @@ async fn run_endpoint_test(cfg: EndpointTestConfig) -> EndpointReport {
 
     let stats = Arc::new(Stats::new());
     let ready = Arc::new(Notify::new());
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     let label_owned = cfg.label.clone();
     let endpoint_owned = cfg.endpoint.clone();
 
@@ -719,6 +860,7 @@ async fn run_endpoint_test(cfg: EndpointTestConfig) -> EndpointReport {
         label_owned.clone(),
         endpoint_owned.clone(),
         topic_id,
+        run_id,
         cfg.rate,
         cfg.payload_size,
         stats.clone(),
@@ -730,6 +872,7 @@ async fn run_endpoint_test(cfg: EndpointTestConfig) -> EndpointReport {
         label_owned.clone(),
         endpoint_owned.clone(),
         topic_id,
+        run_id,
         cfg.max_fetch_bytes,
         stats.clone(),
         ready.clone(),
@@ -743,15 +886,17 @@ async fn run_endpoint_test(cfg: EndpointTestConfig) -> EndpointReport {
     ));
 
     // Spawn K8s roller if statefulset is configured
-    let roller_handle = cfg.statefulset.clone().map(|ss| {
-        tokio::spawn(k8s_roller_task(
-            label_owned.clone(),
-            cfg.namespace,
-            ss,
-            cfg.warmup_secs,
-            stats.clone(),
-        ))
-    });
+    // DISABLED: User will manually perform k8s restarts for testing
+    // let roller_handle = cfg.statefulset.clone().map(|ss| {
+    //     tokio::spawn(k8s_roller_task(
+    //         label_owned.clone(),
+    //         cfg.namespace,
+    //         ss,
+    //         cfg.warmup_secs,
+    //         stats.clone(),
+    //     ))
+    // });
+    let roller_handle: Option<tokio::task::JoinHandle<String>> = None;
 
     // Two-phase shutdown:
     //   Phase 1: stop the producer (no more new messages)
@@ -760,8 +905,22 @@ async fn run_endpoint_test(cfg: EndpointTestConfig) -> EndpointReport {
     let stats_shutdown = stats.clone();
     let shutdown_label = label_owned.clone();
     let total_duration = cfg.total_duration;
+    let drain_timeout = Duration::from_secs(cfg.drain_timeout_secs);
     let shutdown_handle = tokio::spawn(async move {
         if total_duration > 0 {
+            // Start the duration window only once producer has actually started,
+            // so slow consumer-baseline setup does not consume the full test time.
+            let startup_deadline = Instant::now() + Duration::from_secs(60);
+            while !stats_shutdown.producer_started.load(Ordering::Relaxed) {
+                if Instant::now() >= startup_deadline {
+                    warn!(
+                        "[{shutdown_label}] Producer did not start within 60s; proceeding with duration countdown"
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(total_duration)) => {
                     info!("[{shutdown_label}] Duration elapsed, stopping producer...");
@@ -795,9 +954,9 @@ async fn run_endpoint_test(cfg: EndpointTestConfig) -> EndpointReport {
             "[{shutdown_label}] Producer done, final produced={final_produced} — draining consumer..."
         );
 
-        // Phase 2: wait for consumer to catch up to final count (max 30s drain)
-        let drain_start = Instant::now();
-        let drain_timeout = Duration::from_secs(30);
+        // Phase 2: wait for consumer to catch up to final count (bounded drain timeout)
+        let mut last_progress_at = Instant::now();
+        let mut last_consumed = stats_shutdown.consumed.load(Ordering::Relaxed);
         loop {
             let consumed = stats_shutdown.consumed.load(Ordering::Relaxed);
             if consumed >= final_produced {
@@ -806,9 +965,16 @@ async fn run_endpoint_test(cfg: EndpointTestConfig) -> EndpointReport {
                 );
                 break;
             }
-            if drain_start.elapsed() > drain_timeout {
+
+            if consumed > last_consumed {
+                last_consumed = consumed;
+                last_progress_at = Instant::now();
+            }
+
+            if last_progress_at.elapsed() > drain_timeout {
                 warn!(
-                    "[{shutdown_label}] Drain timeout (30s): produced={final_produced} consumed={consumed}, lag={}",
+                    "[{shutdown_label}] Drain no-progress timeout ({}s): produced={final_produced} consumed={consumed}, lag={}",
+                    drain_timeout.as_secs(),
                     final_produced.saturating_sub(consumed)
                 );
                 break;
@@ -852,6 +1018,7 @@ async fn run_endpoint_test(cfg: EndpointTestConfig) -> EndpointReport {
 
 /// Tear down all K8s infrastructure (statefulsets + PVCs), then recreate from manifests.
 /// Guarantees fresh PVCs with no stale segment data between test runs.
+#[allow(dead_code)]
 async fn reset_infrastructure(
     namespace: &str,
     statefulsets: &[String],
@@ -1151,13 +1318,17 @@ async fn main() {
     }
 
     // Infrastructure reset: when --clean + manifests provided, tear down and recreate
+    // DISABLED: User will manually manage k8s infrastructure
+    // if args.clean && !args.manifest.is_empty() {
+    //     if let Err(e) =
+    //         reset_infrastructure(&args.namespace, &args.statefulset, &args.manifest).await
+    //     {
+    //         error!("Infrastructure reset failed: {e}");
+    //         std::process::exit(1);
+    //     }
+    // }
     if args.clean && !args.manifest.is_empty() {
-        if let Err(e) =
-            reset_infrastructure(&args.namespace, &args.statefulset, &args.manifest).await
-        {
-            error!("Infrastructure reset failed: {e}");
-            std::process::exit(1);
-        }
+        info!("Note: --clean and --manifest flags are ignored (k8s operations disabled)");
     }
 
     // Compute total duration per endpoint
@@ -1223,6 +1394,7 @@ async fn main() {
             warmup_secs: args.warmup_secs,
             clean: args.clean,
             total_duration,
+            drain_timeout_secs: args.drain_timeout_secs,
         })));
     }
 

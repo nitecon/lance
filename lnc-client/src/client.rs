@@ -24,6 +24,9 @@ pub enum ClientStream {
 }
 
 impl AsyncRead for ClientStream {
+    /// Delegates read readiness directly to the concrete transport so
+    /// buffered frames stay on the Architecture §15 zero-copy path without
+    /// layering additional indirection.
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -37,6 +40,10 @@ impl AsyncRead for ClientStream {
 }
 
 impl AsyncWrite for ClientStream {
+    /// Delegates write readiness to the underlying transport without
+    /// introducing dynamic dispatch, which keeps buffered writes on the
+    /// Section 14 thread-pinned path compliant with Architecture §15's
+    /// loaner-buffer rules.
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -48,6 +55,9 @@ impl AsyncWrite for ClientStream {
         }
     }
 
+    /// Flushes bytes on whichever transport is active so that ingestion
+    /// frames honor the write-buffering guarantees described in Architecture
+    /// §22 without duplicating logic across TCP/TLS paths.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             ClientStream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
@@ -55,6 +65,9 @@ impl AsyncWrite for ClientStream {
         }
     }
 
+    /// Propagates orderly shutdown to the concrete stream implementation,
+    /// enabling graceful disconnects per Architecture §14's pinning strategy
+    /// whether the session is plain TCP or TLS.
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             ClientStream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
@@ -130,6 +143,8 @@ pub struct TopicInfo {
     pub name: String,
     /// Unix timestamp when the topic was created
     pub created_at: u64,
+    /// Topic identity epoch for stale-id detection
+    pub topic_epoch: u64,
     /// Retention policy configuration (None = no retention policy set)
     pub retention: Option<RetentionInfo>,
 }
@@ -221,7 +236,16 @@ impl ClientConfig {
         }
     }
 
-    /// Enable TLS with the provided configuration
+    /// Enables TLS for this configuration so clients can satisfy
+    /// Architecture §14's production security guidance when traversing
+    /// untrusted networks.
+    ///
+    /// # Arguments
+    /// * `tls_config` - Certificates and trust roots passed through to
+    ///   `lnc-network`'s TLS connector.
+    ///
+    /// # Returns
+    /// * `Self` - Updated config allowing fluent builder-style chaining.
     pub fn with_tls(mut self, tls_config: TlsClientConfig) -> Self {
         self.tls = Some(tls_config);
         self
@@ -245,9 +269,20 @@ pub struct LanceClient {
 }
 
 impl LanceClient {
-    /// Resolve an address string (hostname:port or IP:port) to a SocketAddr
+    /// Resolves an address string (hostname:port or IP:port) to a `SocketAddr`
+    /// so clients can honor Architecture §10.1's Docker-first deployment model
+    /// where hostnames are common.
     ///
-    /// This performs DNS resolution for hostnames and validates IP addresses.
+    /// # Arguments
+    /// * `addr` - Address string such as `"10.0.0.5:1992"` or
+    ///   `"broker.lance:1992"`.
+    ///
+    /// # Returns
+    /// * `Result<SocketAddr>` - Parsed IP:port pair ready for `TcpStream`.
+    ///
+    /// # Errors
+    /// * [`ClientError::ProtocolError`] when DNS resolution fails or produces
+    ///   no usable endpoints.
     async fn resolve_address(addr: &str) -> Result<SocketAddr> {
         // First, try parsing as a SocketAddr directly (for IP:port format)
         if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
@@ -292,7 +327,7 @@ impl LanceClient {
         Ok(Self {
             stream: ClientStream::Tcp(stream),
             config,
-            batch_id: AtomicU64::new(0),
+            batch_id: AtomicU64::new(1),
             read_buffer: vec![0u8; 64 * 1024],
             read_offset: 0,
         })
@@ -356,7 +391,7 @@ impl LanceClient {
         Ok(Self {
             stream: ClientStream::Tls(tls_stream),
             config,
-            batch_id: AtomicU64::new(0),
+            batch_id: AtomicU64::new(1),
             read_buffer: vec![0u8; 64 * 1024],
             read_offset: 0,
         })
@@ -379,16 +414,39 @@ impl LanceClient {
     }
 
     fn next_batch_id(&self) -> u64 {
-        self.batch_id.fetch_add(1, Ordering::SeqCst) + 1
+        self.batch_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Send an ingest request to the default topic (topic 0)
+    /// Sends an ingest frame to the default topic (ID 0) while preserving the
+    /// Architecture §22 write-buffering guarantees.
+    ///
+    /// # Arguments
+    /// * `payload` - Record batch encoded using the zero-copy LWP format.
+    /// * `record_count` - Logical record total encoded in the frame header.
+    ///
+    /// # Returns
+    /// * `Result<u64>` - Server-assigned batch identifier for the frame.
+    ///
+    /// # Errors
+    /// Propagates [`ClientError::Timeout`] when the write exceeds the configured
+    /// deadline or any framing/connection error surfaced by Tokio.
     pub async fn send_ingest(&mut self, payload: Bytes, record_count: u32) -> Result<u64> {
         self.send_ingest_to_topic(0, payload, record_count, None)
             .await
     }
 
-    /// Send an ingest request to a specific topic
+    /// Sends an ingest frame to a specific topic while attaching metadata
+    /// required by Architecture §22's deferred flush/ack scheme.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Destination topic identifier.
+    /// * `payload` - Zero-copy encoded batch.
+    /// * `record_count` - Logical records contained in `payload`.
+    /// * `_auth_config` - Optional future hook for per-request auth context.
+    ///
+    /// # Returns
+    /// * `Result<u64>` - Batch identifier allocated by the client monotonic
+    ///   counter and echoed back by the server.
     pub async fn send_ingest_to_topic(
         &mut self,
         topic_id: u32,
@@ -423,13 +481,33 @@ impl LanceClient {
         Ok(batch_id)
     }
 
-    /// Send an ingest request and wait for acknowledgment (default topic)
+    /// Sends an ingest request to the default topic and waits for the
+    /// corresponding acknowledgment, mirroring Architecture §22.3 sync gates.
+    ///
+    /// # Arguments
+    /// * `payload` - Ingest batch to transmit.
+    /// * `record_count` - Logical record total for metrics validation.
+    ///
+    /// # Returns
+    /// * `Result<u64>` - The acked batch identifier if the server confirms the
+    ///   write succeeded.
     pub async fn send_ingest_sync(&mut self, payload: Bytes, record_count: u32) -> Result<u64> {
         self.send_ingest_to_topic_sync(0, payload, record_count, None)
             .await
     }
 
-    /// Send an ingest request to a specific topic and wait for acknowledgment
+    /// Sends an ingest request to a topic and blocks for server acknowledgment
+    /// so callers can enforce durability or backpressure decisions inline.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Destination topic.
+    /// * `payload` - Zero-copy loaner buffer to transmit.
+    /// * `record_count` - Logical records contained in the batch.
+    /// * `auth_config` - Optional per-request authentication context.
+    ///
+    /// # Returns
+    /// * `Result<u64>` - The acked batch identifier, ensuring sequencing with
+    ///   downstream consumers.
     pub async fn send_ingest_to_topic_sync(
         &mut self,
         topic_id: u32,
@@ -443,40 +521,79 @@ impl LanceClient {
         self.wait_for_ack(batch_id).await
     }
 
+    /// Waits for a specific acknowledgment frame, enforcing Architecture §22's
+    /// deferred flush contract between ingestion and persistence stages.
+    ///
+    /// # Arguments
+    /// * `expected_batch_id` - Identifier produced by the paired send path.
+    ///
+    /// # Returns
+    /// * `Result<u64>` - The acked batch identifier (matching expectation).
+    ///
+    /// # Errors
+    /// Surfaces protocol mismatches, server backpressure, or error frames so
+    /// callers can react immediately.
     async fn wait_for_ack(&mut self, expected_batch_id: u64) -> Result<u64> {
-        let frame = self.recv_frame().await?;
+        // Defensive drain: if a stale ack (batch_id < expected) is in the read
+        // buffer -- e.g. from a prior forwarding-path mismatch -- skip it and
+        // keep reading until we see the expected batch_id or a non-ack frame.
+        // This prevents a single stale ack from cascading into every subsequent
+        // send on this connection.
+        loop {
+            let frame = self.recv_frame().await?;
 
-        match frame.frame_type {
-            FrameType::Ack => {
-                let acked_id = frame.batch_id();
-                if acked_id != expected_batch_id {
+            match frame.frame_type {
+                FrameType::Ack => {
+                    let acked_id = frame.batch_id();
+                    if acked_id == expected_batch_id {
+                        trace!(batch_id = acked_id, "Received ack");
+                        return Ok(acked_id);
+                    }
+                    if acked_id < expected_batch_id {
+                        warn!(
+                            expected = expected_batch_id,
+                            received = acked_id,
+                            "Draining stale ack with lower batch_id"
+                        );
+                        continue;
+                    }
+                    // acked_id > expected: this is a protocol violation, not a stale ack.
                     return Err(ClientError::InvalidResponse(format!(
-                        "Ack batch_id mismatch: sent {}, received {}",
+                        "Ack batch_id mismatch: sent {}, received {} (ahead)",
                         expected_batch_id, acked_id
                     )));
-                }
-                trace!(batch_id = acked_id, "Received ack");
-                Ok(acked_id)
-            },
-            FrameType::Control(ControlCommand::ErrorResponse) => {
-                let error_msg = frame
-                    .payload
-                    .map(|p| String::from_utf8_lossy(&p).to_string())
-                    .unwrap_or_else(|| "Unknown error".to_string());
-                Err(ClientError::ServerError(error_msg))
-            },
-            FrameType::Backpressure => {
-                warn!("Server signaled backpressure");
-                Err(ClientError::ServerBackpressure)
-            },
-            other => Err(ClientError::InvalidResponse(format!(
-                "Expected Ack, got {:?}",
-                other
-            ))),
+                },
+                FrameType::Control(ControlCommand::ErrorResponse) => {
+                    let error_msg = frame
+                        .payload
+                        .map(|p| String::from_utf8_lossy(&p).to_string())
+                        .unwrap_or_else(|| "Unknown error".to_string());
+                    return Err(ClientError::ServerError(error_msg));
+                },
+                FrameType::Backpressure => {
+                    warn!("Server signaled backpressure");
+                    return Err(ClientError::ServerBackpressure);
+                },
+                other => {
+                    return Err(ClientError::InvalidResponse(format!(
+                        "Expected Ack, got {:?}",
+                        other
+                    )));
+                },
+            }
         }
     }
 
-    /// Receive an acknowledgment for a previously sent ingest request
+    /// Receives the next acknowledgment frame and translates server feedback
+    /// (ack, backpressure, or error) into structured [`ClientError`] variants.
+    ///
+    /// # Returns
+    /// * `Result<u64>` - Acked batch identifier if the server confirmed success.
+    ///
+    /// # Errors
+    /// Surfaces [`ClientError::ServerBackpressure`] or
+    /// [`ClientError::InvalidResponse`] when the frame type deviates from the
+    /// Architecture §22 control flow expectations.
     pub async fn recv_ack(&mut self) -> Result<u64> {
         let frame = self.recv_frame().await?;
 
@@ -496,7 +613,12 @@ impl LanceClient {
         }
     }
 
-    /// Send a keepalive message to maintain the connection
+    /// Sends a keepalive frame so long-lived clients satisfy Architecture §9.4
+    /// drain/force-exit requirements and keep connection state fresh.
+    ///
+    /// # Returns
+    /// * `Result<()>` - Ok when the frame is flushed before the configured
+    ///   write timeout expires.
     pub async fn send_keepalive(&mut self) -> Result<()> {
         let frame = Frame::new_keepalive();
         let frame_bytes = encode_frame(&frame);
@@ -513,7 +635,15 @@ impl LanceClient {
         Ok(())
     }
 
-    /// Receive a keepalive response from the server
+    /// Waits for a keepalive response, guaranteeing the control-plane path is
+    /// still healthy per Architecture §9.4 monitoring requirements.
+    ///
+    /// # Returns
+    /// * `Result<()>` - Ok when the server replies with `FrameType::Keepalive`.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::InvalidResponse`] when any other frame type
+    /// arrives, signaling connection drift.
     pub async fn recv_keepalive(&mut self) -> Result<()> {
         let frame = self.recv_frame().await?;
 
@@ -539,6 +669,17 @@ impl LanceClient {
 
     /// Create a new topic with the given name
     pub async fn create_topic(&mut self, name: &str) -> Result<TopicInfo> {
+        const DEFAULT_CREATE_TOPIC_ATTEMPTS: usize = 20;
+        const DEFAULT_CREATE_TOPIC_BACKOFF_MS: u64 = 500;
+        self.ensure_topic(
+            name,
+            DEFAULT_CREATE_TOPIC_ATTEMPTS,
+            DEFAULT_CREATE_TOPIC_BACKOFF_MS,
+        )
+        .await
+    }
+
+    async fn create_topic_once(&mut self, name: &str) -> Result<TopicInfo> {
         let frame = Frame::new_create_topic(name);
         let frame_bytes = encode_frame(&frame);
 
@@ -553,6 +694,141 @@ impl LanceClient {
 
         let response = self.recv_frame().await?;
         self.parse_topic_response(response)
+    }
+
+    /// Ensure a topic exists and return its metadata.
+    ///
+    /// This helper encapsulates common create/list convergence retry behavior so
+    /// application callers (bench/chaos) can stay simple.
+    pub async fn ensure_topic(
+        &mut self,
+        name: &str,
+        max_attempts: usize,
+        base_backoff_ms: u64,
+    ) -> Result<TopicInfo> {
+        let attempts = max_attempts.max(1);
+        let mut last_error: Option<ClientError> = None;
+        let mut saw_retryable_error = false;
+
+        for attempt in 1..=attempts {
+            let mut retryable_this_attempt = false;
+
+            match self.create_topic_once(name).await {
+                Ok(info) => {
+                    trace!(
+                        topic_id = info.id,
+                        topic_name = %info.name,
+                        attempt,
+                        max_attempts = attempts,
+                        "Topic ensured via create_topic"
+                    );
+                    return Ok(info);
+                },
+                Err(create_err) => {
+                    if create_err.is_retryable() {
+                        retryable_this_attempt = true;
+                        saw_retryable_error = true;
+                    }
+                    last_error = Some(ClientError::ServerError(create_err.to_string()));
+                    warn!(
+                        topic_name = %name,
+                        attempt,
+                        max_attempts = attempts,
+                        error = %create_err,
+                        "create_topic failed during ensure_topic; retrying with list fallback"
+                    );
+                },
+            }
+
+            match self.list_topics().await {
+                Ok(topics) => {
+                    if let Some(topic) = topics.into_iter().find(|t| t.name == name) {
+                        trace!(
+                            topic_id = topic.id,
+                            topic_name = %topic.name,
+                            attempt,
+                            max_attempts = attempts,
+                            "Topic ensured via list_topics fallback"
+                        );
+                        return Ok(topic);
+                    }
+                },
+                Err(list_err) => {
+                    if list_err.is_retryable() {
+                        retryable_this_attempt = true;
+                        saw_retryable_error = true;
+                    }
+                    last_error = Some(ClientError::ServerError(list_err.to_string()));
+                    warn!(
+                        topic_name = %name,
+                        attempt,
+                        max_attempts = attempts,
+                        error = %list_err,
+                        "list_topics failed during ensure_topic"
+                    );
+                },
+            }
+
+            if attempt < attempts {
+                let backoff_ms = if retryable_this_attempt {
+                    base_backoff_ms.saturating_mul(attempt as u64).max(1)
+                } else {
+                    // Non-retryable errors are unlikely to heal with long sleeps.
+                    base_backoff_ms.max(1)
+                };
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+
+                // Refresh connection to improve odds of landing on current leader
+                // after elections and readiness transitions.
+                let reconnect_config = self.config.clone();
+                match Self::connect(reconnect_config).await {
+                    Ok(new_client) => {
+                        *self = new_client;
+                    },
+                    Err(reconnect_err) => {
+                        warn!(
+                            topic_name = %name,
+                            attempt,
+                            max_attempts = attempts,
+                            error = %reconnect_err,
+                            "ensure_topic reconnect attempt failed"
+                        );
+                        last_error = Some(reconnect_err);
+                    },
+                }
+            }
+        }
+
+        if let Some(err) = last_error {
+            return Err(ClientError::ServerError(format!(
+                "ensure_topic('{}') failed after {} attempts: {}",
+                name, attempts, err
+            )));
+        }
+
+        if saw_retryable_error {
+            return Err(ClientError::ServerError(format!(
+                "ensure_topic('{}') exhausted {} retryable attempts",
+                name, attempts
+            )));
+        }
+
+        Err(ClientError::ServerError(format!(
+            "topic '{}' not found after {} ensure_topic attempts",
+            name, attempts
+        )))
+    }
+
+    /// Ensure topic with standard retry profile suitable for benchmark/chaos tools.
+    pub async fn ensure_topic_default(&mut self, name: &str) -> Result<TopicInfo> {
+        const DEFAULT_ENSURE_TOPIC_ATTEMPTS: usize = 20;
+        const DEFAULT_ENSURE_TOPIC_BACKOFF_MS: u64 = 500;
+        self.ensure_topic(
+            name,
+            DEFAULT_ENSURE_TOPIC_ATTEMPTS,
+            DEFAULT_ENSURE_TOPIC_BACKOFF_MS,
+        )
+        .await
     }
 
     /// List all topics on the server
@@ -609,7 +885,8 @@ impl LanceClient {
         self.parse_delete_response(response)
     }
 
-    /// Set retention policy for an existing topic
+    /// Sets the retention policy for an existing topic, mirroring the
+    /// configuration model documented in Architecture §12.7.
     ///
     /// # Arguments
     /// * `topic_id` - Topic identifier
@@ -758,8 +1035,22 @@ impl LanceClient {
         self.parse_fetch_response(response)
     }
 
-    /// Subscribe to a topic for streaming data
-    /// Returns the consumer ID and starting offset
+    /// Subscribes to a topic for streaming consumption, honoring the consumer
+    /// coordination model described in Architecture §20.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic to follow.
+    /// * `start_offset` - First logical offset to deliver.
+    /// * `max_batch_bytes` - Maximum payload size per delivery window.
+    /// * `consumer_id` - Stable consumer identifier for server-side tracking.
+    ///
+    /// # Returns
+    /// * `Result<SubscribeResult>` - Contains the confirmed consumer_id and
+    ///   start offset granted by the server.
+    ///
+    /// # Errors
+    /// Surfaces timeouts, protocol violations, or server error frames (e.g.,
+    /// `ControlCommand::ErrorResponse`).
     pub async fn subscribe(
         &mut self,
         topic_id: u32,
@@ -783,7 +1074,19 @@ impl LanceClient {
         self.parse_subscribe_response(response)
     }
 
-    /// Unsubscribe from a topic
+    /// Unsubscribes a consumer from a topic, ensuring server resources are
+    /// reclaimed per Architecture §20's consumer lifecycle.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic to leave.
+    /// * `consumer_id` - Consumer identifier provided during subscribe.
+    ///
+    /// # Returns
+    /// * `Result<()>` - Ok when the server acknowledges the unsubscribe.
+    ///
+    /// # Errors
+    /// Propagates [`ClientError::ServerError`] if the server rejects the
+    /// request or [`ClientError::InvalidResponse`] if a non-ack frame arrives.
     pub async fn unsubscribe(&mut self, topic_id: u32, consumer_id: u64) -> Result<()> {
         let frame = Frame::new_unsubscribe(topic_id, consumer_id);
         let frame_bytes = encode_frame(&frame);
@@ -1015,6 +1318,7 @@ impl LanceClient {
                     id: json["id"].as_u64().unwrap_or(0) as u32,
                     name: json["name"].as_str().unwrap_or("").to_string(),
                     created_at: json["created_at"].as_u64().unwrap_or(0),
+                    topic_epoch: json["topic_epoch"].as_u64().unwrap_or(1),
                     retention,
                 })
             },
@@ -1062,6 +1366,7 @@ impl LanceClient {
                                     id: t["id"].as_u64().unwrap_or(0) as u32,
                                     name: t["name"].as_str().unwrap_or("").to_string(),
                                     created_at: t["created_at"].as_u64().unwrap_or(0),
+                                    topic_epoch: t["topic_epoch"].as_u64().unwrap_or(1),
                                     retention,
                                 }
                             })
@@ -1085,6 +1390,17 @@ impl LanceClient {
         }
     }
 
+    /// Reads the next wire frame into the preallocated buffer, preserving the
+    /// Architecture §15 zero-copy guarantees while translating parse failures
+    /// into structured [`ClientError`] values.
+    ///
+    /// # Returns
+    /// * `Result<Frame>` - Fully parsed LWP frame ready for higher-level
+    ///   ingestion/consumer handlers.
+    ///
+    /// # Errors
+    /// Propagates timeouts, malformed headers, or connection closures so
+    /// callers can fail fast when the transport becomes unhealthy.
     async fn recv_frame(&mut self) -> Result<Frame> {
         // Max frame size cap to prevent OOM from malformed headers (16 MB)
         const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;

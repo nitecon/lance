@@ -11,7 +11,7 @@
 
 use crate::consumer::{ConsumerRateLimiter, FetchRequest, FetchResponse};
 use crate::subscription::SubscriptionManager;
-use crate::topic::{RetentionConfig, TopicListResponse, TopicRegistry};
+use crate::topic::{RetentionConfig, TopicIdentityError, TopicListResponse, TopicRegistry};
 use bytes::Bytes;
 use lnc_network::{ControlCommand, Frame};
 use lnc_replication::{ClusterCoordinator, TopicOperation};
@@ -115,9 +115,49 @@ impl<'a> ControlCommandDispatcher<'a> {
     }
 
     /// Execute fetch request against topic registry
+    ///
+    /// Handles the tail sentinel (`u64::MAX`) used by clients seeking to
+    /// the end of a topic.  When the sentinel is received the server
+    /// resolves it to the current data-end offset and returns an empty
+    /// fetch response so the client can begin tailing from that position.
+    /// Without this, the CATCHING_UP heuristic would fire for every empty
+    /// or partially-filled topic, trapping consumers in an infinite
+    /// backoff loop.
     fn handle_fetch_request(&self, req: &FetchRequest) -> Frame {
-        if self.ctx.topic_registry.get_topic(req.topic_id).is_none() {
+        if matches!(
+            self.ctx
+                .topic_registry
+                .validate_topic_identity(req.topic_id, None),
+            Err(TopicIdentityError::UnknownTopic)
+        ) {
+            if self.ctx.cluster.is_some() {
+                debug!(
+                    target: "lance::server",
+                    topic_id = req.topic_id,
+                    requested_offset = req.start_offset,
+                    "Fetch topic metadata missing on this node; returning CATCHING_UP"
+                );
+                return Frame::new_catching_up(0);
+            }
+
             return Frame::new_error_response(&format!("Topic {} not found", req.topic_id));
+        }
+
+        // Handle the tail sentinel (u64::MAX) used by consumers seeking to
+        // the end of a topic (SeekPosition::End).  Resolve it to the
+        // current data-end offset and return an empty response so the
+        // client can begin tailing without triggering the CATCHING_UP
+        // heuristic.
+        if req.start_offset == u64::MAX {
+            let total = self.ctx.topic_registry.total_data_size(req.topic_id);
+            debug!(
+                target: "lance::server",
+                topic_id = req.topic_id,
+                resolved_offset = total,
+                "Fetch: resolved tail sentinel (u64::MAX) to current end offset"
+            );
+            let response = FetchResponse::new(total, 0, Bytes::new());
+            return Frame::new_fetch_response(Bytes::from(response.encode()));
         }
 
         match self.ctx.topic_registry.read_from_offset(
@@ -154,11 +194,16 @@ impl<'a> ControlCommandDispatcher<'a> {
     }
 }
 
-/// Check if a command is a write operation requiring leader
-pub fn is_write_operation(command: ControlCommand) -> bool {
+/// Check if a command is a topic metadata *write* operation requiring
+/// leader-authoritative handling.  Read-only operations like `ListTopics`
+/// are excluded so that every node can serve its local topic registry
+/// without forwarding to the leader — improving availability during
+/// elections and leadership transitions.
+pub fn is_topic_metadata_operation(command: ControlCommand) -> bool {
     matches!(
         command,
         ControlCommand::CreateTopic
+            | ControlCommand::GetTopic
             | ControlCommand::DeleteTopic
             | ControlCommand::SetRetention
             | ControlCommand::CreateTopicWithRetention
@@ -175,33 +220,144 @@ pub async fn handle_create_topic(ctx: &CommandContext<'_>, payload: Option<&Byte
         return Frame::new_error_response("Topic name required");
     }
 
-    match ctx.topic_registry.create_topic(&topic_name) {
-        Ok(metadata) => {
-            // Replicate topic creation to followers (if in cluster mode)
-            if let Some(coord) = ctx.cluster {
-                let op = TopicOperation::Create {
-                    topic_id: metadata.id,
-                    name: metadata.name.clone(),
-                    created_at: metadata.created_at,
-                };
-                if let Err(e) = coord.replicate_topic_op(op).await {
-                    warn!(
+    if let Some(coord) = ctx.cluster {
+        // If a topic name already exists locally, converge it through replicated
+        // idempotent create instead of failing fast. This heals stale local-only
+        // mappings under churn and guarantees cluster-wide visibility.
+        if let Some(existing_id) = ctx.topic_registry.get_topic_id_by_name(&topic_name) {
+            let created_at = ctx
+                .topic_registry
+                .get_topic_by_id(existing_id)
+                .map(|m| m.created_at)
+                .unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                });
+
+            let op = TopicOperation::Create {
+                topic_id: existing_id,
+                name: topic_name.clone(),
+                created_at,
+            };
+
+            if let Err(e) = coord.replicate_topic_op_sync(op).await {
+                warn!(
+                    target: "lance::server",
+                    topic_id = existing_id,
+                    topic_name = %topic_name,
+                    error = %e,
+                    "Failed to converge existing topic creation"
+                );
+                coord.reemit_committed_topic_ops().await;
+                if let Some(metadata) = ctx.topic_registry.get_topic_by_id(existing_id) {
+                    info!(
                         target: "lance::server",
                         topic_id = metadata.id,
+                        topic_name = %metadata.name,
                         error = %e,
-                        "Failed to replicate topic creation (topic created locally)"
+                        "Returning existing topic after convergence retry failed"
                     );
+                    let response_data = serde_json::json!({
+                        "id": metadata.id,
+                        "name": metadata.name,
+                        "created_at": metadata.created_at,
+                        "topic_epoch": metadata.topic_epoch
+                    });
+                    return Frame::new_topic_response(Bytes::from(response_data.to_string()));
                 }
+                return Frame::new_error_response(&format!(
+                    "Failed to replicate existing topic convergence: {}",
+                    e
+                ));
             }
 
-            let response_data = serde_json::json!({
-                "id": metadata.id,
-                "name": metadata.name,
-                "created_at": metadata.created_at
-            });
-            Frame::new_topic_response(Bytes::from(response_data.to_string()))
-        },
-        Err(e) => Frame::new_error_response(&e.to_string()),
+            let _ = ctx
+                .topic_registry
+                .create_topic_with_id(existing_id, &topic_name, created_at);
+
+            if let Some(metadata) = ctx.topic_registry.get_topic_by_id(existing_id) {
+                let response_data = serde_json::json!({
+                    "id": metadata.id,
+                    "name": metadata.name,
+                    "created_at": metadata.created_at,
+                    "topic_epoch": metadata.topic_epoch
+                });
+                return Frame::new_topic_response(Bytes::from(response_data.to_string()));
+            }
+        }
+
+        // Cluster mode: replicate first, then materialize locally.
+        // This prevents transient visibility of uncommitted topic metadata.
+        let topic_id = ctx.topic_registry.reserve_topic_id();
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let op = TopicOperation::Create {
+            topic_id,
+            name: topic_name.clone(),
+            created_at,
+        };
+
+        if let Err(e) = coord.replicate_topic_op_sync(op).await {
+            warn!(
+                target: "lance::server",
+                topic_id,
+                error = %e,
+                "Failed to replicate topic creation - returning error to client"
+            );
+
+            // Leader churn can race with sync quorum observation. If this
+            // create actually committed after we returned an error, replay
+            // committed topic ops to restore local metadata deterministically.
+            coord.reemit_committed_topic_ops().await;
+
+            return Frame::new_error_response(&format!(
+                "Failed to replicate topic creation: {}",
+                e
+            ));
+        }
+
+        match ctx
+            .topic_registry
+            .create_topic_with_id(topic_id, &topic_name, created_at)
+        {
+            Ok(metadata) => {
+                let response_data = serde_json::json!({
+                    "id": metadata.id,
+                    "name": metadata.name,
+                    "created_at": metadata.created_at,
+                    "topic_epoch": metadata.topic_epoch
+                });
+                Frame::new_topic_response(Bytes::from(response_data.to_string()))
+            },
+            Err(e) => Frame::new_error_response(&e.to_string()),
+        }
+    } else {
+        // Standalone mode keeps local duplicate semantics.
+        if ctx
+            .topic_registry
+            .get_topic_id_by_name(&topic_name)
+            .is_some()
+        {
+            return Frame::new_error_response(&format!("Topic '{}' already exists", topic_name));
+        }
+
+        match ctx.topic_registry.create_topic(&topic_name) {
+            Ok(metadata) => {
+                let response_data = serde_json::json!({
+                    "id": metadata.id,
+                    "name": metadata.name,
+                    "created_at": metadata.created_at,
+                    "topic_epoch": metadata.topic_epoch
+                });
+                Frame::new_topic_response(Bytes::from(response_data.to_string()))
+            },
+            Err(e) => Frame::new_error_response(&e.to_string()),
+        }
     }
 }
 
@@ -224,7 +380,8 @@ pub fn handle_get_topic(ctx: &CommandContext<'_>, payload: Option<&Bytes>) -> Fr
             let response_data = serde_json::json!({
                 "id": metadata.id,
                 "name": metadata.name,
-                "created_at": metadata.created_at
+                "created_at": metadata.created_at,
+                "topic_epoch": metadata.topic_epoch
             });
             Frame::new_topic_response(Bytes::from(response_data.to_string()))
         },
@@ -244,7 +401,7 @@ pub async fn handle_delete_topic(ctx: &CommandContext<'_>, payload: Option<&Byte
             // Replicate topic deletion to followers (if in cluster mode)
             if let Some(coord) = ctx.cluster {
                 let op = TopicOperation::Delete { topic_id };
-                if let Err(e) = coord.replicate_topic_op(op).await {
+                if let Err(e) = coord.replicate_topic_op_sync(op).await {
                     warn!(
                         target: "lance::server",
                         topic_id,
@@ -487,38 +644,167 @@ pub async fn handle_create_topic_with_retention(
                 max_bytes: Some(max_bytes),
             });
 
-            match ctx
-                .topic_registry
-                .create_topic_with_retention(&topic_name, retention)
-            {
-                Ok(metadata) => {
-                    // Replicate to followers if in cluster mode
-                    if let Some(coord) = ctx.cluster {
-                        let op = TopicOperation::Create {
-                            topic_id: metadata.id,
-                            name: metadata.name.clone(),
-                            created_at: metadata.created_at,
-                        };
-                        if let Err(e) = coord.replicate_topic_op(op).await {
-                            warn!(
+            if let Some(coord) = ctx.cluster {
+                if let Some(existing_id) = ctx.topic_registry.get_topic_id_by_name(&topic_name) {
+                    let created_at = ctx
+                        .topic_registry
+                        .get_topic_by_id(existing_id)
+                        .map(|m| m.created_at)
+                        .unwrap_or_else(|| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0)
+                        });
+
+                    let op = TopicOperation::Create {
+                        topic_id: existing_id,
+                        name: topic_name.clone(),
+                        created_at,
+                    };
+
+                    if let Err(e) = coord.replicate_topic_op_sync(op).await {
+                        warn!(
+                            target: "lance::server",
+                            topic_id = existing_id,
+                            topic_name = %topic_name,
+                            error = %e,
+                            "Failed to converge existing topic creation with retention"
+                        );
+                        coord.reemit_committed_topic_ops().await;
+                        if let Some(metadata) = ctx.topic_registry.get_topic_by_id(existing_id) {
+                            info!(
                                 target: "lance::server",
                                 topic_id = metadata.id,
+                                topic_name = %metadata.name,
                                 error = %e,
-                                "Failed to replicate topic creation"
+                                "Returning existing topic after retention convergence retry failed"
                             );
+                            let response_data = serde_json::json!({
+                                "id": metadata.id,
+                                "name": metadata.name,
+                                "created_at": metadata.created_at,
+                                "topic_epoch": metadata.topic_epoch,
+                                "max_age_secs": max_age_secs,
+                                "max_bytes": max_bytes
+                            });
+                            return Frame::new_topic_response(Bytes::from(
+                                response_data.to_string(),
+                            ));
                         }
+                        return Frame::new_error_response(&format!(
+                            "Failed to replicate existing topic convergence: {}",
+                            e
+                        ));
                     }
 
-                    let response_data = serde_json::json!({
-                        "id": metadata.id,
-                        "name": metadata.name,
-                        "created_at": metadata.created_at,
-                        "max_age_secs": max_age_secs,
-                        "max_bytes": max_bytes
-                    });
-                    Frame::new_topic_response(Bytes::from(response_data.to_string()))
-                },
-                Err(e) => Frame::new_error_response(&e.to_string()),
+                    let _ = ctx.topic_registry.create_topic_with_id(
+                        existing_id,
+                        &topic_name,
+                        created_at,
+                    );
+                    let _ = ctx
+                        .topic_registry
+                        .set_retention(existing_id, max_age_secs, max_bytes);
+
+                    if let Some(metadata) = ctx.topic_registry.get_topic_by_id(existing_id) {
+                        let response_data = serde_json::json!({
+                            "id": metadata.id,
+                            "name": metadata.name,
+                            "created_at": metadata.created_at,
+                            "topic_epoch": metadata.topic_epoch,
+                            "max_age_secs": max_age_secs,
+                            "max_bytes": max_bytes
+                        });
+                        return Frame::new_topic_response(Bytes::from(response_data.to_string()));
+                    }
+                }
+
+                // Cluster mode: replicate first, then materialize locally.
+                // This prevents transient visibility of uncommitted topic metadata.
+                let topic_id = ctx.topic_registry.reserve_topic_id();
+                let created_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                let op = TopicOperation::Create {
+                    topic_id,
+                    name: topic_name.clone(),
+                    created_at,
+                };
+
+                if let Err(e) = coord.replicate_topic_op_sync(op).await {
+                    warn!(
+                        target: "lance::server",
+                        topic_id,
+                        error = %e,
+                        "Failed to replicate topic creation - returning error to client"
+                    );
+
+                    // Leader churn can race with sync quorum observation. If
+                    // the create committed despite this error path, replay
+                    // committed topic ops to reconcile local registry state.
+                    coord.reemit_committed_topic_ops().await;
+
+                    return Frame::new_error_response(&format!(
+                        "Failed to replicate topic creation: {}",
+                        e
+                    ));
+                }
+
+                match ctx
+                    .topic_registry
+                    .create_topic_with_id(topic_id, &topic_name, created_at)
+                {
+                    Ok(mut metadata) => {
+                        metadata.retention = retention.clone();
+                        let _ = ctx
+                            .topic_registry
+                            .set_retention(topic_id, max_age_secs, max_bytes);
+
+                        let response_data = serde_json::json!({
+                            "id": metadata.id,
+                            "name": metadata.name,
+                            "created_at": metadata.created_at,
+                            "topic_epoch": metadata.topic_epoch,
+                            "max_age_secs": max_age_secs,
+                            "max_bytes": max_bytes
+                        });
+                        Frame::new_topic_response(Bytes::from(response_data.to_string()))
+                    },
+                    Err(e) => Frame::new_error_response(&e.to_string()),
+                }
+            } else {
+                // Standalone mode keeps local duplicate semantics.
+                if ctx
+                    .topic_registry
+                    .get_topic_id_by_name(&topic_name)
+                    .is_some()
+                {
+                    return Frame::new_error_response(&format!(
+                        "Topic '{}' already exists",
+                        topic_name
+                    ));
+                }
+
+                match ctx
+                    .topic_registry
+                    .create_topic_with_retention(&topic_name, retention)
+                {
+                    Ok(metadata) => {
+                        let response_data = serde_json::json!({
+                            "id": metadata.id,
+                            "name": metadata.name,
+                            "created_at": metadata.created_at,
+                            "topic_epoch": metadata.topic_epoch,
+                            "max_age_secs": max_age_secs,
+                            "max_bytes": max_bytes
+                        });
+                        Frame::new_topic_response(Bytes::from(response_data.to_string()))
+                    },
+                    Err(e) => Frame::new_error_response(&e.to_string()),
+                }
             }
         },
         None => Frame::new_error_response("Invalid create topic payload"),
@@ -536,15 +822,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_write_operation() {
-        assert!(is_write_operation(ControlCommand::CreateTopic));
-        assert!(is_write_operation(ControlCommand::DeleteTopic));
-        assert!(is_write_operation(ControlCommand::SetRetention));
-        assert!(is_write_operation(ControlCommand::CreateTopicWithRetention));
-        assert!(!is_write_operation(ControlCommand::ListTopics));
-        assert!(!is_write_operation(ControlCommand::GetTopic));
-        assert!(!is_write_operation(ControlCommand::Fetch));
-        assert!(!is_write_operation(ControlCommand::Subscribe));
+    fn test_is_topic_metadata_operation() {
+        assert!(is_topic_metadata_operation(ControlCommand::CreateTopic));
+        assert!(is_topic_metadata_operation(ControlCommand::DeleteTopic));
+        assert!(is_topic_metadata_operation(ControlCommand::SetRetention));
+        assert!(is_topic_metadata_operation(
+            ControlCommand::CreateTopicWithRetention
+        ));
+        // ListTopics is read-only and excluded from leader-authoritative gating
+        // so followers can serve their local topic list during elections.
+        assert!(!is_topic_metadata_operation(ControlCommand::ListTopics));
+        assert!(is_topic_metadata_operation(ControlCommand::GetTopic));
+        assert!(!is_topic_metadata_operation(ControlCommand::Fetch));
+        assert!(!is_topic_metadata_operation(ControlCommand::Subscribe));
     }
 
     #[test]
@@ -625,5 +915,138 @@ mod tests {
             frame.frame_type,
             lnc_network::FrameType::Control(ControlCommand::ErrorResponse)
         ));
+    }
+
+    /// Regression test: tail sentinel (u64::MAX) on an empty topic must return
+    /// a normal (empty) FetchResponse, NOT a CATCHING_UP frame.
+    ///
+    /// Before the fix, `start_offset = u64::MAX` with `total = 0` triggered
+    /// the `start_offset > total` heuristic and returned CATCHING_UP,
+    /// trapping consumers in an infinite backoff loop.
+    #[test]
+    fn test_fetch_tail_sentinel_empty_topic_returns_fetch_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = TopicRegistry::new(dir.path().to_path_buf()).unwrap();
+        // Create an empty topic (no data produced)
+        let topic_meta = registry.create_topic("empty-topic").unwrap();
+
+        let rate_limiter = ConsumerRateLimiter::disabled();
+        let sub_manager = SubscriptionManager::new();
+        let cluster: Option<Arc<ClusterCoordinator>> = None;
+
+        let ctx = CommandContext {
+            topic_registry: &registry,
+            rate_limiter: &rate_limiter,
+            subscription_manager: &sub_manager,
+            cluster: &cluster,
+        };
+
+        let dispatcher = ControlCommandDispatcher::new(&ctx);
+
+        // Build a FetchRequest with the tail sentinel
+        let req = FetchRequest {
+            topic_id: topic_meta.id,
+            start_offset: u64::MAX,
+            max_bytes: 65536,
+        };
+
+        let frame = dispatcher.handle_fetch_request(&req);
+
+        // Must be a FetchResponse, not CatchingUp
+        assert!(
+            matches!(
+                frame.frame_type,
+                lnc_network::FrameType::Control(ControlCommand::FetchResponse)
+            ),
+            "Tail sentinel on empty topic must return FetchResponse, got: {:?}",
+            frame.frame_type
+        );
+    }
+
+    /// Verify that a concrete offset beyond total data still returns
+    /// CATCHING_UP in cluster mode (normal replication-lag behavior).
+    #[test]
+    fn test_fetch_concrete_offset_beyond_total_returns_catching_up_in_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = TopicRegistry::new(dir.path().to_path_buf()).unwrap();
+        let topic_meta = registry.create_topic("test-topic").unwrap();
+        let topic_id = topic_meta.id;
+
+        let rate_limiter = ConsumerRateLimiter::disabled();
+        let sub_manager = SubscriptionManager::new();
+        // No cluster -- CATCHING_UP logic only applies when cluster is Some,
+        // but the `start_offset > total` check is hit regardless of cluster
+        // membership for the replication-lag heuristic.
+        let cluster: Option<Arc<ClusterCoordinator>> = None;
+
+        let ctx = CommandContext {
+            topic_registry: &registry,
+            rate_limiter: &rate_limiter,
+            subscription_manager: &sub_manager,
+            cluster: &cluster,
+        };
+
+        let dispatcher = ControlCommandDispatcher::new(&ctx);
+
+        // Concrete offset that is beyond the empty topic's total (0)
+        let req = FetchRequest {
+            topic_id,
+            start_offset: 1024,
+            max_bytes: 65536,
+        };
+
+        let frame = dispatcher.handle_fetch_request(&req);
+
+        // Should return CATCHING_UP since 1024 > 0 (topic total) and the
+        // offset is a concrete value (not the tail sentinel)
+        assert!(
+            matches!(
+                frame.frame_type,
+                lnc_network::FrameType::Control(ControlCommand::CatchingUp)
+            ),
+            "Concrete offset beyond total should return CatchingUp, got: {:?}",
+            frame.frame_type
+        );
+    }
+
+    /// Verify that a fetch at offset 0 on an empty topic returns an empty
+    /// FetchResponse (not CATCHING_UP).
+    #[test]
+    fn test_fetch_offset_zero_empty_topic_returns_fetch_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = TopicRegistry::new(dir.path().to_path_buf()).unwrap();
+        let topic_meta = registry.create_topic("empty-topic").unwrap();
+        let topic_id = topic_meta.id;
+
+        let rate_limiter = ConsumerRateLimiter::disabled();
+        let sub_manager = SubscriptionManager::new();
+        let cluster: Option<Arc<ClusterCoordinator>> = None;
+
+        let ctx = CommandContext {
+            topic_registry: &registry,
+            rate_limiter: &rate_limiter,
+            subscription_manager: &sub_manager,
+            cluster: &cluster,
+        };
+
+        let dispatcher = ControlCommandDispatcher::new(&ctx);
+
+        let req = FetchRequest {
+            topic_id,
+            start_offset: 0,
+            max_bytes: 65536,
+        };
+
+        let frame = dispatcher.handle_fetch_request(&req);
+
+        // Offset 0 on an empty topic should return a normal (empty) response
+        assert!(
+            matches!(
+                frame.frame_type,
+                lnc_network::FrameType::Control(ControlCommand::FetchResponse)
+            ),
+            "Offset 0 on empty topic must return FetchResponse, got: {:?}",
+            frame.frame_type
+        );
     }
 }

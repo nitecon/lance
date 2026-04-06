@@ -1,6 +1,9 @@
 use lnc_core::{LanceError, Result};
 use lnc_io::WalConfig;
-use lnc_replication::{DiscoveryClusterConfig, DiscoveryMethod, PeerInfo, ReplicationMode};
+use lnc_replication::{
+    DiscoveryClusterConfig, DiscoveryMethod, PeerInfo, ReplicationMode,
+    parse_node_id_from_hostname, parse_peer_node_id,
+};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -30,9 +33,29 @@ pub struct Config {
     /// TLS settings for secure connections
     #[serde(default)]
     pub tls: TlsSettings,
-    /// Quorum timeout in milliseconds for L3 replication (default: 100ms)
+    /// Quorum timeout in milliseconds for L3 replication (default: 5000ms)
     #[serde(default)]
     pub replication_quorum_timeout_ms: Option<u64>,
+    /// Per-connection consumer read rate limit in bytes per second.
+    /// Disabled by default (unlimited throughput, zero overhead on fetch path).
+    /// Set to cap how fast any single consumer can read, e.g. `104857600` for 100 MB/s.
+    #[serde(default)]
+    pub consumer_rate_limit_bytes_per_sec: Option<u64>,
+    /// Capacity of the data replication forwarder channel.
+    /// Higher values absorb network micro-bursts without backpressuring ingestion.
+    #[serde(default = "default_data_replication_channel_capacity")]
+    pub data_replication_channel_capacity: usize,
+    /// Maximum number of concurrent replication batches in flight.
+    /// `1` preserves strict sequential forwarding.
+    /// Values `>1` enable bounded pipelining for higher throughput.
+    #[serde(default = "default_replication_max_inflight")]
+    pub replication_max_inflight: usize,
+    /// Pin the dedicated coordinator runtime thread to a specific CPU core (optional).
+    #[serde(default)]
+    pub coordinator_pin_core: Option<usize>,
+    /// Pin the dedicated forwarder runtime thread to a specific CPU core (optional).
+    #[serde(default)]
+    pub forwarder_pin_core: Option<usize>,
 }
 
 /// Authentication configuration for the server
@@ -66,6 +89,14 @@ pub struct TlsSettings {
 
 fn default_retention_cleanup_interval() -> u64 {
     60
+}
+
+fn default_data_replication_channel_capacity() -> usize {
+    65_536
+}
+
+fn default_replication_max_inflight() -> usize {
+    8
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +177,11 @@ impl Default for Config {
             auth: AuthSettings::default(),
             tls: TlsSettings::default(),
             replication_quorum_timeout_ms: None,
+            consumer_rate_limit_bytes_per_sec: None,
+            data_replication_channel_capacity: default_data_replication_channel_capacity(),
+            replication_max_inflight: default_replication_max_inflight(),
+            coordinator_pin_core: None,
+            forwarder_pin_core: None,
         }
     }
 }
@@ -230,6 +266,12 @@ impl Config {
                 size: args.wal_size,
                 path: Some(args.data_dir.join("wal")),
             },
+            ingestion: IngestionSettings {
+                actor_count: args.ingestion_actor_count.max(1),
+                ..Default::default()
+            },
+            replication_max_inflight: args.replication_max_inflight.max(1),
+            consumer_rate_limit_bytes_per_sec: args.consumer_rate_limit,
             ..Default::default()
         }
     }
@@ -258,7 +300,7 @@ impl Config {
         self.peers
             .iter()
             .enumerate()
-            .map(|(i, _)| (i + 1) as u16)
+            .map(|(idx, peer_str)| parse_peer_node_id(peer_str, idx))
             .filter(|&id| id != self.node_id)
             .collect()
     }
@@ -285,20 +327,14 @@ impl Config {
 
         // First pass: collect all peer info and try initial resolution
         for (idx, peer_str) in self.peers.iter().enumerate() {
-            // Support both "host:port" and "node_id@host:port" formats
-            let (node_id, host_port) = if peer_str.contains('@') {
-                let parts: Vec<&str> = peer_str.splitn(2, '@').collect();
-                if parts.len() == 2 {
-                    if let Ok(id) = parts[0].parse::<u16>() {
-                        (id, parts[1].to_string())
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
+            let node_id = parse_peer_node_id(peer_str, idx);
+            let host_port = if peer_str.contains('@') {
+                match peer_str.split_once('@').map(|x| x.1) {
+                    Some(hp) => hp.to_string(),
+                    None => continue,
                 }
             } else {
-                (idx as u16, peer_str.to_string())
+                peer_str.to_string()
             };
 
             // Skip self
@@ -321,14 +357,7 @@ impl Config {
             .peers
             .iter()
             .enumerate()
-            .filter(|(idx, p)| {
-                let node_id = if p.contains('@') {
-                    p.split('@').next().and_then(|s| s.parse::<u16>().ok())
-                } else {
-                    Some(*idx as u16)
-                };
-                node_id.is_some_and(|id| id != self.node_id)
-            })
+            .filter(|(idx, p)| parse_peer_node_id(p, *idx) != self.node_id)
             .count();
 
         // Retry loop for DNS resolution
@@ -404,6 +433,10 @@ impl Config {
     }
 
     /// Create cluster configuration for replication (with async peer resolution)
+    ///
+    /// Automatically selects `DnsStateful` discovery when peer strings contain
+    /// hostnames with parseable node IDs (e.g., `lance-1.lance-headless:1993`).
+    /// Falls back to `Static` discovery for raw IP addresses.
     pub async fn cluster_config_async(&self) -> DiscoveryClusterConfig {
         let peers = self.parse_peers_async().await;
         tracing::info!(
@@ -412,13 +445,77 @@ impl Config {
             peer_count = peers.len(),
             "Parsed cluster peers"
         );
+
+        // Detect if peers use hostname patterns suitable for DnsStateful discovery.
+        // If any peer string contains a hostname with a parseable node ID suffix,
+        // use DnsStateful for stable node ID resolution on DNS refresh.
+        let has_hostname_peers = self.peers.iter().any(|p| {
+            let host = if p.contains('@') {
+                // node_id@host:port format — already has explicit ID
+                return false;
+            } else {
+                p.rsplit(':').next_back().unwrap_or(p)
+            };
+            // Check if it's NOT a raw IP and HAS a parseable hostname ID
+            host.parse::<std::net::IpAddr>().is_err() && parse_node_id_from_hostname(host).is_some()
+        });
+
+        let discovery = if has_hostname_peers {
+            // Extract hostnames (without port) for DnsStateful discovery
+            let peer_hostnames: Vec<String> = self
+                .peers
+                .iter()
+                .filter_map(|p| {
+                    if p.contains('@') {
+                        return None;
+                    }
+                    // Split off port to get hostname
+                    if let Some(colon_pos) = p.rfind(':') {
+                        let host = &p[..colon_pos];
+                        if host.parse::<std::net::IpAddr>().is_err() {
+                            return Some(host.to_string());
+                        }
+                    }
+                    None
+                })
+                .collect();
+
+            let port = self
+                .peers
+                .first()
+                .and_then(|p| p.rsplit(':').next())
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(1993);
+
+            if peer_hostnames.is_empty() {
+                DiscoveryMethod::Static(peers)
+            } else {
+                tracing::info!(
+                    target: "lance::config",
+                    hostnames = ?peer_hostnames,
+                    port,
+                    "Using DnsStateful discovery for stable node IDs"
+                );
+                DiscoveryMethod::DnsStateful {
+                    peer_hostnames,
+                    port,
+                    refresh_interval: Duration::from_secs(30),
+                }
+            }
+        } else {
+            DiscoveryMethod::Static(peers)
+        };
+
         DiscoveryClusterConfig {
             node_id: self.node_id,
             listen_addr: self.replication_addr,
-            discovery: DiscoveryMethod::Static(peers),
-            heartbeat_interval: Duration::from_millis(150),
-            election_timeout_min: Duration::from_millis(300),
-            election_timeout_max: Duration::from_millis(500),
+            discovery,
+            // Keep these aligned with RaftConfig production defaults.
+            // Use a wider election budget so transient replication stalls and
+            // control-plane jitter do not trigger avoidable leader churn.
+            heartbeat_interval: Duration::from_millis(250),
+            election_timeout_min: Duration::from_millis(3000),
+            election_timeout_max: Duration::from_millis(6000),
             raw_peer_strings: self.peers.clone(),
         }
     }
@@ -439,6 +536,10 @@ mod tests {
         assert_eq!(config.health_addr.port(), 8080);
         assert_eq!(config.replication_mode, "l1");
         assert!(config.peers.is_empty());
+        assert_eq!(config.data_replication_channel_capacity, 65_536);
+        assert_eq!(config.replication_max_inflight, 8);
+        assert_eq!(config.coordinator_pin_core, None);
+        assert_eq!(config.forwarder_pin_core, None);
     }
 
     #[test]
@@ -480,6 +581,10 @@ health_addr = "127.0.0.1:8081"
 data_dir = "/tmp/lance-test"
 replication_mode = "l3"
 peers = ["127.0.0.1:1994", "127.0.0.1:1995"]
+data_replication_channel_capacity = 32768
+replication_max_inflight = 8
+coordinator_pin_core = 6
+forwarder_pin_core = 7
 
 [wal]
 enabled = true
@@ -507,6 +612,10 @@ segment_max_size = 2147483648
         assert!(config.wal.enabled);
         assert_eq!(config.ingestion.batch_pool_size, 128);
         assert_eq!(config.io.ring_size, 512);
+        assert_eq!(config.data_replication_channel_capacity, 32768);
+        assert_eq!(config.replication_max_inflight, 8);
+        assert_eq!(config.coordinator_pin_core, Some(6));
+        assert_eq!(config.forwarder_pin_core, Some(7));
     }
 
     #[test]
@@ -573,7 +682,7 @@ segment_max_size = 2147483648
     }
 
     #[test]
-    fn test_peer_ids() {
+    fn test_peer_ids_ip_addresses() {
         let mut config = Config::default();
         config.node_id = 1;
         config.peers = vec![
@@ -583,9 +692,63 @@ segment_max_size = 2147483648
         ];
 
         let peer_ids = config.peer_ids();
-        // Should exclude own node_id (1)
+        // IP addresses fall back to idx-based IDs: [0, 1, 2], filter out self (1)
         assert!(!peer_ids.contains(&1));
+        assert!(peer_ids.contains(&0));
         assert!(peer_ids.contains(&2));
-        assert!(peer_ids.contains(&3));
+        assert_eq!(peer_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_peer_ids_hostname_node0() {
+        // Regression: node_id=0 must correctly filter itself from hostname-based peers
+        let mut config = Config::default();
+        config.node_id = 0;
+        config.peers = vec![
+            "lance-0.lance-headless:1993".into(),
+            "lance-1.lance-headless:1993".into(),
+            "lance-2.lance-headless:1993".into(),
+        ];
+
+        let peer_ids = config.peer_ids();
+        // Should extract IDs [0, 1, 2] from hostnames, filter out self (0)
+        assert!(!peer_ids.contains(&0));
+        assert!(peer_ids.contains(&1));
+        assert!(peer_ids.contains(&2));
+        assert_eq!(peer_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_peer_ids_hostname_node1() {
+        let mut config = Config::default();
+        config.node_id = 1;
+        config.peers = vec![
+            "lance-0.lance-headless:1993".into(),
+            "lance-1.lance-headless:1993".into(),
+            "lance-2.lance-headless:1993".into(),
+        ];
+
+        let peer_ids = config.peer_ids();
+        assert!(!peer_ids.contains(&1));
+        assert!(peer_ids.contains(&0));
+        assert!(peer_ids.contains(&2));
+        assert_eq!(peer_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_peer_ids_explicit_format() {
+        let mut config = Config::default();
+        config.node_id = 0;
+        config.peers = vec![
+            "0@127.0.0.1:1993".into(),
+            "1@127.0.0.1:1994".into(),
+            "2@127.0.0.1:1995".into(),
+        ];
+
+        let peer_ids = config.peer_ids();
+        assert!(!peer_ids.contains(&0));
+        assert!(peer_ids.contains(&1));
+        assert!(peer_ids.contains(&2));
+        assert_eq!(peer_ids.len(), 2);
     }
 }

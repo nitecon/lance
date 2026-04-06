@@ -1,12 +1,17 @@
-//! lnc-bench — Throughput and latency benchmark for LANCE
+//! lnc-bench — High-throughput benchmark for LANCE
 //!
-//! Measures peak ingestion throughput (msg/s, MB/s) and ACK latency
+//! Measures peak ingestion throughput (msg/s, MB/s) and end-to-end latency
 //! percentiles (p50, p95, p99, p999, max) using the lnc-client Producer API.
+//!
+//! LANCE is designed for millions of messages per second. This benchmark
+//! validates performance against realistic high-throughput targets:
+//!   - Throughput: 100K-1M+ msg/s (platform capability)
+//!   - Latency: sub-millisecond to low-millisecond (p50: <5ms, p99: <50ms)
 //!
 //! # Usage
 //!
 //! ```text
-//! lnc-bench --endpoint 127.0.0.1:1992 --topic 1 --duration 30 --msg-size 1024 --connections 4
+//! lnc-bench --endpoint 127.0.0.1:1992 --topic bench --duration 60 --connections 64 --pipeline 256
 //! ```
 
 use std::sync::Arc;
@@ -18,11 +23,19 @@ use clap::Parser;
 use tokio::sync::{Barrier, Semaphore, mpsc};
 use tracing::{error, info, warn};
 
-/// LANCE throughput and latency benchmark
+// Realistic latency targets for networked operations (nanoseconds)
+// LANCE targets sub-millisecond to low-millisecond latency
+const LATENCY_P50_MAX_NS: u64 = 5_000_000; // 5ms - excellent for LAN
+const LATENCY_P99_MAX_NS: u64 = 50_000_000; // 50ms - acceptable tail latency
+const LATENCY_P999_MAX_NS: u64 = 100_000_000; // 100ms - max acceptable tail
+const PRODUCE_TIMEOUT_SECS: u64 = 15;
+const DRAIN_TIMEOUT_SECS: u64 = 15;
+
+/// LANCE high-throughput benchmark
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "lnc-bench",
-    about = "Throughput and latency benchmark for LANCE"
+    about = "High-throughput benchmark for LANCE - designed for millions of msg/s"
 )]
 struct Args {
     /// LANCE server endpoint (host:port)
@@ -68,6 +81,46 @@ struct Args {
     /// Collect per-message latencies (adds overhead, enables percentile reporting)
     #[arg(long, default_value = "true")]
     latency: bool,
+
+    /// Minimum throughput gate in messages/sec
+    ///
+    /// LANCE platform targets:
+    ///   - 10K msg/s: Entry-level (single connection)
+    ///   - 100K msg/s: Good (multi-core, batching)
+    ///   - 500K msg/s: Excellent (optimized pipeline)
+    ///   - 1M+ msg/s: World-class (maximized parallelism)
+    #[arg(long, default_value = "10000")]
+    min_throughput_msgs_per_sec: f64,
+
+    /// Maximum allowed benchmark errors for pass gate
+    #[arg(long, default_value = "0")]
+    max_errors: u64,
+
+    /// Skip strict latency percentile gate
+    #[arg(long, default_value = "false")]
+    skip_latency_gate: bool,
+}
+
+fn gate_status(pass: bool) -> &'static str {
+    if pass { "PASS" } else { "FAIL" }
+}
+
+fn throughput_health(msgs_per_sec: f64) -> (&'static str, &'static str) {
+    if msgs_per_sec < 1_000.0 {
+        ("🔴 CRITICAL", "<1K msg/s - Severely constrained")
+    } else if msgs_per_sec < 10_000.0 {
+        ("🟠 LOW", "1K-10K msg/s - Development/testing pace")
+    } else if msgs_per_sec < 50_000.0 {
+        ("� MODERATE", "10K-50K msg/s - Entry production")
+    } else if msgs_per_sec < 100_000.0 {
+        ("🟢 GOOD", "50K-100K msg/s - Solid throughput")
+    } else if msgs_per_sec < 500_000.0 {
+        ("� EXCELLENT", "100K-500K msg/s - High performance")
+    } else if msgs_per_sec < 1_000_000.0 {
+        ("🟢 OUTSTANDING", "500K-1M msg/s - Near peak")
+    } else {
+        ("🏆 WORLD-CLASS", "1M+ msg/s - Platform maximized")
+    }
 }
 
 /// Shared counters across all producer tasks
@@ -307,10 +360,16 @@ async fn main() {
     info!("║  ── Throughput ────────────────────────────────────────     ║");
     info!("║  Messages:     {:<43}║", format!("{total_msgs}"));
     info!("║  Msg/sec:      {:<43}║", format!("{msgs_per_sec:.0}"));
+    let (health, health_band) = throughput_health(msgs_per_sec);
+    info!(
+        "║  Throughput:   {:<43}║",
+        format!("{health} ({health_band})")
+    );
     info!("║  Bandwidth:    {:<43}║", format_bytes(bytes_per_sec));
     info!("║  Errors:       {:<43}║", format!("{total_errors}"));
     info!("║                                                            ║");
 
+    let mut latency_gate_pass = args.skip_latency_gate;
     if !all_latencies.is_empty() {
         let p50 = percentile(&all_latencies, 50.0);
         let p95 = percentile(&all_latencies, 95.0);
@@ -318,11 +377,13 @@ async fn main() {
         let p999 = percentile(&all_latencies, 99.9);
         let max = *all_latencies.last().unwrap_or(&0);
         let min = *all_latencies.first().unwrap_or(&0);
-        let avg = if all_latencies.is_empty() {
-            0
-        } else {
-            all_latencies.iter().sum::<u64>() / all_latencies.len() as u64
-        };
+        let avg = all_latencies.iter().sum::<u64>() / all_latencies.len() as u64;
+
+        if !args.skip_latency_gate {
+            latency_gate_pass = p50 <= LATENCY_P50_MAX_NS
+                && p99 <= LATENCY_P99_MAX_NS
+                && p999 <= LATENCY_P999_MAX_NS;
+        }
 
         info!("║  ── Latency (send → ACK) ─────────────────────────────     ║");
         info!(
@@ -337,9 +398,56 @@ async fn main() {
         info!("║  p99.9:        {:<43}║", format_ns(p999));
         info!("║  max:          {:<43}║", format_ns(max));
         info!("║                                                            ║");
+    } else {
+        info!("║  ── Latency (send → ACK) ─────────────────────────────     ║");
+        info!("║  samples:      {:<43}║", "0");
+        info!("║  status:       {:<43}║", "NOT COLLECTED");
+        info!("║                                                            ║");
     }
 
+    let throughput_gate_pass = msgs_per_sec >= args.min_throughput_msgs_per_sec;
+    let error_gate_pass = total_errors <= args.max_errors;
+    let overall_pass = throughput_gate_pass && error_gate_pass && latency_gate_pass;
+
+    info!("║  ── Benchmark Gates ───────────────────────────────────     ║");
+    info!(
+        "║  Throughput:   {:<43}║",
+        format!(
+            "{} (requires >= {:.0} msg/s)",
+            gate_status(throughput_gate_pass),
+            args.min_throughput_msgs_per_sec
+        )
+    );
+    info!(
+        "║  Errors:       {:<43}║",
+        format!(
+            "{} (requires <= {})",
+            gate_status(error_gate_pass),
+            args.max_errors,
+        )
+    );
+    info!(
+        "║  Latency:      {:<43}║",
+        if args.skip_latency_gate {
+            "SKIP (disabled by --skip-latency-gate)".to_string()
+        } else {
+            format!(
+                "{} (p50<=5ms, p99<=50ms, p99.9<=100ms)",
+                gate_status(latency_gate_pass)
+            )
+        }
+    );
+    info!("║                                                            ║");
+    info!(
+        "║  OVERALL:      {:<43}║",
+        if overall_pass { "PASS" } else { "FAIL" }
+    );
+
     info!("╚══════════════════════════════════════════════════════════════╝");
+
+    if !overall_pass {
+        std::process::exit(1);
+    }
 }
 
 /// Setup topic: create if it doesn't exist, return topic_id
@@ -348,38 +456,14 @@ async fn setup_topic(endpoint: &str, topic_name: &str) -> Result<u32, String> {
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
 
-    // Try to create topic (returns existing info if already exists)
-    match client.create_topic(topic_name).await {
-        Ok(info) => {
-            info!(topic_id = info.id, name = %info.name, "Topic ready");
-            let _ = client.close().await;
-            return Ok(info.id);
-        },
-        Err(e) => {
-            warn!("create_topic returned error (may already exist): {e}");
-        },
-    }
+    let topic = client
+        .create_topic(topic_name)
+        .await
+        .map_err(|e| format!("create_topic failed: {e}"))?;
 
-    // Fallback: list topics and find by name
-    match client.list_topics().await {
-        Ok(topics) => {
-            let _ = client.close().await;
-            for t in &topics {
-                if t.name == topic_name {
-                    info!(topic_id = t.id, name = %t.name, "Found existing topic");
-                    return Ok(t.id);
-                }
-            }
-            Err(format!(
-                "topic '{}' not found after create attempt",
-                topic_name
-            ))
-        },
-        Err(e) => {
-            let _ = client.close().await;
-            Err(format!("list_topics failed: {e}"))
-        },
-    }
+    info!(topic_id = topic.id, name = %topic.name, "Topic ready");
+    let _ = client.close().await;
+    Ok(topic.id)
 }
 
 /// Generate a deterministic payload of the given size
@@ -453,22 +537,39 @@ async fn producer_task(
 
         tokio::spawn(async move {
             let start = Instant::now();
-            match prod.send(topic_id, &pl).await {
-                Ok(_ack) => {
-                    m.total_messages.fetch_add(1, Ordering::Relaxed);
-                    m.total_bytes.fetch_add(msg_size, Ordering::Relaxed);
-                    if let Some(tx) = lat {
-                        let _ = tx.send(start.elapsed().as_nanos() as u64);
-                    }
+            match tokio::time::timeout(
+                Duration::from_secs(PRODUCE_TIMEOUT_SECS),
+                prod.produce_single(topic_id, &pl),
+            )
+            .await
+            {
+                Ok(result) => match result {
+                    Ok(_ack) => {
+                        m.total_messages.fetch_add(1, Ordering::Relaxed);
+                        m.total_bytes.fetch_add(msg_size, Ordering::Relaxed);
+                        if let Some(tx) = lat {
+                            let _ = tx.send(start.elapsed().as_nanos() as u64);
+                        }
+                    },
+                    Err(e) => {
+                        let prev = m.total_errors.fetch_add(1, Ordering::Relaxed);
+                        // Log first error and every 10000th to avoid spam
+                        if prev == 0 || prev % 10000 == 0 {
+                            warn!("send error (count={}): {}", prev + 1, e);
+                        }
+                        if matches!(e, lnc_client::ClientError::ServerBackpressure) {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    },
                 },
-                Err(e) => {
+                Err(_) => {
                     let prev = m.total_errors.fetch_add(1, Ordering::Relaxed);
-                    // Log first error and every 10000th to avoid spam
                     if prev == 0 || prev % 10000 == 0 {
-                        warn!("send error (count={}): {}", prev + 1, e);
-                    }
-                    if matches!(e, lnc_client::ClientError::ServerBackpressure) {
-                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        warn!(
+                            "send timeout after {}s (count={})",
+                            PRODUCE_TIMEOUT_SECS,
+                            prev + 1
+                        );
                     }
                 },
             }
@@ -477,7 +578,18 @@ async fn producer_task(
     }
 
     // Wait for all in-flight sends to drain
-    let _ = sem.acquire_many(pipeline as u32).await;
+    if tokio::time::timeout(
+        Duration::from_secs(DRAIN_TIMEOUT_SECS),
+        sem.acquire_many(pipeline as u32),
+    )
+    .await
+    .is_err()
+    {
+        warn!(
+            "Timed out waiting for in-flight sends to drain after {}s",
+            DRAIN_TIMEOUT_SECS
+        );
+    }
 
     // Flush + close
     // Arc::into_inner only works if we're the last holder; try_unwrap for safety

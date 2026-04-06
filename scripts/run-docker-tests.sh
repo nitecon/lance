@@ -17,6 +17,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 COMPOSE_FILE="$PROJECT_DIR/docker-compose.test.yml"
+ARTIFACTS_DIR="$PROJECT_DIR/.cassa_artifacts"
+TEE_LOG_DIR="$ARTIFACTS_DIR/tee"
+BENCH_RESULTS_DIR="$ARTIFACTS_DIR/benchmarks"
 
 # Options
 TEST_FILTER=""
@@ -323,32 +326,34 @@ run_tests() {
 run_tee_tests() {
     log "Running TEE-specific tests..."
     echo ""
+    mkdir -p "$TEE_LOG_DIR"
+    TEE_TEST_LOG_FILE="$TEE_LOG_DIR/lance-tee-tests.log"
     
     # First run unit tests for TEE primitives
     log "=== TEE Unit Tests (lnc-io) ==="
     cd "$PROJECT_DIR"
-    cargo test --package lnc-io --lib -- tee 2>&1 | tee /tmp/lance-tee-tests.log || {
+    cargo test --package lnc-io --lib -- tee 2>&1 | tee "$TEE_TEST_LOG_FILE" || {
         log_error "TEE unit tests failed"
         TEST_EXIT_CODE=1
     }
     
     echo ""
     log "=== TEE Forwarding Tests (lnc-replication) ==="
-    cargo test --package lnc-replication --lib -- tee 2>&1 | tee -a /tmp/lance-tee-tests.log || {
+    cargo test --package lnc-replication --lib -- tee 2>&1 | tee -a "$TEE_TEST_LOG_FILE" || {
         log_error "TEE forwarding tests failed"
         TEST_EXIT_CODE=1
     }
     
     echo ""
     log "=== Audit Logging Tests ==="
-    cargo test --package lnc-replication --lib -- audit 2>&1 | tee -a /tmp/lance-tee-tests.log || {
+    cargo test --package lnc-replication --lib -- audit 2>&1 | tee -a "$TEE_TEST_LOG_FILE" || {
         log_error "Audit logging tests failed"
         TEST_EXIT_CODE=1
     }
     
     echo ""
     log "=== Splice/TEE Probe Tests ==="
-    cargo test --package lnc-io --lib -- splice 2>&1 | tee -a /tmp/lance-tee-tests.log || {
+    cargo test --package lnc-io --lib -- splice 2>&1 | tee -a "$TEE_TEST_LOG_FILE" || {
         log_error "Splice tests failed"
         TEST_EXIT_CODE=1
     }
@@ -360,14 +365,13 @@ run_tee_tests() {
         log_error "Some TEE tests failed"
     fi
     
-    log "Test log saved to: /tmp/lance-tee-tests.log"
+    log "Test log saved to: $TEE_TEST_LOG_FILE"
 }
 
 run_benchmarks() {
     log "Running performance benchmarks..."
     echo ""
-    
-    BENCH_RESULTS_DIR="$PROJECT_DIR/benchmark-results"
+
     mkdir -p "$BENCH_RESULTS_DIR"
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     BENCH_FILE="$BENCH_RESULTS_DIR/benchmark_${TIMESTAMP}.txt"

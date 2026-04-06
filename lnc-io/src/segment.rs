@@ -1,7 +1,7 @@
 use crate::backend::IoBackend;
 use crate::fallback::Pwritev2Backend;
 use bytes::Bytes;
-use lnc_core::{LanceError, Result};
+use lnc_core::{LanceError, LoanableBatch, Result};
 use lnc_metrics::time_io_sampled;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -173,6 +173,20 @@ impl SegmentWriter {
         Ok(offset)
     }
 
+    /// Append a LoanableBatch to the segment.
+    ///
+    /// This is a compatibility helper for the synchronous buffered path.
+    /// Unlike `submit_write` in `AsyncIoBackend`, this does NOT take ownership
+    /// of the batch, as `BufWriter` copies the data anyway.
+    ///
+    /// Useful when the system is running in L1/Buffered mode but still
+    /// using the BatchPool for memory management.
+    pub fn append_batch(&mut self, batch: &LoanableBatch) -> Result<u64> {
+        // We use batch.as_slice() which is cheap
+        // The internal BufWriter will perform the memcpy
+        self.append(batch.as_slice())
+    }
+
     pub fn write_batch(&mut self, data: &[u8]) -> Result<u64> {
         // Sampled I/O latency tracking - only ~1% overhead on hot path
         let _latency_timer = time_io_sampled();
@@ -294,6 +308,11 @@ impl SegmentWriter {
     /// dictated by the leader, ensuring byte-identical segment layouts.
     pub fn create_named(dir: &Path, segment_name: &str) -> Result<Self> {
         let path = dir.join(segment_name);
+        if path.exists() {
+            // Follower recovery path: segment already exists on disk, so resume
+            // from current EOF instead of truncating and resetting offset to 0.
+            return Self::open(&path);
+        }
         Self::create(&path)
     }
 
@@ -361,6 +380,78 @@ impl SegmentWriter {
     #[must_use]
     pub fn filename(&self) -> Option<&str> {
         self.path.file_name().and_then(|f| f.to_str())
+    }
+
+    /// Truncates the segment to a specific offset and updates the write position.
+    ///
+    /// This is used during Raft log truncation to ensure the data plane
+    /// matches the control plane's rolled-back state. Only allows truncating
+    /// backward (rewinding), never forward (which would create gaps).
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - The requested offset is ahead of the current write position
+    /// - The underlying file operation fails
+    pub fn truncate_to_offset(&mut self, offset: u64) -> Result<()> {
+        if offset > self.write_offset {
+            return Err(LanceError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Cannot truncate forward: current offset {}, requested {}",
+                    self.write_offset, offset
+                ),
+            )));
+        }
+
+        if offset == self.write_offset {
+            return Ok(());
+        }
+
+        match &mut self.backend {
+            WriteBackend::Buffered(bw) => {
+                // 1. Flush to ensure we don't lose data before the truncate point
+                bw.flush()?;
+                let file = bw.get_mut();
+                // 2. Physical truncation
+                file.set_len(offset)?;
+                // 3. Seek to the new EOF to ensure subsequent writes are correct
+                file.seek(SeekFrom::Start(offset))?;
+            },
+            WriteBackend::Direct(_backend) => {
+                // Direct backends usually don't have buffers, but we must
+                // truncate the underlying file handle if the backend allows it.
+                // For now, we assume the backend handles positional writes,
+                // but the physical file size still needs to be corrected.
+                // Note: If DirectBackend uses O_DIRECT, file size management
+                // might be backend-specific.
+                return Err(LanceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Truncation for Direct I/O backend not yet implemented",
+                )));
+            },
+        }
+
+        self.write_offset = offset;
+        // Reset record_count to 0 to prevent over-reporting after a rollback.
+        // We don't accurately know the true count without re-parsing the file,
+        // which would be expensive and defeat the zero-copy design.
+        //
+        // Heuristics (like rotation) will treat this as a "young" segment,
+        // which is safer than triggering premature rotation on a stale count.
+        // The count self-corrects as new writes arrive. Since Raft rollbacks
+        // are rare exception events (network partitions, leader changes), the
+        // temporary under-reporting is negligible compared to maintaining
+        // system consistency.
+        self.record_count = 0;
+
+        tracing::info!(
+            target: "lance::io",
+            path = %self.path.display(),
+            to_offset = offset,
+            "Segment truncated due to Raft log rollback"
+        );
+
+        Ok(())
     }
 }
 

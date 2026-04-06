@@ -28,9 +28,12 @@ impl FollowerHealth {
             latencies: VecDeque::with_capacity(LATENCY_WINDOW_SIZE),
             consecutive_slow: 0,
             status: FollowerStatus::Healthy,
-            p99_threshold: Duration::from_millis(10),
-            eviction_threshold: 3,
-            recovery_window: 10,
+            // Defaults tuned for cross-node Kubernetes deployments.
+            // 10ms/3-samples was too aggressive and evicted healthy followers
+            // during normal replication jitter, causing avoidable quorum loss.
+            p99_threshold: Duration::from_millis(250),
+            eviction_threshold: 5,
+            recovery_window: 5,
         }
     }
 
@@ -128,16 +131,32 @@ impl FollowerHealth {
         Some(total / self.latencies.len() as u32)
     }
 
+    /// Compute P99 latency using O(N) partial selection on a stack-allocated buffer.
+    ///
+    /// **Zero-Allocation (§18.1)**: Uses a fixed-size `[Duration; LATENCY_WINDOW_SIZE]`
+    /// on the stack instead of `Vec::collect()` on the heap. If monitoring scrapes this
+    /// every second, there is zero allocator pressure — no garbage for the global
+    /// allocator to contend over.
+    ///
+    /// **O(N)**: `select_nth_unstable` uses introselect (quickselect + heapselect).
     pub fn p99_latency(&self) -> Option<Duration> {
         if self.latencies.is_empty() {
             return None;
         }
 
-        let mut sorted: Vec<Duration> = self.latencies.iter().copied().collect();
-        sorted.sort();
+        // Stack allocation — no heap, no allocator lock contention
+        let mut buf = [Duration::ZERO; LATENCY_WINDOW_SIZE];
+        let len = self.latencies.len();
+        for (i, lat) in self.latencies.iter().enumerate() {
+            buf[i] = *lat;
+        }
 
-        let idx = (sorted.len() as f64 * 0.99).ceil() as usize - 1;
-        Some(sorted[idx.min(sorted.len() - 1)])
+        let idx = (len as f64 * 0.99).ceil() as usize - 1;
+        let idx = idx.min(len - 1);
+
+        // O(N) selection on the stack slice
+        let (_left, median, _right) = buf[..len].select_nth_unstable(idx);
+        Some(*median)
     }
 }
 
@@ -174,5 +193,42 @@ mod tests {
             health.record_latency(Duration::from_millis(5));
         }
         assert_eq!(health.status, FollowerStatus::Healthy);
+    }
+
+    #[test]
+    fn test_p99_latency_stack_based() {
+        let mut health = FollowerHealth::new(1);
+
+        // Fill window with 1..=100 ms
+        for i in 1..=100 {
+            health.record_latency(Duration::from_millis(i));
+        }
+
+        let p99 = health.p99_latency().unwrap();
+        // P99 of 1..=100 is the 99th value = 99ms
+        // ceil(100 * 0.99) = 99, idx = 98, value at rank 99 = 99ms
+        assert_eq!(p99, Duration::from_millis(99));
+    }
+
+    #[test]
+    fn test_p99_latency_empty() {
+        let health = FollowerHealth::new(1);
+        assert!(health.p99_latency().is_none());
+    }
+
+    #[test]
+    fn test_p99_latency_single_element() {
+        let mut health = FollowerHealth::new(1);
+        health.record_latency(Duration::from_millis(42));
+        assert_eq!(health.p99_latency().unwrap(), Duration::from_millis(42));
+    }
+
+    #[test]
+    fn test_average_latency() {
+        let mut health = FollowerHealth::new(1);
+        health.record_latency(Duration::from_millis(10));
+        health.record_latency(Duration::from_millis(20));
+        health.record_latency(Duration::from_millis(30));
+        assert_eq!(health.average_latency().unwrap(), Duration::from_millis(20));
     }
 }

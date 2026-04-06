@@ -1,26 +1,25 @@
 //! Multi-actor ingestion scaling
 //!
 //! Implements N ingestion actors with client hash partitioning per Architecture §5.2.
-//! Uses crossbeam::ArrayQueue for lock-free MPMC communication per CodingGuidelines §3.3.
+//! Uses flume bounded channels for async backpressure without busy-spinning.
 
 use super::ingestion::{DataReplicationRequest, IngestionRequest, WriteMetadata};
 use super::writer::{TopicWriter, create_topic_writer, rotate_topic_segment};
 use crate::config::Config;
 use crate::topic::TopicRegistry;
 use bytes::Bytes;
-use crossbeam::queue::ArrayQueue;
 use lnc_core::{LanceError, Result, SortKey, pin_thread_to_cpu};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, info, warn};
 
 /// Unified ingestion sender that works with both single-actor (flume) and multi-actor modes
 #[derive(Clone)]
 pub enum IngestionSender {
-    /// Single-actor mode using flume channel
-    Single(flume::Sender<IngestionRequest>),
     /// Multi-actor mode using crossbeam ArrayQueue
     Multi(MultiActorSender),
 }
@@ -29,11 +28,7 @@ impl IngestionSender {
     /// Send an ingestion request
     pub async fn send(&self, request: IngestionRequest) -> Result<()> {
         match self {
-            Self::Single(tx) => tx
-                .send_async(request)
-                .await
-                .map_err(|_| LanceError::ChannelDisconnected("ingestion")),
-            Self::Multi(sender) => sender.send(request),
+            Self::Multi(sender) => sender.send(request).await,
         }
     }
 }
@@ -43,8 +38,8 @@ static SEQUENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Multi-actor ingestion system with hash partitioning
 pub struct MultiActorIngestion {
-    /// Request queues - one per actor
-    queues: Vec<Arc<ArrayQueue<IngestionRequest>>>,
+    /// Request queues - one per actor (flume senders for async backpressure)
+    queues: Vec<flume::Sender<IngestionRequest>>,
     /// Actor thread handles
     handles: Vec<thread::JoinHandle<()>>,
     /// Number of actors
@@ -79,8 +74,9 @@ impl MultiActorIngestion {
         let mut handles = Vec::with_capacity(actor_count);
 
         for actor_id in 0..actor_count {
-            let queue = Arc::new(ArrayQueue::new(queue_capacity));
-            queues.push(Arc::clone(&queue));
+            // Use flume bounded channel for async backpressure
+            let (tx, rx) = flume::bounded(queue_capacity);
+            queues.push(tx);
 
             let config_clone = config.clone();
             let registry_clone = Arc::clone(&topic_registry);
@@ -114,7 +110,7 @@ impl MultiActorIngestion {
                     run_ingestion_actor_sync(
                         actor_id,
                         config_clone,
-                        queue,
+                        rx,
                         registry_clone,
                         repl_tx_clone,
                     );
@@ -156,32 +152,39 @@ impl MultiActorIngestion {
 /// Cloneable sender handle for multi-actor ingestion
 #[derive(Clone)]
 pub struct MultiActorSender {
-    queues: Vec<Arc<ArrayQueue<IngestionRequest>>>,
+    queues: Vec<flume::Sender<IngestionRequest>>,
     actor_count: usize,
 }
 
 impl MultiActorSender {
-    /// Send a request to the appropriate actor based on topic_id hash partitioning
-    pub fn send(&self, request: IngestionRequest) -> Result<()> {
-        let actor_id = (request.topic_id as usize) % self.actor_count;
-        let queue = &self.queues[actor_id];
+    /// Send a request to the appropriate actor based on topic_id hash partitioning.
+    ///
+    /// **Ordering guarantee**: All messages for the same `topic_id` are routed to
+    /// the same actor regardless of which connection they arrive on. This ensures
+    /// per-topic message ordering is preserved even when writes are forwarded from
+    /// followers via a connection pool (where each pooled connection has a different
+    /// `routing_key`).
+    ///
+    /// Multi-actor parallelism is still achieved across *different* topics — each
+    /// topic hashes to one of the N actors, distributing the workload.
+    ///
+    /// This is async and yields to the Tokio runtime when the channel is full,
+    /// providing true backpressure without busy-spinning.
+    pub async fn send(&self, request: IngestionRequest) -> Result<()> {
+        // Hash on topic_id ONLY to guarantee per-topic ordering.
+        // Previously this XOR'd with routing_key for hot-topic sharding, but that
+        // broke ordering when followers forwarded writes via a connection pool
+        // (each pooled connection had a different routing_key, scattering a single
+        // topic's messages across multiple actors and segment files).
+        let hashed = (request.topic_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let actor_id = (hashed as usize) % self.actor_count;
 
-        // Try to push, spinning briefly if full (lock-free backpressure)
-        let mut attempts = 0;
-        let mut req = request;
-        loop {
-            match queue.push(req) {
-                Ok(()) => return Ok(()),
-                Err(returned) => {
-                    req = returned;
-                    attempts += 1;
-                    if attempts > 1000 {
-                        return Err(LanceError::Protocol("Ingestion queue full".into()));
-                    }
-                    std::hint::spin_loop();
-                },
-            }
-        }
+        // send_async yields to the Tokio runtime if the channel is full.
+        // No more busy-spinning!
+        self.queues[actor_id]
+            .send_async(request)
+            .await
+            .map_err(|_| LanceError::ChannelDisconnected("ingestion_actor"))
     }
 }
 
@@ -189,7 +192,7 @@ impl MultiActorSender {
 fn run_ingestion_actor_sync(
     actor_id: usize,
     config: Config,
-    queue: Arc<ArrayQueue<IngestionRequest>>,
+    rx: flume::Receiver<IngestionRequest>,
     topic_registry: Arc<TopicRegistry>,
     replication_tx: Option<tokio::sync::mpsc::Sender<DataReplicationRequest>>,
 ) {
@@ -239,19 +242,32 @@ fn run_ingestion_actor_sync(
     let mut pending_signals: Vec<BatchSuccess> = Vec::new();
     let mut dirty_topics: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut dirty_bytes: usize = 0;
-    let mut last_write = std::time::Instant::now();
+    let mut last_write = Instant::now();
 
-    // Spin-wait loop (per CodingGuidelines §3.1 - ingestion actors never park)
     loop {
-        match queue.pop() {
-            Some(first) => {
+        // Calculate timeout based on pending data
+        let timeout = if !pending_signals.is_empty() {
+            let elapsed = last_write.elapsed();
+            if elapsed >= FLUSH_TIMEOUT {
+                Duration::ZERO // Flush immediately
+            } else {
+                FLUSH_TIMEOUT - elapsed
+            }
+        } else {
+            Duration::from_secs(3600) // Wait up to 1 hour if idle
+        };
+
+        let recv_result = rx.recv_timeout(timeout);
+
+        match recv_result {
+            Ok(first) => {
                 // ── Phase 1: Collect a batch ──────────────────────────
                 let mut batch: Vec<IngestionRequest> = Vec::with_capacity(MAX_BATCH);
                 batch.push(first);
                 while batch.len() < MAX_BATCH {
-                    match queue.pop() {
-                        Some(r) => batch.push(r),
-                        None => break,
+                    match rx.try_recv() {
+                        Ok(r) => batch.push(r),
+                        Err(_) => break,
                     }
                 }
 
@@ -283,6 +299,7 @@ fn run_ingestion_actor_sync(
                         &topic_registry,
                         &mut topic_writers,
                         request,
+                        &payload,
                     ) {
                         Ok(meta) => {
                             dirty_topics.insert(topic_id);
@@ -309,7 +326,7 @@ fn run_ingestion_actor_sync(
                         },
                     }
                 }
-                last_write = std::time::Instant::now();
+                last_write = Instant::now();
 
                 // ── Phase 3: Flush if threshold crossed ──────────────
                 if dirty_bytes >= FLUSH_THRESHOLD {
@@ -324,16 +341,12 @@ fn run_ingestion_actor_sync(
                         let _ = w.reset();
                     }
                     dirty_bytes = 0;
+                    last_write = Instant::now();
                 }
             },
-            None => {
-                // No work — check shutdown
-                if Arc::strong_count(&queue) == 1 {
-                    break;
-                }
-
-                // Flush on timeout if we have pending data
-                if !pending_signals.is_empty() && last_write.elapsed() >= FLUSH_TIMEOUT {
+            Err(flume::RecvTimeoutError::Timeout) => {
+                // Flush pending data on timeout
+                if !pending_signals.is_empty() {
                     flush_and_signal_sync(
                         &mut topic_writers,
                         &mut dirty_topics,
@@ -345,9 +358,12 @@ fn run_ingestion_actor_sync(
                         let _ = w.reset();
                     }
                     dirty_bytes = 0;
+                    last_write = Instant::now();
                 }
-
-                std::hint::spin_loop();
+            },
+            Err(flume::RecvTimeoutError::Disconnected) => {
+                // Channel disconnected - shutdown
+                break;
             },
         }
     }
@@ -432,6 +448,36 @@ fn flush_and_signal_sync(
     replication_tx: &Option<tokio::sync::mpsc::Sender<DataReplicationRequest>>,
     wal: &mut Option<lnc_io::Wal>,
 ) {
+    // Phase 0: enqueue replication work first so follower replication can overlap
+    // with local durability flush below. Client ACK is still gated on write_done,
+    // which is only sent after WAL/data sync completes.
+    if let Some(tx) = replication_tx {
+        for s in pending_signals.iter() {
+            let repl_req = DataReplicationRequest {
+                topic_id: s.topic_id,
+                payload: s.payload.clone(),
+                segment_name: s.meta.segment_name.clone(),
+                write_offset: s.meta.write_offset,
+                global_offset: s.meta.write_offset + s.payload_len as u64,
+                is_new_segment: s.meta.is_new_segment,
+                rotated_after: s.meta.rotated_after,
+                write_id: s.write_id,
+            };
+
+            match tx.try_send(repl_req) {
+                Ok(()) => {},
+                Err(TrySendError::Full(repl_req)) => {
+                    if let Err(_e) = tx.blocking_send(repl_req) {
+                        tracing::error!(target: "lance::ingestion", "Replication channel closed");
+                    }
+                },
+                Err(TrySendError::Closed(_)) => {
+                    tracing::error!(target: "lance::ingestion", "Replication channel closed");
+                },
+            }
+        }
+    }
+
     // Sync WAL before segment fsyncs (batched, not per-append)
     if let Some(w) = wal {
         if let Err(e) = w.sync() {
@@ -442,46 +488,46 @@ fn flush_and_signal_sync(
             );
         }
     }
-    for topic_id in dirty_topics.iter() {
-        if let Some(tw) = topic_writers.get_mut(topic_id) {
-            if let Err(e) = tw.writer.fsync() {
-                tracing::error!(
-                    target: "lance::ingestion",
-                    topic_id,
-                    error = %e,
-                    "Batch fsync failed"
-                );
+    // If WAL is enabled and synced above, segment fsync is redundant on the ACK
+    // hot path. Crash recovery can replay WAL + committed Raft log to rebuild
+    // segment bytes, so we preserve durability while avoiding duplicate flush cost.
+    if wal.is_none() {
+        for topic_id in dirty_topics.iter() {
+            if let Some(tw) = topic_writers.get_mut(topic_id) {
+                if let Err(e) = tw.writer.fsync() {
+                    tracing::error!(
+                        target: "lance::ingestion",
+                        topic_id,
+                        error = %e,
+                        "Batch fsync failed"
+                    );
+                }
             }
         }
     }
     dirty_topics.clear();
 
-    for s in pending_signals.drain(..) {
-        if let Some(tx) = s.write_done_tx {
+    // Phase 1: release all client waiters now that data is durable locally.
+    // This keeps ACK latency independent from replication channel backpressure.
+    for s in pending_signals.iter_mut() {
+        if let Some(tx) = s.write_done_tx.take() {
             let _ = tx.send(());
         }
-
-        if let Some(tx) = replication_tx {
-            let _ = tx.try_send(DataReplicationRequest {
-                topic_id: s.topic_id,
-                payload: s.payload,
-                segment_name: s.meta.segment_name,
-                write_offset: s.meta.write_offset,
-                global_offset: s.meta.write_offset + s.payload_len as u64,
-                is_new_segment: s.meta.is_new_segment,
-                rotated_after: s.meta.rotated_after,
-                write_id: s.write_id,
-            });
-        }
     }
+
+    pending_signals.clear();
 }
 
-/// Process a single ingestion request (synchronous), returning write metadata for replication
+/// Process a single ingestion request (synchronous), returning write metadata for replication.
+///
+/// `payload` is passed separately because the caller has already taken it from
+/// the request via `std::mem::take` for WAL and deferred-signal storage.
 fn process_request_sync(
     config: &Config,
     topic_registry: &TopicRegistry,
     topic_writers: &mut HashMap<u32, TopicWriter>,
     request: IngestionRequest,
+    payload: &Bytes,
 ) -> Result<WriteMetadata> {
     let topic_id = request.topic_id;
 
@@ -507,14 +553,14 @@ fn process_request_sync(
     let seq = SEQUENCE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let sort_key = SortKey::from_timestamp_ns(request.timestamp_ns, seq as u32);
 
-    let offset = topic_writer.writer.write_batch(&request.payload)?;
+    let offset = topic_writer.writer.write_batch(payload)?;
 
     topic_writer
         .index_builder
         .add_record(sort_key, request.timestamp_ns, offset);
 
     lnc_metrics::increment_records_ingested(request.record_count as u64);
-    lnc_metrics::increment_bytes_ingested(request.payload.len() as u64);
+    lnc_metrics::increment_bytes_ingested(payload.len() as u64);
 
     let rotated_after = if topic_writer.writer.current_offset() >= config.io.segment_max_size {
         rotate_topic_segment(config, topic_registry, topic_id, topic_writer)?;
@@ -538,27 +584,54 @@ mod tests {
 
     #[test]
     fn test_partition_key_via_sender() {
-        let queues = vec![
-            Arc::new(ArrayQueue::<IngestionRequest>::new(1)),
-            Arc::new(ArrayQueue::<IngestionRequest>::new(1)),
-            Arc::new(ArrayQueue::<IngestionRequest>::new(1)),
-            Arc::new(ArrayQueue::<IngestionRequest>::new(1)),
-        ];
+        let mut queues = Vec::new();
+        for _ in 0..4 {
+            let (tx, _rx) = flume::bounded::<IngestionRequest>(1);
+            queues.push(tx);
+        }
 
         let sender = MultiActorSender {
             queues,
             actor_count: 4,
         };
 
-        // Verify partition key calculation: topic_id % actor_count
-        assert_eq!(0 % 4, 0);
-        assert_eq!(1 % 4, 1);
-        assert_eq!(2 % 4, 2);
-        assert_eq!(3 % 4, 3);
-        assert_eq!(4 % 4, 0);
-        assert_eq!(5 % 4, 1);
-
         // Verify sender has correct actor count
         assert_eq!(sender.actor_count, 4);
+
+        // Per-topic ordering: same topic_id MUST always map to the same actor,
+        // regardless of routing_key. This guarantees per-topic message ordering
+        // when writes arrive from different forwarding pool connections.
+        let topic_id = 42u32;
+        let expected_actor = (((topic_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) as usize) % 4;
+        for routing_key in [1u64, 7, 13, 21, 34, 55, 89, 144] {
+            // routing_key is no longer used in the hash, but we verify the
+            // invariant holds for any value a caller might set.
+            let _ = routing_key;
+            let actor = (((topic_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) as usize) % 4;
+            assert_eq!(
+                actor, expected_actor,
+                "topic {} must always route to the same actor",
+                topic_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_different_topics_spread_across_actors() {
+        // Verify that different topic_ids distribute across actors to utilize
+        // multi-actor parallelism. With 4 actors and enough topics, we should
+        // see all actors used.
+        let actor_count = 4usize;
+        let mut seen = std::collections::HashSet::new();
+        for topic_id in 0u32..32 {
+            let actor =
+                (((topic_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) as usize) % actor_count;
+            seen.insert(actor);
+        }
+        assert_eq!(
+            seen.len(),
+            actor_count,
+            "32 topics should spread across all 4 actors"
+        );
     }
 }

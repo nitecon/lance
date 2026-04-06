@@ -1,7 +1,35 @@
-//! Raft consensus protocol implementation with safety enhancements.
+//! Raft consensus protocol implementation with safety enhancements (CONTROL PLANE).
 //!
-//! This module implements the core Raft state machine with the following
-//! enhancements beyond the basic protocol:
+//! This module is part of the CONTROL PLANE, not the data plane.
+//! It implements the core Raft state machine for leader election, cluster
+//! membership, and metadata consensus. It does NOT handle actual data replication.
+//!
+//! # Architecture Note: Control Plane vs Data Plane
+//!
+//! LANCE separates control plane (Raft) from data plane (independent replication):
+//!
+//! - **Control Plane (this module)**: Uses Raft consensus for leader election,
+//!   cluster membership, and topic metadata. This is the "slow path" focused on
+//!   consistency. Raft log entries carry metadata only, NOT actual data payloads.
+//!
+//! - **Data Plane**: Uses independent replication for actual data writes.
+//!   Data plane replication is completely separate from Raft. The data plane
+//!   can function behind load balancers and does not block on Raft consensus.
+//!
+//! # Key Point
+//!
+//! Raft determines WHO is the leader, but data plane replication (not Raft)
+//! handles HOW data is replicated. Followers report their max offset to the
+//! control plane periodically (~50ms) so control plane knows which node has
+//! the latest data for failover decisions.
+//!
+//! For data plane implementation, see `lance/src/server/mod.rs` and
+//! `lnc-replication/src/quorum.rs`.
+//!
+//! See `docs/Architecture.md` section "Control Plane vs Data Plane Architecture"
+//! for detailed explanation.
+//!
+//! # Safety Enhancements
 //!
 //! - **Pre-Vote**: Prevents disruption from partitioned nodes rejoining
 //! - **Fencing tokens**: Revokes write authority from deposed leaders
@@ -92,9 +120,12 @@ pub struct RaftConfig {
 impl Default for RaftConfig {
     fn default() -> Self {
         Self {
-            election_timeout_min: Duration::from_millis(150),
-            election_timeout_max: Duration::from_millis(300),
-            heartbeat_interval: Duration::from_millis(50),
+            // Increased from 150/300ms to 1000/2000ms for production stability
+            // 50ms was suicidal for a persistent storage cluster with network/disk latency
+            election_timeout_min: Duration::from_millis(1000),
+            election_timeout_max: Duration::from_millis(2000),
+            // Heartbeat must be significantly faster than min timeout (usually 1/4th)
+            heartbeat_interval: Duration::from_millis(250),
             pre_vote_enabled: true,
             leader_lease: Duration::from_millis(100),
         }
@@ -110,7 +141,7 @@ pub struct RaftNode {
     /// Current term.
     current_term: u64,
     /// Node voted for in current term (if any).
-    voted_for: Option<u16>,
+    pub(crate) voted_for: Option<u16>,
     /// Current leader (if known).
     leader_id: Option<u16>,
     /// Last time we heard from the leader.
@@ -131,13 +162,16 @@ pub struct RaftNode {
     last_log_term: u64,
     /// Commit index.
     commit_index: u64,
-    /// Last applied index.
-    #[allow(dead_code)] // Will be used when state machine application is implemented
+    /// Last applied index (entries applied to state machine via Apply Loop).
     last_applied: u64,
     /// Pre-vote in progress.
     pre_vote_in_progress: bool,
     /// Votes received in current election.
-    votes_received: HashSet<u16>,
+    pub(crate) votes_received: HashSet<u16>,
+    /// Next log index to send to each peer (leader only).
+    next_index: std::collections::HashMap<u16, u64>,
+    /// Highest log index known to be replicated on each peer (leader only).
+    match_index: std::collections::HashMap<u16, u64>,
 }
 
 impl RaftNode {
@@ -145,13 +179,20 @@ impl RaftNode {
     pub fn new(node_id: u16, config: ClusterConfig, raft_config: RaftConfig) -> Self {
         let election_timeout = Self::random_election_timeout(&raft_config);
 
+        // CRITICAL FIX: Initialize last_leader_contact to the past.
+        // If we initialize to Instant::now(), we implicitly claim we just saw a leader,
+        // which causes us to deny PreVotes from valid candidates during a restart storm.
+        let last_leader_contact = Instant::now()
+            .checked_sub(raft_config.election_timeout_max * 2)
+            .unwrap_or_else(Instant::now);
+
         Self {
             node_id,
             state: RaftState::Follower,
             current_term: 0,
             voted_for: None,
             leader_id: None,
-            last_leader_contact: Instant::now(),
+            last_leader_contact,
             election_timeout,
             config,
             raft_config,
@@ -163,15 +204,30 @@ impl RaftNode {
             last_applied: 0,
             pre_vote_in_progress: false,
             votes_received: HashSet::new(),
+            next_index: std::collections::HashMap::new(),
+            match_index: std::collections::HashMap::new(),
         }
     }
 
     /// Restore persistent state after crash recovery (Raft §5.2)
     ///
     /// This must be called before the node participates in elections.
-    pub fn restore_state(&mut self, term: u64, voted_for: Option<u16>) {
+    ///
+    /// **Best Practice**: Query the LogStore for `last_log_index` and `last_log_term`
+    /// on startup to initialize the node with the correct log position. Without this,
+    /// the node starts at index 0 and relies on the first heartbeat to catch up,
+    /// which can cause temporary inconsistencies during leader election.
+    pub fn restore_state(
+        &mut self,
+        term: u64,
+        voted_for: Option<u16>,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) {
         self.current_term = term;
         self.voted_for = voted_for;
+        self.last_log_index = last_log_index;
+        self.last_log_term = last_log_term;
     }
 
     /// Get the current state.
@@ -186,6 +242,17 @@ impl RaftNode {
     #[must_use]
     pub const fn current_term(&self) -> u64 {
         self.current_term
+    }
+
+    /// Observe a remote term discovered via RPC response handling.
+    ///
+    /// Returns `true` when this node had to step down to follower.
+    pub fn observe_remote_term(&mut self, remote_term: u64) -> bool {
+        if remote_term > self.current_term {
+            self.become_follower(remote_term);
+            return true;
+        }
+        false
     }
 
     /// Get the current leader ID (if known).
@@ -222,6 +289,27 @@ impl RaftNode {
         self.last_log_index
     }
 
+    /// Get the last log term.
+    #[inline]
+    #[must_use]
+    pub const fn last_log_term(&self) -> u64 {
+        self.last_log_term
+    }
+
+    /// Get the last applied index.
+    #[inline]
+    #[must_use]
+    pub const fn last_applied(&self) -> u64 {
+        self.last_applied
+    }
+
+    /// Update last_applied after successfully applying an entry to the state machine.
+    pub fn advance_last_applied(&mut self, new_last_applied: u64) {
+        if new_last_applied > self.last_applied {
+            self.last_applied = new_last_applied;
+        }
+    }
+
     /// Advance the Raft log index after a successful write or replication.
     ///
     /// Called by:
@@ -233,6 +321,22 @@ impl RaftNode {
     pub fn advance_log(&mut self, entry_count: u64) {
         self.last_log_index += entry_count;
         self.last_log_term = self.current_term;
+    }
+
+    /// Roll back follower log pointers if append durability fails after an
+    /// optimistic `handle_append_entries` accept path.
+    ///
+    /// This preserves RaftNode/log-store consistency by restoring in-memory
+    /// cursors to their pre-append values.
+    pub fn rollback_failed_append(
+        &mut self,
+        last_log_index: u64,
+        last_log_term: u64,
+        commit_index: u64,
+    ) {
+        self.last_log_index = last_log_index;
+        self.last_log_term = last_log_term;
+        self.commit_index = commit_index.min(last_log_index);
     }
 
     // =========================================================================
@@ -251,8 +355,8 @@ impl RaftNode {
             return None;
         }
 
-        if self.state == RaftState::Leader {
-            // Leaders don't start pre-votes
+        if self.state != RaftState::Follower || self.pre_vote_in_progress {
+            // Only followers start pre-votes, and only one round at a time.
             return None;
         }
 
@@ -293,10 +397,16 @@ impl RaftNode {
             };
         }
 
-        // Check if we've heard from a leader recently
-        // (prevents disruption if there's a working leader)
-        let leader_active = self.last_leader_contact.elapsed() < self.election_timeout;
-        if leader_active && self.leader_id.is_some() {
+        // FIX: Simplified disruption check.
+        // If we haven't heard from a leader within the minimum election timeout,
+        // we should entertain the pre-vote. The leader is likely dead or partitioned.
+        // We removed the `&& self.leader_id.is_some()` check because a node might
+        // have a stale leader_id from disk but no active connection.
+        let within_election_window =
+            self.last_leader_contact.elapsed() < self.raft_config.election_timeout_min;
+
+        if within_election_window {
+            // We have a healthy leader (or think we do), so we deny disruption.
             return PreVoteResponse {
                 term: self.current_term,
                 vote_granted: false,
@@ -312,8 +422,8 @@ impl RaftNode {
     /// Handle an incoming pre-vote response.
     ///
     /// Returns `true` if pre-vote succeeded and we should start a real election.
-    pub fn handle_pre_vote_response(&mut self, resp: &PreVoteResponse) -> bool {
-        if !self.pre_vote_in_progress {
+    pub fn handle_pre_vote_response(&mut self, voter_id: u16, resp: &PreVoteResponse) -> bool {
+        if !self.pre_vote_in_progress || resp.term < self.current_term {
             return false;
         }
 
@@ -325,21 +435,16 @@ impl RaftNode {
         }
 
         if resp.vote_granted {
-            // Count the vote — caller must pass the actual voter node ID
-            // via the resp.term field context or track externally.
-            // For pre-vote we track grants via an external counter,
-            // so this path is only reached if the coordinator feeds
-            // individual responses. We return early based on quorum.
+            self.votes_received.insert(voter_id);
         }
 
-        // Check if we have enough pre-votes
-        let quorum = self.quorum_size();
-        if self.votes_received.len() >= quorum {
+        // Check if we have enough pre-votes for quorum
+        if self.votes_received.len() >= self.quorum_size() {
             self.pre_vote_in_progress = false;
-            return true; // Proceed to real election
+            true
+        } else {
+            false
         }
-
-        false
     }
 
     // =========================================================================
@@ -441,6 +546,16 @@ impl RaftNode {
         false
     }
 
+    /// Revert a candidate back to follower after a failed/aborted election round.
+    ///
+    /// This allows the coordinator to restart from a clean pre-vote state on the
+    /// next election timeout instead of staying in candidate mode indefinitely.
+    pub fn revert_candidate_after_failed_election(&mut self) {
+        if self.state == RaftState::Candidate {
+            self.become_follower(self.current_term);
+        }
+    }
+
     // =========================================================================
     // AppendEntries (Heartbeat + Log Replication)
     // =========================================================================
@@ -483,7 +598,9 @@ impl RaftNode {
             };
         }
 
-        // Valid leader heartbeat - reset election timeout
+        // Term-valid AppendEntries (heartbeat or replication) confirms leader liveness.
+        // Reset election timeout before log-matching checks so followers don't start
+        // elections while the leader is actively backtracking next_index.
         self.last_leader_contact = Instant::now();
         self.leader_id = Some(req.leader_id);
 
@@ -492,16 +609,43 @@ impl RaftNode {
             self.state = RaftState::Follower;
         }
 
-        // Advance log index for data entries received from leader.
-        // This tracks replication progress so elections (§5.4.1) pick
-        // the follower with the most up-to-date log.
-        let data_entries = req
-            .entries
-            .iter()
-            .filter(|e| e.entry_type == crate::codec::EntryType::Data)
-            .count() as u64;
-        if data_entries > 0 {
-            self.advance_log(data_entries);
+        if req.prev_log_index > self.last_log_index {
+            return AppendEntriesResponse {
+                term: self.current_term,
+                success: false,
+                match_index: self.last_log_index,
+                follower_hlc: self.hlc.now(),
+                follower_id: self.node_id,
+            };
+        }
+
+        if let Some(first_entry) = req.entries.first() {
+            // Reject out-of-order appends that do not start immediately after prev_log_index.
+            // This prevents accepting index gaps when concurrent replication RPCs arrive
+            // out-of-order on followers.
+            if first_entry.index != req.prev_log_index + 1 {
+                return AppendEntriesResponse {
+                    term: self.current_term,
+                    success: false,
+                    match_index: self.last_log_index,
+                    follower_hlc: self.hlc.now(),
+                    follower_id: self.node_id,
+                };
+            }
+        }
+
+        // Advance log index based on the actual entries received.
+        // CRITICAL FIX: We must update last_log_index for ALL entry types (NoOp, TopicOp,
+        // ConfigChange, Data), not just Data. The previous filter caused followers to ignore
+        // NoOp entries (sent by leaders on election to seal the term), making match_index
+        // permanently stuck at 1. This caused the leader to believe followers were behind,
+        // triggering infinite retries and memory leaks in AsyncQuorumManager.
+        //
+        // Elections (§5.4.1) require accurate log indices to pick the follower
+        // with the most up-to-date log.
+        if let Some(last_entry) = req.entries.last() {
+            self.last_log_index = last_entry.index;
+            self.last_log_term = last_entry.term;
         }
 
         let success = true;
@@ -598,6 +742,11 @@ impl RaftNode {
         self.voted_for = None;
         self.pre_vote_in_progress = false;
 
+        // Reset election timeout to prevent election storms when discovering higher term
+        // This is critical: without this, a partitioned node will continuously retry
+        // elections every 50ms when it discovers the cluster has moved to a higher term
+        self.reset_election_timeout();
+
         if was_leader {
             // Revoke fencing token
             self.fencing_token = None;
@@ -620,6 +769,19 @@ impl RaftNode {
         // Create new fencing token
         self.fencing_token = Some(FencingToken::new(self.current_term, self.node_id));
 
+        // Initialize next_index and match_index for all peers (Raft §5.3)
+        // next_index: optimistically assume peers are caught up (last_log_index + 1)
+        // match_index: conservatively assume no replication yet (0)
+        self.next_index.clear();
+        self.match_index.clear();
+        for node in &self.config.old_nodes {
+            if node.node_id != self.node_id {
+                self.next_index
+                    .insert(node.node_id, self.last_log_index + 1);
+                self.match_index.insert(node.node_id, 0);
+            }
+        }
+
         tracing::info!(
             target: "lance::raft",
             node_id = self.node_id,
@@ -627,6 +789,30 @@ impl RaftNode {
             fencing_token = ?self.fencing_token,
             "Became leader"
         );
+    }
+
+    /// Create a No-Op entry for a new leader to commit (Raft §5.4.2).
+    ///
+    /// A new leader cannot immediately commit entries from previous terms,
+    /// even if they are stored on a majority. The leader must first replicate
+    /// and commit at least one entry from its own term to "seal" the log.
+    ///
+    /// Industry best practice: append a No-Op entry immediately upon election.
+    pub fn create_noop_entry(&mut self) -> Option<crate::codec::LogEntry> {
+        if self.state != RaftState::Leader {
+            return None;
+        }
+
+        // Advance log for the No-Op entry
+        self.advance_log(1);
+
+        Some(crate::codec::LogEntry {
+            term: self.current_term,
+            index: self.last_log_index,
+            hlc: self.hlc.now(),
+            entry_type: crate::codec::EntryType::Noop,
+            data: bytes::Bytes::new(),
+        })
     }
 
     // =========================================================================
@@ -744,6 +930,19 @@ impl RaftNode {
         self.last_leader_contact.elapsed() > self.election_timeout
     }
 
+    /// Whether a pre-vote round is currently in progress.
+    #[must_use]
+    pub const fn pre_vote_in_progress(&self) -> bool {
+        self.pre_vote_in_progress
+    }
+
+    /// Finish a pre-vote round that did not reach quorum and back off before retrying.
+    pub fn finish_failed_pre_vote_round(&mut self) {
+        self.pre_vote_in_progress = false;
+        self.votes_received.clear();
+        self.reset_election_timeout();
+    }
+
     /// Reset the election timeout with a new random value.
     fn reset_election_timeout(&mut self) {
         self.election_timeout = Self::random_election_timeout(&self.raft_config);
@@ -779,7 +978,7 @@ impl RaftNode {
     }
 
     /// Calculate quorum size.
-    fn quorum_size(&self) -> usize {
+    pub fn quorum_size(&self) -> usize {
         let total = if self.config.is_joint {
             // Joint consensus: use larger of old/new configs
             self.config.old_nodes.len().max(self.config.new_nodes.len())
@@ -788,6 +987,94 @@ impl RaftNode {
         };
 
         total / 2 + 1
+    }
+
+    /// Check if a vote count constitutes a quorum.
+    pub fn has_quorum(&self, vote_count: usize) -> bool {
+        vote_count >= self.quorum_size()
+    }
+
+    /// Update match_index for a peer after successful replication.
+    /// Returns the new commit_index if it advanced.
+    pub fn update_match_index(&mut self, peer_id: u16, match_index: u64) -> Option<u64> {
+        if self.state != RaftState::Leader {
+            return None;
+        }
+
+        // Update the peer's match_index
+        self.match_index.insert(peer_id, match_index);
+        // Successful replication means next probe can start after the acknowledged index.
+        self.next_index
+            .insert(peer_id, match_index.saturating_add(1));
+
+        // Advance commit_index if a majority of peers have replicated up to some index N
+        // Raft §5.3: Only commit entries from current term
+        let old_commit = self.commit_index;
+
+        // Collect all match indices including self
+        let mut indices: Vec<u64> = self.match_index.values().copied().collect();
+        indices.push(self.last_log_index); // Leader's own log
+        indices.sort_unstable();
+
+        // Find the median (majority) index
+        let quorum_idx = indices.len() - self.quorum_size();
+        let new_commit = indices[quorum_idx];
+
+        // Only advance commit_index, never decrease
+        if new_commit > old_commit {
+            self.commit_index = new_commit;
+            tracing::debug!(
+                target: "lance::raft",
+                node_id = self.node_id,
+                old_commit,
+                new_commit,
+                "Advanced commit_index"
+            );
+            Some(new_commit)
+        } else {
+            None
+        }
+    }
+
+    /// Return the leader-side replication cursor for a peer.
+    ///
+    /// If no cursor exists yet, default to `last_log_index + 1` per Raft §5.3.
+    pub fn next_index_for_peer(&self, peer_id: u16) -> Option<u64> {
+        if self.state != RaftState::Leader {
+            return None;
+        }
+
+        Some(
+            self.next_index
+                .get(&peer_id)
+                .copied()
+                .unwrap_or(self.last_log_index.saturating_add(1)),
+        )
+    }
+
+    /// Back off the peer replication cursor after a rejection.
+    ///
+    /// Followers report their local `match_index` on failure. We clamp to that
+    /// hint and never increase the cursor here.
+    pub fn backoff_next_index(&mut self, peer_id: u16, follower_match_index: u64) -> Option<u64> {
+        if self.state != RaftState::Leader {
+            return None;
+        }
+
+        let current = self
+            .next_index
+            .get(&peer_id)
+            .copied()
+            .unwrap_or(self.last_log_index.saturating_add(1));
+        let suggested = follower_match_index.saturating_add(1).max(1);
+        let new_next = current.min(suggested);
+        self.next_index.insert(peer_id, new_next);
+        Some(new_next)
+    }
+
+    /// Get the current commit index.
+    pub fn commit_index(&self) -> u64 {
+        self.commit_index
     }
 
     /// Update the cluster configuration (for membership changes).
@@ -915,6 +1202,23 @@ mod tests {
     }
 
     #[test]
+    fn test_observe_remote_term_steps_down_leader() {
+        let config = test_config();
+        let mut node = RaftNode::new(1, config, RaftConfig::default());
+
+        node.current_term = 3;
+        node.state = RaftState::Leader;
+        node.fencing_token = Some(FencingToken::new(3, 1));
+
+        let stepped_down = node.observe_remote_term(4);
+
+        assert!(stepped_down);
+        assert_eq!(node.state, RaftState::Follower);
+        assert_eq!(node.current_term, 4);
+        assert!(node.fencing_token.is_none());
+    }
+
+    #[test]
     fn test_validate_fence() {
         let config = test_config();
         let mut node = RaftNode::new(1, config, RaftConfig::default());
@@ -939,18 +1243,19 @@ mod tests {
     fn test_election_timeout_triggers_new_election() {
         let config = test_config();
         let raft_config = RaftConfig {
-            election_timeout_min: Duration::from_millis(10),
-            election_timeout_max: Duration::from_millis(20),
+            election_timeout_min: Duration::from_millis(100),
+            election_timeout_max: Duration::from_millis(200),
             ..RaftConfig::default()
         };
         let mut node = RaftNode::new(1, config, raft_config);
 
         // Initially follower
         assert_eq!(node.state, RaftState::Follower);
-        assert!(!node.election_timeout_elapsed());
 
-        // Simulate timeout by setting last_leader_contact to past
-        node.last_leader_contact = Instant::now() - Duration::from_secs(1);
+        // After the cold-start deadlock fix, new nodes start with
+        // last_leader_contact in the past (2× election_timeout_max ago).
+        // This is intentional to prevent nodes from denying pre-votes during
+        // cluster restarts. The election timeout should be elapsed on startup.
         assert!(node.election_timeout_elapsed());
 
         // Starting election should transition to candidate
@@ -1095,5 +1400,68 @@ mod tests {
         assert!(!resp.vote_granted);
         // Term should NOT be updated (pre-vote protection)
         assert_eq!(node.current_term, 0);
+    }
+
+    /// Regression test for the "NoOp visibility" bug.
+    ///
+    /// **Bug**: Followers were filtering `handle_append_entries` to only advance
+    /// `last_log_index` for `EntryType::Data`, ignoring NoOp/TopicOp/ConfigChange.
+    /// This caused `match_index` to stay stuck at 1 after the leader sent a NoOp
+    /// entry on election (to seal the term), triggering infinite retries and
+    /// memory leaks in `AsyncQuorumManager`.
+    ///
+    /// **Fix**: `handle_append_entries` now advances `last_log_index` based on
+    /// the last entry in the batch, regardless of entry type.
+    ///
+    /// This test ensures the bug never recurs by simulating a Leader sending a
+    /// NoOp entry and asserting that the Follower correctly advances its index.
+    #[test]
+    fn test_follower_advances_index_on_noop() {
+        let config = test_config();
+        let mut node = RaftNode::new(1, config, RaftConfig::default());
+
+        // 1. Establish baseline: Follower at term 1, log index 10
+        node.current_term = 1;
+        node.state = RaftState::Follower;
+        node.last_log_index = 10;
+        node.last_log_term = 1;
+
+        // 2. Simulate Leader (ID 2) sending a NoOp entry (EntryType::Noop)
+        // Leader is at index 10, sending entry 11 to seal the term.
+        let noop_entry = crate::codec::LogEntry {
+            term: 1,
+            index: 11,
+            hlc: lnc_core::HlcTimestamp::new(1000, 0),
+            entry_type: crate::codec::EntryType::Noop, // <--- The crucial part
+            data: bytes::Bytes::new(),
+        };
+
+        let req = AppendEntriesRequest {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 10, // Matching previous index
+            prev_log_term: 1,
+            leader_commit: 10,
+            leader_hlc: lnc_core::HlcTimestamp::new(1000, 0),
+            entries: vec![noop_entry],
+        };
+
+        // 3. Handle request
+        let resp = node.handle_append_entries(&req);
+
+        // 4. Assertions
+        assert!(resp.success, "Follower should accept valid NoOp");
+        assert_eq!(
+            resp.match_index, 11,
+            "match_index must advance for NoOp (was stuck at 1 in the bug)"
+        );
+        assert_eq!(
+            node.last_log_index, 11,
+            "Internal log index must advance for NoOp"
+        );
+        assert_eq!(
+            node.last_log_term, 1,
+            "Last log term should be updated from NoOp entry"
+        );
     }
 }

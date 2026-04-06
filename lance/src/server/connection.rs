@@ -10,18 +10,24 @@ use crate::auth::TokenValidator;
 use crate::consumer::{ConsumerRateLimiter, FetchRequest, FetchResponse, read_segment_zero_copy};
 use crate::shutdown::{begin_operation, end_operation, is_shutdown_requested};
 use crate::subscription::SubscriptionManager;
-use crate::topic::TopicRegistry;
+use crate::topic::{TopicIdentityError, TopicRegistry};
 use bytes::Bytes;
+use futures::stream::{FuturesUnordered, StreamExt};
 use lnc_core::{BatchPool, LanceError, Result};
+use lnc_metrics::time_ingest_sampled;
 use lnc_network::{ControlCommand, FrameType, LWP_HEADER_SIZE, parse_frame};
-use lnc_replication::{AsyncQuorumManager, ClusterCoordinator, LeaderConnectionPool, QuorumResult};
+use lnc_replication::{
+    AsyncQuorumManager, ClusterCoordinator, ForwardError, LeaderConnectionPool, QuorumResult,
+};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
-// 4 Golden Signals - sampled latency tracking (hot-path safe)
-use lnc_metrics::time_ingest_sampled;
 
 const INITIAL_BUFFER_SIZE: usize = 256 * 1024;
+const LEADER_DISCOVERY_RETRIES: usize = 3;
+const LEADER_DISCOVERY_BASE_BACKOFF_MS: u64 = 50;
+static CONNECTION_ROUTING_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Connection context holding shared state for frame processing
 struct ConnectionContext<'a, S> {
@@ -39,6 +45,9 @@ struct ConnectionContext<'a, S> {
     quorum_manager: &'a Option<Arc<AsyncQuorumManager>>,
     /// This node's ID (for recording leader's own quorum ACK)
     node_id: u16,
+    /// Stable connection-scoped key (retained for diagnostic tracing).
+    /// Actor dispatch now uses topic_id only for per-topic ordering.
+    routing_key: u64,
 }
 
 /// Result of frame processing
@@ -88,8 +97,13 @@ where
 {
     let mut buffer = vec![0u8; INITIAL_BUFFER_SIZE];
     let mut read_offset = 0usize;
+    let connection_routing_key = CONNECTION_ROUTING_COUNTER.fetch_add(1, Ordering::Relaxed);
     // Track authentication state for this connection
     let mut authenticated = !token_validator.is_enabled();
+
+    // Hoisted allocation for ACKs (reused across all batches)
+    // Size = 64 pipeline depth * 12 bytes per ACK ~= 768 bytes
+    let mut ack_buffer = Vec::with_capacity(1024);
 
     loop {
         if is_shutdown_requested() {
@@ -123,9 +137,10 @@ where
             authenticated: &mut authenticated,
             quorum_manager: &quorum_manager,
             node_id,
+            routing_key: connection_routing_key,
         };
 
-        read_offset = process_frames(ctx, &mut buffer, read_offset).await?;
+        read_offset = process_frames(ctx, &mut buffer, &mut read_offset, &mut ack_buffer).await?;
     }
 }
 
@@ -181,11 +196,12 @@ fn extract_payload_length(buffer: &[u8]) -> usize {
     u32::from_le_bytes([buffer[32], buffer[33], buffer[34], buffer[35]]) as usize
 }
 
-/// Process all complete frames in buffer
+/// Process all complete frames in buffer with zero-copy cursor logic
 async fn process_frames<S>(
     mut ctx: ConnectionContext<'_, S>,
     buffer: &mut Vec<u8>,
-    mut read_offset: usize,
+    read_offset: &mut usize,
+    ack_buffer: &mut Vec<u8>,
 ) -> Result<usize>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -195,26 +211,32 @@ where
     // into a single fsync, and we send all ACKs in one write.
     let mut pending: Vec<PendingIngest> = Vec::new();
 
-    while read_offset >= LWP_HEADER_SIZE {
-        match parse_frame(&buffer[..read_offset])? {
-            Some((frame, consumed)) => {
-                let action = dispatch_frame(&mut ctx, &frame, buffer, consumed, read_offset).await;
+    // Cursor-based parsing: eliminates O(N²) copy_within per frame
+    let mut cursor = 0;
+
+    while *read_offset - cursor >= LWP_HEADER_SIZE {
+        match parse_frame(&buffer[cursor..*read_offset])? {
+            Some((frame, frame_len)) => {
+                // Pass cursor-adjusted sub-slice so forwarding paths send the
+                // correct frame bytes (not stale data from buffer offset 0).
+                let effective_read_offset = *read_offset - cursor;
+                let action = dispatch_frame(
+                    &mut ctx,
+                    &frame,
+                    &mut buffer[cursor..],
+                    frame_len,
+                    effective_read_offset,
+                )
+                .await;
 
                 match action {
-                    FrameAction::Continue => {
-                        buffer.copy_within(consumed..read_offset, 0);
-                        read_offset -= consumed;
-                        maybe_shrink_buffer(buffer, read_offset);
+                    FrameAction::Continue | FrameAction::Forwarded => {
+                        // Just advance cursor, don't shift data yet
+                        cursor += frame_len;
                     },
                     FrameAction::Pending(p) => {
                         pending.push(p);
-                        buffer.copy_within(consumed..read_offset, 0);
-                        read_offset -= consumed;
-                        maybe_shrink_buffer(buffer, read_offset);
-                    },
-                    FrameAction::Forwarded => {
-                        // Buffer already adjusted by forwarding logic
-                        read_offset -= consumed;
+                        cursor += frame_len;
                     },
                     FrameAction::Error(e) => return Err(e),
                 }
@@ -223,55 +245,126 @@ where
         }
     }
 
+    // Perform ONE shift for all processed frames (O(1) per batch read)
+    if cursor > 0 {
+        buffer.copy_within(cursor..*read_offset, 0);
+        *read_offset -= cursor;
+        maybe_shrink_buffer(buffer, *read_offset);
+    }
+
     // ── Batch-complete all deferred ingests ─────────────────────────────
+    // In L3 mode, ACK is gated on both local durability and quorum success.
+    // This preserves producer-visible durability guarantees during leader churn
+    // and avoids acknowledging writes that have not reached majority replication.
+    //
+    // CRITICAL: ACKs must remain FIFO for pipelined clients.
+    // We still await completions concurrently, but stream ACKs for contiguous
+    // in-order prefixes instead of waiting for the entire batch to finish.
     if !pending.is_empty() {
         let count = pending.len();
-        let mut ack_buf = Vec::with_capacity(count * LWP_HEADER_SIZE);
+        let qm = ctx.quorum_manager.as_ref().map(Arc::clone);
 
-        for p in pending {
-            // Await write completion (all fire together after one fsync)
-            if p.write_done_rx.await.is_err() {
-                return Err(LanceError::Io(std::io::Error::other(
-                    "Ingestion write failed",
-                )));
-            }
+        // 1. Build completion futures with original ordering index.
+        let mut futures = FuturesUnordered::new();
+        for (idx, p) in pending.into_iter().enumerate() {
+            let _qm_clone = qm.clone();
+            futures.push(async move {
+                // Await write completion
+                if p.write_done_rx.await.is_err() {
+                    return (
+                        idx,
+                        Err(LanceError::Io(std::io::Error::other(
+                            "Ingestion write failed",
+                        ))),
+                    );
+                }
 
-            // Await quorum for L3 writes
-            if let Some((write_id, rx)) = p.quorum_rx {
-                if let Some(qm) = ctx.quorum_manager {
-                    let result = qm.wait_for_quorum(write_id, rx).await;
-                    match result {
-                        QuorumResult::Success => {},
-                        QuorumResult::Timeout => {
-                            warn!(
-                                target: "lance::server",
-                                batch_id = p.batch_id,
-                                write_id,
-                                "Quorum timeout — ACKing client anyway (data is locally durable)"
-                            );
+                let batch_id = p.batch_id;
+
+                // L3 QUORUM DURABILITY: Wait for quorum before ACKing client.
+                // This ensures writes are replicated to majority before client
+                // considers them committed, preventing data loss during failover.
+                if let Some((_write_id, rx)) = p.quorum_rx {
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+                        Ok(Ok(result)) => {
+                            if !result.is_success() {
+                                return (
+                                    idx,
+                                    Err(LanceError::QuorumNotReached {
+                                        required: 2,
+                                        received: 1,
+                                    }),
+                                );
+                            }
                         },
-                        QuorumResult::Failed | QuorumResult::Partial { .. } => {
-                            warn!(
-                                target: "lance::server",
-                                batch_id = p.batch_id,
-                                write_id,
-                                result = ?result,
-                                "Quorum failed — ACKing client anyway (data is locally durable)"
+                        _ => {
+                            return (
+                                idx,
+                                Err(LanceError::QuorumNotReached {
+                                    required: 2,
+                                    received: 1,
+                                }),
                             );
                         },
                     }
                 }
-            }
 
-            ack_buf.extend_from_slice(&lnc_network::encode_ack_bytes(p.batch_id));
+                // Return batch_id on quorum durability success
+                (idx, Ok(batch_id))
+            });
         }
 
-        // Batch-write all ACKs in one syscall
-        if ctx.stream.write_all(&ack_buf).await.is_err() {
-            return Err(LanceError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "Failed to send batch ack",
-            )));
+        // 2. Track completed slots and stream ACKs only for contiguous FIFO prefix.
+        let mut ready: Vec<Option<Result<u64>>> =
+            std::iter::repeat_with(|| None).take(count).collect();
+        let mut next_ack_idx = 0usize;
+
+        while let Some((idx, result)) = futures.next().await {
+            ready[idx] = Some(result);
+
+            ack_buffer.clear();
+            while next_ack_idx < count {
+                let Some(slot) = ready[next_ack_idx].take() else {
+                    break;
+                };
+
+                match slot {
+                    Ok(batch_id) => {
+                        ack_buffer.extend_from_slice(&lnc_network::encode_ack_bytes(batch_id));
+                        next_ack_idx += 1;
+                    },
+                    Err(e) => {
+                        // Each pending ingest had begin_operation() called; always balance
+                        // counters even on quorum/ingest failures.
+                        for _ in 0..count {
+                            end_operation();
+                        }
+
+                        match e {
+                            LanceError::QuorumNotReached { .. } => {
+                                // Keep connection alive and surface a retryable failure
+                                // instead of abruptly closing the socket (which manifests
+                                // as early EOF in forwarding paths).
+                                let _ =
+                                    send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
+                                return Ok(*read_offset);
+                            },
+                            _ => return Err(e),
+                        }
+                    },
+                }
+            }
+
+            if !ack_buffer.is_empty() && ctx.stream.write_all(ack_buffer).await.is_err() {
+                for _ in 0..count {
+                    end_operation();
+                }
+
+                return Err(LanceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Failed to send batch ack",
+                )));
+            }
         }
 
         // Each pending ingest had begin_operation() called; balance them.
@@ -280,7 +373,7 @@ where
         }
     }
 
-    Ok(read_offset)
+    Ok(*read_offset)
 }
 
 /// Dispatch frame to appropriate handler
@@ -355,18 +448,70 @@ where
     let timestamp_ns = frame.header.ingest_header.timestamp_ns;
     let record_count = frame.record_count();
 
-    // Validate topic exists
-    if topic_id != 0 && !ctx.topic_registry.topic_exists(topic_id) {
-        warn!(target: "lance::server", topic_id, batch_id, "Ingest to unknown topic");
-        if send_error(ctx.stream, "Unknown topic").await.is_err() {
-            end_operation();
-            return FrameAction::Error(LanceError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "Failed to send error",
-            )));
+    // Validate topic identity. Epoch validation is optional in phase 1
+    // (`None`) but this call site is now prepared for stale-id rejection.
+    if topic_id != 0
+        && matches!(
+            ctx.topic_registry.validate_topic_identity(topic_id, None),
+            Err(TopicIdentityError::UnknownTopic)
+        )
+    {
+        if let Some(coord) = ctx.cluster.as_ref() {
+            // Best-effort self-heal: if this node has committed topic ops that
+            // were not yet reflected in local registry state, replay them now
+            // before surfacing Unknown topic to the client.
+            coord.reemit_committed_topic_ops().await;
+            if ctx.topic_registry.topic_exists(topic_id) {
+                debug!(
+                    target: "lance::server",
+                    topic_id,
+                    batch_id,
+                    "Recovered topic metadata via committed-op replay"
+                );
+            } else {
+                debug!(
+                    target: "lance::server",
+                    topic_id,
+                    batch_id,
+                    "Topic still missing after committed-op replay"
+                );
+            }
         }
-        end_operation();
-        return FrameAction::Continue;
+
+        if ctx.topic_registry.topic_exists(topic_id) {
+            // Metadata was recovered after best-effort replay/hydration.
+        } else {
+            // Re-check leadership/forwarding once more before returning Unknown topic.
+            // During startup/election churn, role can change between the initial
+            // pre-check and this local topic lookup.
+            if let Some(action) = try_forward_to_leader(ctx, buffer, consumed, read_offset).await {
+                end_operation();
+                return action;
+            }
+
+            let err_msg = if ctx.cluster.is_some() {
+                warn!(
+                    target: "lance::server",
+                    topic_id,
+                    batch_id,
+                    "Ingest topic metadata not yet converged; returning transient forward failure"
+                );
+                "FORWARD_FAILED: Unknown topic (metadata convergence)"
+            } else {
+                warn!(target: "lance::server", topic_id, batch_id, "Ingest to unknown topic");
+                "Unknown topic"
+            };
+
+            if send_error(ctx.stream, err_msg).await.is_err() {
+                end_operation();
+                return FrameAction::Error(LanceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Failed to send error",
+                )));
+            }
+            end_operation();
+            return FrameAction::Continue;
+        }
     }
 
     if let Some(ref payload) = frame.payload {
@@ -388,6 +533,7 @@ where
 
         let request = IngestionRequest {
             topic_id,
+            routing_key: ctx.routing_key,
             timestamp_ns,
             record_count,
             payload: payload.clone(),
@@ -430,10 +576,13 @@ where
         return handle_authenticate(ctx, frame).await;
     }
 
-    // Check if write command needs forwarding
-    if command_handlers::is_write_operation(command) {
+    // Forward write commands and fetch reads through the leader for consistent
+    // metadata visibility during leadership churn / follower catch-up windows.
+    let should_forward_to_leader =
+        command_handlers::is_topic_metadata_operation(command) || command == ControlCommand::Fetch;
+    if should_forward_to_leader {
         if let Some(action) =
-            try_forward_control_to_leader(ctx, buffer, consumed, read_offset).await
+            try_forward_control_to_leader(ctx, command, buffer, consumed, read_offset).await
         {
             return action;
         }
@@ -520,18 +669,41 @@ where
     FrameAction::Continue
 }
 
+async fn resolve_leader_addr_with_retry(
+    coord: &ClusterCoordinator,
+) -> Option<std::net::SocketAddr> {
+    for attempt in 0..LEADER_DISCOVERY_RETRIES {
+        if let Some(addr) = coord.leader_addr_authoritative().await {
+            return Some(addr);
+        }
+
+        if attempt + 1 < LEADER_DISCOVERY_RETRIES {
+            let backoff_ms = LEADER_DISCOVERY_BASE_BACKOFF_MS * (attempt as u64 + 1);
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+        }
+    }
+
+    None
+}
+
 /// Try to forward write to leader, returns Some(FrameAction) if handled
 async fn try_forward_to_leader<S>(
     ctx: &mut ConnectionContext<'_, S>,
     buffer: &mut [u8],
     consumed: usize,
-    read_offset: usize,
+    _read_offset: usize,
 ) -> Option<FrameAction>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let coord = ctx.cluster.as_ref()?;
+    if coord.is_leader_authoritative() {
+        return None;
+    }
+
     if coord.is_leader() {
+        // Data-plane ingest is allowed on elected leader while readiness warms up.
+        // Metadata operations remain gated separately via authoritative checks.
         return None;
     }
 
@@ -539,14 +711,51 @@ where
         match pool.forward_write(&buffer[..consumed]).await {
             Ok(response) => {
                 if ctx.stream.write_all(&response).await.is_ok() {
-                    buffer.copy_within(consumed..read_offset, 0);
+                    // Buffer shift is handled by process_frames cursor logic.
                     return Some(FrameAction::Forwarded);
                 }
             },
+            Err(ForwardError::LeaderUnknown) => {
+                if let Some(leader_addr) = resolve_leader_addr_with_retry(coord).await {
+                    pool.on_leader_change(Some(leader_addr)).await;
+                    match pool.forward_write(&buffer[..consumed]).await {
+                        Ok(response) => {
+                            if ctx.stream.write_all(&response).await.is_ok() {
+                                return Some(FrameAction::Forwarded);
+                            }
+                        },
+                        Err(e) => {
+                            warn!(target: "lance::server", error = %e, "Write forwarding to leader failed");
+                            let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
+                            return Some(FrameAction::Forwarded);
+                        },
+                    }
+                }
+
+                warn!(target: "lance::server", "Write forwarding to leader failed: leader address unknown");
+                let _ = send_error(ctx.stream, "FORWARD_FAILED: Leader address unknown").await;
+                return Some(FrameAction::Forwarded);
+            },
             Err(e) => {
+                // Transient forwarding failures (e.g. early EOF on stale pooled
+                // connection during leader transition) can often be recovered by
+                // refreshing leader address and retrying once.
+                if let Some(leader_addr) = resolve_leader_addr_with_retry(coord).await {
+                    pool.on_leader_change(Some(leader_addr)).await;
+                    match pool.forward_write(&buffer[..consumed]).await {
+                        Ok(response) => {
+                            if ctx.stream.write_all(&response).await.is_ok() {
+                                return Some(FrameAction::Forwarded);
+                            }
+                        },
+                        Err(retry_err) => {
+                            warn!(target: "lance::server", error = %retry_err, "Write forwarding retry after leader refresh failed");
+                        },
+                    }
+                }
+
                 warn!(target: "lance::server", error = %e, "Write forwarding to leader failed");
                 let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
-                buffer.copy_within(consumed..read_offset, 0);
                 return Some(FrameAction::Forwarded);
             },
         }
@@ -557,7 +766,6 @@ where
             None => "NOT_LEADER: leader unknown".to_string(),
         };
         let _ = send_error(ctx.stream, &err_msg).await;
-        buffer.copy_within(consumed..read_offset, 0);
         return Some(FrameAction::Forwarded);
     }
 
@@ -567,30 +775,85 @@ where
 /// Try to forward control command to leader
 async fn try_forward_control_to_leader<S>(
     ctx: &mut ConnectionContext<'_, S>,
+    command: ControlCommand,
     buffer: &mut [u8],
     consumed: usize,
-    read_offset: usize,
+    _read_offset: usize,
 ) -> Option<FrameAction>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let coord = ctx.cluster.as_ref()?;
-    if coord.is_leader() {
+    if command == ControlCommand::Fetch {
+        // Fetch must only execute locally on a ready leader; otherwise forward.
+        if coord.is_leader() && coord.is_leader_authoritative() {
+            return None;
+        }
+    } else if coord.is_leader_authoritative() {
         return None;
+    }
+
+    if coord.is_leader() {
+        lnc_metrics::increment_cluster_elected_not_ready_rejects();
+        warn!(
+            target: "lance::server",
+            "Leader elected but not ready; rejecting control command with retryable forward failure"
+        );
+        let _ = send_error(
+            ctx.stream,
+            "FORWARD_FAILED: Leader not ready (apply/metadata catch-up)",
+        )
+        .await;
+        // Buffer shift is handled by process_frames cursor logic.
+        return Some(FrameAction::Forwarded);
     }
 
     if let Some(pool) = ctx.leader_pool {
         match pool.forward_write(&buffer[..consumed]).await {
             Ok(response) => {
                 if ctx.stream.write_all(&response).await.is_ok() {
-                    buffer.copy_within(consumed..read_offset, 0);
                     return Some(FrameAction::Forwarded);
                 }
             },
+            Err(ForwardError::LeaderUnknown) => {
+                if let Some(leader_addr) = resolve_leader_addr_with_retry(coord).await {
+                    pool.on_leader_change(Some(leader_addr)).await;
+                    match pool.forward_write(&buffer[..consumed]).await {
+                        Ok(response) => {
+                            if ctx.stream.write_all(&response).await.is_ok() {
+                                return Some(FrameAction::Forwarded);
+                            }
+                        },
+                        Err(e) => {
+                            warn!(target: "lance::server", error = %e, "Control command forwarding to leader failed");
+                            let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
+                            return Some(FrameAction::Forwarded);
+                        },
+                    }
+                }
+
+                warn!(target: "lance::server", "Control command forwarding to leader failed: leader address unknown");
+                let _ = send_error(ctx.stream, "FORWARD_FAILED: Leader address unknown").await;
+                return Some(FrameAction::Forwarded);
+            },
             Err(e) => {
+                // Mirror data-plane retry behavior for transient forward failures.
+                if let Some(leader_addr) = resolve_leader_addr_with_retry(coord).await {
+                    pool.on_leader_change(Some(leader_addr)).await;
+                    match pool.forward_write(&buffer[..consumed]).await {
+                        Ok(response) => {
+                            if ctx.stream.write_all(&response).await.is_ok() {
+                                return Some(FrameAction::Forwarded);
+                            }
+                        },
+                        Err(retry_err) => {
+                            warn!(target: "lance::server", error = %retry_err, "Control forwarding retry after leader refresh failed");
+                        },
+                    }
+                }
+
                 warn!(target: "lance::server", error = %e, "Control command forwarding to leader failed");
                 let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
-                buffer.copy_within(consumed..read_offset, 0);
                 return Some(FrameAction::Forwarded);
             },
         }
@@ -634,10 +897,20 @@ async fn handle_control_command<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    // Check if this is a write operation that requires leader
-    if command_handlers::is_write_operation(command) {
+    // Topic metadata commands are leader-authoritative to avoid stale
+    // follower registry responses during startup/election churn.
+    if command_handlers::is_topic_metadata_operation(command) {
         if let Some(coord) = cluster {
-            if !coord.is_leader() {
+            if !coord.is_leader_authoritative() {
+                if coord.is_leader() {
+                    lnc_metrics::increment_cluster_elected_not_ready_rejects();
+                    return send_error(
+                        stream,
+                        "FORWARD_FAILED: Leader not ready (apply/metadata catch-up)",
+                    )
+                    .await;
+                }
+
                 return send_not_leader_error(stream, coord.leader_addr().map(|a| a.to_string()))
                     .await;
             }
@@ -685,12 +958,8 @@ fn handle_fetch_request(
 ) -> lnc_network::Frame {
     let topic_id = fetch_req.topic_id;
 
-    // Get topic directory
-    let topic_dir = if topic_id == 0 {
-        topic_registry.data_dir().join("segments").join("0")
-    } else {
-        topic_registry.get_topic_dir(topic_id)
-    };
+    // Name-based storage: all topics resolve through the registry
+    let topic_dir = topic_registry.get_topic_dir(topic_id);
 
     if !topic_dir.exists() {
         return lnc_network::Frame::new_error_response("Topic not found");

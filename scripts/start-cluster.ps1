@@ -18,12 +18,13 @@ $BasePort = 1992
 $BaseMetricsPort = 9090
 $BaseHealthPort = 8080
 $BaseReplicationPort = 1993
-$DataDirBase = "$PSScriptRoot\..\test-data"
-$LogDir = "$PSScriptRoot\..\test-logs"
+$ArtifactsDir = "$PSScriptRoot\..\.cassa_artifacts"
+$DataDirBase = "$ArtifactsDir\test-data"
+$LogDir = "$ArtifactsDir\test-logs"
 $NodeCount = 3
 
 # Process tracking file
-$PidFile = "$PSScriptRoot\..\test-cluster.pids"
+$PidFile = "$ArtifactsDir\test-cluster.pids"
 
 function Stop-Cluster {
     Write-Host "Stopping LANCE cluster..." -ForegroundColor Yellow

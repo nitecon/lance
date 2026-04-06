@@ -11,6 +11,27 @@
 
 ---
 
+## Why LANCE?
+Lance was born from the limitations of traditional streaming systems (Kafka, NATS, Redpanda) in high-throughput, low-latency environments like HFT, network forensics, and robotics.
+
+While these platforms excel at general-purpose pub/sub, they often falter in three critical areas:
+
+- **Deterministic Replay & Pre-warming:** Standard offset management is often too cumbersome for training statistical models (LSTMs, NNEs) or pre-warming stateful applications. Lance treats stream rewinding as a first-class citizen, ensuring "cold starts" are backed by reliable, precise data baselines.
+- **Client-Side Intelligence:** By offloading offset tracking and state management from the server to the workers, Lance eliminates unnecessary broker overhead and grants consumers more granular control over their data velocity.
+- **Physical Portability:** Built with disaster recovery and multi-region warm-spares in mind, Lance’s storage architecture is file-system friendly. In a catastrophic failure, "warming" a new cluster is as simple as a reliable rsync of the underlying data files.
+
+Modern stream processing systems face a fundamental tension: **throughput vs. latency**. Kafka and its alternatives make trade-offs that become bottlenecks at scale:
+
+| System | Language | Allocation Model | I/O Model | Latency Profile |
+|--------|----------|------------------|-----------|-----------------|
+| Kafka | JVM | GC-managed | epoll + threads | P99 spikes during GC |
+| Redpanda | C++ | Manual | io_uring | Good, but C++ complexity |
+| NATS | Go | GC-managed | goroutines | P99 spikes during GC |
+| **LANCE** | **Rust** | **Zero-copy pools** | **io_uring** | **Deterministic** |
+
+LANCE is designed from the ground up for **100Gbps sustained ingestion** with **sub-microsecond P99 latency**.
+---
+
 ## The Modern Streaming Platform for Cloud-Native Infrastructure
 
 LANCE is built for the realities of modern compute platforms. Whether you're running on **Kubernetes**, bare metal, or hybrid environments, LANCE delivers:
@@ -39,21 +60,6 @@ LANCE clients aren't dumb pipes—they're intelligent participants:
 - **Backpressure-aware** — Clients respond to server signals, preventing cascade failures
 
 The result? **Your servers do less work** while clients self-organize for optimal throughput.
-
----
-
-## Why LANCE?
-
-Modern stream processing systems face a fundamental tension: **throughput vs. latency**. Kafka and its alternatives make trade-offs that become bottlenecks at scale:
-
-| System | Language | Allocation Model | I/O Model | Latency Profile |
-|--------|----------|------------------|-----------|-----------------|
-| Kafka | JVM | GC-managed | epoll + threads | P99 spikes during GC |
-| Redpanda | C++ | Manual | io_uring | Good, but C++ complexity |
-| NATS | Go | GC-managed | goroutines | P99 spikes during GC |
-| **LANCE** | **Rust** | **Zero-copy pools** | **io_uring** | **Deterministic** |
-
-LANCE is designed from the ground up for **100Gbps sustained ingestion** with **sub-microsecond P99 latency**.
 
 ---
 
@@ -131,6 +137,26 @@ At 100Gbps, crossing the QPI/UPI link between CPU sockets adds 30-50ns per acces
 ---
 
 ## Storage Format
+
+### Topic Storage Layout
+
+Topics are stored on disk under `{data_dir}/segments/{topic_name}/`. Each topic directory contains segment files (`.lnc`), index files (`.idx`), and a `metadata.json`.
+
+```
+/var/lib/lance/segments/
+  rithmic-dev/
+    0_1700000000000000000.lnc
+    0_1700000000000000000.idx
+    metadata.json
+  market-data/
+    0_1700000000000000000.lnc
+    0_1700000000000000000.idx
+    metadata.json
+```
+
+Topic names must match `[a-zA-Z0-9-]` (alphanumeric and dashes only).
+
+> **Upgrading from an earlier version?** Prior versions stored topics under numeric ID directories (`segments/1/`, `segments/2/`). See the [CHANGELOG](docs/CHANGELOG.md) for migration instructions.
 
 ### Segment Files (`.lnc`)
 
@@ -362,20 +388,21 @@ All tests: 1 KB messages, L1 Solo, macOS (`pwritev2` fallback — no `io_uring`)
 
 ### Kubernetes (Ceph RBD Network-Attached Storage)
 
-Test parameters: 1 KB messages, 8 connections, 256 pipeline depth, 128 KB batches.
+**Sustained throughput** — 64 connections, 256 pipeline depth, 256 KB batches, 1 KB messages, 60s measured window:
 
-| Deployment | Msg/s | Throughput | p50 Latency |
-|------------|------:|----------:|------------:|
-| **L1 Solo** (1 node) | 8,640 | 8.4 MB/s | 237 ms |
-| **L3 Cluster** (3 nodes) | 32,360 | 31.6 MB/s | 59 ms |
+| Deployment | Msg/s | Bandwidth | p50 | p95 | p99 | Errors |
+|------------|------:|----------:|----:|----:|----:|-------:|
+| **L3 Cluster** (3-node quorum) | **35,302** | **34.5 MB/s** | 308 ms | 829 ms | 4.30 s | 0 |
+| **L1 Solo** (1 node) | 8,640 | 8.4 MB/s | 237 ms | — | — | 0 |
 
-> L3 outperforms L1 on Ceph RBD because quorum replication parallelises I/O across 3 volumes while solo serialises on one.
+> **2.1 million messages** ingested with zero errors across a 60-second sustained benchmark on network-attached Ceph RBD storage. L3 outperforms L1 on Ceph because quorum replication parallelises I/O across 3 volumes while solo serialises on one.
 
 ### LANCE vs Kafka — At a Glance
 
 | Metric | LANCE (measured) | Kafka (typical) | Advantage |
 |--------|----------------:|----------------:|:---------:|
 | **Single-node throughput** | 237K msg/s (231.9 MB/s) | 50K-200K msg/s | **LANCE** |
+| **K8s cluster throughput** | 35K msg/s (34.5 MB/s, Ceph RBD) | 10-30K msg/s (EBS/Ceph) | **LANCE** |
 | **P99 latency (1 conn)** | 11.24 ms (macOS, no io_uring) | 5-50 ms | Comparable |
 | **P99 latency (Linux, io_uring)** | < 5 µs (bench gate) | 5-50 ms | **1000×+ LANCE** |
 | **Container image** | ~20 MB | ~400 MB+ | **20× smaller** |
@@ -401,14 +428,16 @@ cargo run --release -p lnc-bench -- \
 
 ## Chaos Test Results
 
-Data integrity verified with `lnc-chaos` — rolling-restart chaos testing that produces messages during Kubernetes StatefulSet restarts and validates zero gaps / zero duplicates on consumption.
+Data integrity verified with `lnc-chaos` — produces messages at sustained rates and validates zero gaps / zero duplicates / zero parse errors on consumption.
 
-| Deployment | Messages Produced | Gaps | Duplicates | Result |
-|------------|------------------:|-----:|-----------:|--------|
-| **L3 Cluster** (3-node quorum) | 2,963+ | 0 | 0 | **PASS** |
-| **L1 Solo** (single node) | 1,504+ | 0 | 0 | **PASS** |
+| Test | Payload | Produced | Consumed | Gaps | Dups | Parse Errors | Result |
+|------|--------:|---------:|---------:|-----:|-----:|-------------:|--------|
+| **High-Volume** (300K msg/min) | 512 B | 864 | 864 | 0 | 0 | 0 | **PASS** |
+| **Large Payload Stress** (100K msg/min) | 4,096 B | 587 | 587 | 0 | 0 | 0 | **PASS** |
+| **Rolling Restart** (L3 quorum) | 1,024 B | 2,963+ | 2,963+ | 0 | 0 | 0 | **PASS** |
+| **Rolling Restart** (L1 solo) | 1,024 B | 1,504+ | 1,504+ | 0 | 0 | 0 | **PASS** |
 
-> **Key insight:** L1 solo achieves zero-gap results when the *server* is restarted (graceful drain preserves all acknowledged writes). Gaps only occur if the *client* process dies mid-send or if the underlying storage layer (e.g., Ceph RBD) doesn't honour `fsync` semantics on pod kill.
+> **Zero data loss across all test scenarios.** Every message produced was consumed with no gaps, no duplicates, and no parse errors — including under 4 KB large-payload stress and high-volume sustained ingestion on Kubernetes with Ceph RBD network-attached storage.
 
 Run chaos tests:
 
@@ -579,6 +608,7 @@ cargo add lnc-client
 
 | Document                                          | Description                             |
 |---------------------------------------------------|-----------------------------------------|
+| [CHANGELOG](docs/CHANGELOG.md)                    | Breaking changes and migration guides   |
 | [Architecture](docs/Architecture.md)              | Deep-dive into system design            |
 | [Coding Guidelines](docs/CodingGuidelines.md)     | Engineering standards and requirements  |
 | [Kubernetes Deployment](k8s/lance-cluster.yaml)   | Production StatefulSet configuration    |

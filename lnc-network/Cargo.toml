@@ -20,8 +20,8 @@ tokio = { workspace = true }
 zerocopy = { workspace = true }
 
 # TLS support (optional feature)
-tokio-rustls = { version = "0.26", optional = true }
-rustls = { version = "0.23", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 rustls-pki-types = { version = "1.9", optional = true }
 webpki-roots = { version = "0.26", optional = true }
 

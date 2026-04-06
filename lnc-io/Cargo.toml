@@ -14,9 +14,12 @@ bytes = { workspace = true }
 crossbeam = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
+tokio = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3.10"
+tempfile = "3.27"

@@ -16,7 +16,11 @@
 - [10. Container Deployment & Ephemeral Integrity](#10-container-deployment-ephemeral-integrity)
 - [11. Chaos Testing & Failure Mode Design](#11-chaos-testing-failure-mode-design)
 - [12. Observability & Telemetry](#12-observability-telemetry)
+- [5.4 Revised Write Path: End-to-End Flow](#54-revised-write-path-end-to-end-flow)
 - [13. Memory Layout & Zero-Copy Primitives](#13-memory-layout-zero-copy-primitives)
+- [13.10 Bit-Packing: node_actor_seq Implementation](#1310-bit-packing-node_actor_seq-implementation)
+- [13.11 io_uring Probe & Fallback Strategy](#1311-io_uring-probe-fallback-strategy)
+- [13.12 SIMD-Accelerated Checksumming](#1312-simd-accelerated-checksumming)
 - [14. Thread Pinning & NUMA Awareness](#14-thread-pinning-numa-awareness)
 - [15. Buffer Ownership & Lifecycle (The Loaner Pattern)](#15-buffer-ownership-lifecycle-the-loaner-pattern)
 - [16. The LANCE Wire Protocol (LWP)](#16-the-lance-wire-protocol-lwp)
@@ -28,6 +32,35 @@
 - [22. Write Buffering & Deferred Sync Architecture](#22-write-buffering-deferred-sync-architecture)
 - [23. CATCHING_UP Protocol](#23-catching_up-protocol)
 - [24. Recursive Segment Recovery](#24-recursive-segment-recovery)
+- [25. Segment Compaction](#25-segment-compaction)
+- [26. Circuit Breaker](#26-circuit-breaker)
+- [27. Retention Service](#27-retention-service)
+- [28. Token Authentication](#28-token-authentication)
+- [29. Hybrid Logical Clock (HLC)](#29-hybrid-logical-clock-hlc)
+- [30. Subscription Management](#30-subscription-management)
+- [Raft Persistence Execution Isolation (Step 1)](#raft-persistence-execution-isolation-step-1)
+- [Coordinator Runtime Isolation (Step 2)](#coordinator-runtime-isolation-step-2)
+- [Data Forwarder Runtime Isolation (Step 3)](#data-forwarder-runtime-isolation-step-3)
+- [Replication Transport Concurrency (PeerManager)](#replication-transport-concurrency-peermanager)
+- [Ingest ACK Semantics (Local Durability vs Quorum)](#ingest-ack-semantics-local-durability-vs-quorum)
+- [Ingest ACK Semantics (Local Durability vs Quorum)](#ingest-ack-semantics-local-durability-vs-quorum)
+- [Ingestion Flush Two-Phase Signaling](#ingestion-flush-two-phase-signaling)
+- [Topic Metadata Convergence During Leader Churn](#topic-metadata-convergence-during-leader-churn)
+- [M3 Single-Topic Hotspot Mitigation (Connection-Scoped Routing)](#m3-single-topic-hotspot-mitigation-connection-scoped-routing)
+- [Topic Create Convergence for Existing Local Names (Cluster Mode)](#topic-create-convergence-for-existing-local-names-cluster-mode)
+- [Higher-Term Response Demotion and Heartbeat Response Draining](#higher-term-response-demotion-and-heartbeat-response-draining)
+- [Integrity Model Shift: Topic Identity Epoch (Planned/Active)](#integrity-model-shift-topic-identity-epoch-plannedactive)
+- [Topic Identity Epoch Phase 1 Implementation Status](#topic-identity-epoch-phase-1-implementation-status)
+- [Leader Readiness Gate (Elected vs Authoritative)](#leader-readiness-gate-elected-vs-authoritative)
+- [Client-Owned Topic Convergence for Validation Tools](#client-owned-topic-convergence-for-validation-tools)
+- [Coordinator Stability Telemetry and Readiness Separation](#coordinator-stability-telemetry-and-readiness-separation)
+- [Follower Catch-up Recovery Fix (AppendEntries prev_log_term)](#follower-catch-up-recovery-fix-appendentries-prev_log_term)
+- [Hot-Path Lock Removal in Async io_uring Backend](#hot-path-lock-removal-in-async-io_uring-backend)
+- [Hot-Path Dynamic Dispatch Removal for Async I/O Futures](#hot-path-dynamic-dispatch-removal-for-async-io-futures)
+- [Changes](#changes)
+- [Outcome](#outcome)
+- [Control Plane vs Data Plane Architecture](#control-plane-vs-data-plane-architecture)
+- [Control Plane vs Data Plane Architecture](#control-plane-vs-data-plane-architecture)
 
 ---
 
@@ -4018,68 +4051,63 @@ impl RegisteredBufferPool {
 
 ### 17.5 Consumer Rate Limiting
 
-Prevent any single consumer from monopolizing resources:
+**Disabled by default.** The rate limiter is opt-in to maximize throughput in
+burst-performance environments. When disabled, the fetch hot path has zero
+overhead — no atomic loads, no syscalls, no branch mispredicts. Enable it only
+when you need to prevent a single consumer from monopolizing I/O bandwidth in
+multi-tenant or shared-cluster deployments.
+
+#### Enabling
+
+| Method | Example |
+|--------|---------|
+| **CLI flag** | `lance --consumer-rate-limit 104857600` (100 MB/s) |
+| **Config file** | `consumer_rate_limit_bytes_per_sec = 104857600` |
+| **Default** | Omitted / `None` → unlimited, zero overhead |
+
+#### Design
+
+The limiter uses a token-bucket algorithm with per-connection scope. When
+`rate_limit` is `None`, `try_consume()` and `has_capacity()` short-circuit
+immediately, returning the full requested amount with a single branch:
 
 ```rust
 pub struct ConsumerRateLimiter {
-    /// Bytes per second limit
-    rate_limit: u64,
-    /// Token bucket state
+    /// `None` = disabled (unlimited throughput, zero overhead).
+    /// `Some(limit)` = bytes-per-second cap with token bucket.
+    rate_limit: Option<u64>,
     tokens: AtomicU64,
     last_refill: AtomicU64,
 }
 
 impl ConsumerRateLimiter {
-    pub fn new(bytes_per_second: u64) -> Self {
-        Self {
-            rate_limit: bytes_per_second,
-            tokens: AtomicU64::new(bytes_per_second),  // Start with 1 second of tokens
-            last_refill: AtomicU64::new(current_time_ms()),
-        }
-    }
-    
-    /// Try to consume tokens; returns how many bytes allowed
+    /// Disabled — all fetches pass through with no atomic ops.
+    pub fn disabled() -> Self { /* ... */ }
+
+    /// Enabled — token bucket with the given bytes/sec cap.
+    pub fn new(bytes_per_second: u64) -> Self { /* ... */ }
+
+    #[inline]
     pub fn try_consume(&self, requested: u64) -> u64 {
-        self.refill();
-        
-        loop {
-            let current = self.tokens.load(Ordering::Relaxed);
-            let allowed = std::cmp::min(current, requested);
-            
-            if allowed == 0 {
-                return 0;
-            }
-            
-            if self.tokens.compare_exchange_weak(
-                current,
-                current - allowed,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ).is_ok() {
-                return allowed;
-            }
+        if self.rate_limit.is_none() {
+            return requested;  // fast path: single branch, no atomics
         }
-    }
-    
-    fn refill(&self) {
-        let now = current_time_ms();
-        let last = self.last_refill.load(Ordering::Relaxed);
-        let elapsed_ms = now.saturating_sub(last);
-        
-        if elapsed_ms > 0 {
-            let refill_amount = (self.rate_limit * elapsed_ms) / 1000;
-            self.tokens.fetch_add(refill_amount, Ordering::Relaxed);
-            self.last_refill.store(now, Ordering::Relaxed);
-            
-            // Cap at 1 second worth of tokens (burst limit)
-            let current = self.tokens.load(Ordering::Relaxed);
-            if current > self.rate_limit {
-                self.tokens.store(self.rate_limit, Ordering::Relaxed);
-            }
-        }
+        self.try_consume_inner(requested)
     }
 }
 ```
+
+#### When to enable
+
+- **Multi-tenant clusters**: prevent one consumer from starving others.
+- **Shared NVMe**: cap read bandwidth so ingestion writes retain priority.
+- **WAN consumers**: match rate to available network bandwidth.
+
+#### When to leave disabled (default)
+
+- **Local development / testing**: maximum throughput, no artificial limits.
+- **Dedicated consumers**: single consumer per topic, no contention.
+- **Burst replay**: bulk export or backfill where speed is the priority.
 
 ### 17.6 Read Path Summary
 
@@ -5566,7 +5594,470 @@ The `SubscriptionManager` provides **server-assisted** offset tracking that comp
 ### 30.5 Concurrency
 
 The `SubscriptionManager` uses `RwLock<HashMap<...>>` for both maps. This is acceptable because subscription operations are infrequent control-plane events (not hot-path data-plane). The `RwLock` allows concurrent reads (e.g., multiple `get_committed_offset` calls) while serialising writes.
+## Raft Persistence Execution Isolation (Step 1)
 
+### Raft Persistence Execution Isolation (Step 1)
+
+To prevent Raft durability operations from blocking async executor workers, persistence-heavy operations in the cluster control plane are offloaded to blocking workers.
+
+Implemented in `lnc-replication/src/cluster.rs`:
+
+- Follower `AppendEntries` persistence (`truncate_from` + `append`) runs via `tokio::task::spawn_blocking`.
+- Leader-side log persistence for `replicate_data_enriched` runs via `spawn_blocking`.
+- Leader No-Op entry persistence runs via `spawn_blocking`.
+- Raft term/vote state persistence before elections runs via `spawn_blocking`.
+- Snapshot log compaction (`compact_to`) runs via `spawn_blocking`.
+
+This preserves Raft durability ordering while reducing risk of Tokio worker starvation under disk contention.
+
+## Coordinator Runtime Isolation (Step 2)
+
+### Coordinator Runtime Isolation (Step 2)
+
+To isolate Raft/control-plane scheduling from the main server async runtime, coordinator bootstrap was moved onto a dedicated OS thread that owns its own Tokio runtime.
+
+Implemented in `lance/src/server/mod.rs`:
+
+- Cluster coordinator initialization (`start_listener`, `initialize`, `run`, `graceful_shutdown`) now runs inside a dedicated thread named `lance-coordinator-{node_id}`.
+- The dedicated thread uses a bounded `tokio::runtime::Builder::new_current_thread().enable_all()` runtime for coordinator work.
+- Optional CPU affinity can be configured via `coordinator_pin_core` to pin the coordinator thread before runtime startup.
+- Server shutdown now joins the dedicated coordinator thread via `tokio::task::spawn_blocking` to avoid blocking async workers during thread join.
+- The cluster startup log now records whether the dedicated coordinator runtime was successfully started.
+
+This separation keeps client accept/forwarding and other server-runtime tasks isolated from coordinator loop scheduling pressure, making runtime contention easier to reason about during failure and chaos scenarios.
+
+## Data Forwarder Runtime Isolation (Step 3)
+
+### Data Forwarder Runtime Isolation (Step 3)
+
+To prevent data replication forwarding work from contending with the main server runtime, the data forwarder loop now runs on its own dedicated OS thread with a dedicated Tokio runtime.
+
+Implemented in `lance/src/server/mod.rs`:
+
+- The `repl_rx` receive loop and `replicate_data_enriched` forwarding path are executed on a dedicated thread named `lance-forwarder-{node_id}`.
+- The forwarder thread uses `tokio::runtime::Builder::new_current_thread().enable_all()` to isolate scheduling from connection accept/dispatch.
+- Optional CPU affinity can be configured via `forwarder_pin_core` to pin the forwarder thread before runtime startup.
+- Forwarder channel capacity is configurable via `data_replication_channel_capacity` (default: `65536`) to absorb bursty replication traffic.
+- Forwarder pipelining is configurable via `replication_max_inflight` (default: `1`). Values `>1` enable bounded in-flight replication via `JoinSet` to hide network RTT.
+- The forwarder loop applies natural backpressure by pausing receive when the in-flight set reaches `replication_max_inflight`.
+- Forwarder shutdown is coordinated via `shutdown_rx` and channel closure (`data_repl_tx` drop), then joined using `tokio::task::spawn_blocking`.
+- Forwarder lifecycle logs now clearly indicate dedicated-runtime startup and shutdown.
+
+This removes replication-forwarding CPU and async scheduling pressure from the main runtime while preserving existing quorum ACK accounting semantics.
+## Replication Transport Concurrency (PeerManager)
+
+`PeerManager` uses per-peer connection locking to isolate slow followers and prevent cross-peer head-of-line blocking.
+
+- Peer registry: `Arc<RwLock<HashMap<u16, Arc<Mutex<PeerConnection>>>>>`
+- Map lock scope: lookup/insert/remove only (short critical sections)
+- Network I/O (`connect`, `send`, `recv`): performed under the specific peer's mutex, never under the global map lock
+- Raft RPC request/response (`AppendEntries`, `PreVote`, `Vote`) remains serialized per peer to preserve protocol correctness without message IDs
+
+This design ensures one slow/unreachable follower cannot delay heartbeats or control RPCs to other followers, reducing election churn under load while keeping existing wire protocol semantics.
+## Ingest ACK Semantics (Local Durability vs Quorum)
+
+## Ingest ACK Semantics (Local Durability vs Quorum)
+
+For high-throughput ingest, client ACKs are now gated on **local durability only** (ingestion actor write completion / fsync boundary) and are **not blocked** on quorum wait completion.
+
+- Connection handler waits for `write_done` before returning ACK to client.
+- Quorum wait (`AsyncQuorumManager::wait_for_quorum`) runs off-path in background tasks.
+- Quorum failures/timeouts remain observable via logs/metrics and still impact replication health, but they no longer directly stall the ingest response path.
+
+Rationale:
+- Prevent control-plane replication latency from backpressuring data-plane ACK latency.
+- Preserve local durability guarantees while isolating Raft jitter/elections from client write RTT.
+
+Trade-off:
+- ACK now means "durable on leader" rather than "quorum-committed".
+- Operators should monitor quorum failure metrics and logs as first-class SLO signals for replication health.
+## Ingestion Flush Two-Phase Signaling
+
+In the multi-actor ingestion path, post-fsync handling is now explicitly two-phase:
+
+1. **Phase 1 (Latency release):** all `write_done_tx` waiters are signaled immediately after WAL sync + segment fsync complete.
+2. **Phase 2 (Replication enqueue):** replication requests are enqueued after waiter release.
+
+Replication enqueue uses `try_send` fast-path with `blocking_send` fallback when channel capacity is exhausted.
+
+This preserves replication delivery semantics while removing replication-channel backpressure from the client ACK critical path. Client ACK latency now tracks local durability, not replication queue occupancy.
+## Topic Metadata Convergence During Leader Churn
+
+To reduce `Unknown topic` / `Topic not found` windows during elections and transient quorum instability, the server now applies two convergence-safe behaviors:
+
+1. **Create rollback self-heal**
+   - In clustered mode, when `replicate_topic_op_sync(Create)` returns an error, the local optimistic topic create is still rolled back.
+   - Immediately after rollback, the node replays committed topic operations from the Raft log (`reemit_committed_topic_ops`) to repair false-negative rollback cases where the create committed during leadership churn but quorum observation raced.
+   - This preserves leader-authoritative semantics while restoring deterministic local metadata convergence.
+
+2. **Fetch-side transient handling in clustered mode**
+   - If a fetch request targets a topic whose metadata is temporarily missing on a node in cluster mode, the server returns `CATCHING_UP` instead of hard `Topic not found`.
+   - This aligns fetch behavior with replication convergence semantics and avoids escalating short-lived metadata lag into terminal client errors.
+
+These changes are consistency-first and do not alter standalone mode behavior.
+## M3 Single-Topic Hotspot Mitigation (Connection-Scoped Routing)
+
+### Summary
+To reduce single-topic ingest concentration on one ingestion actor, actor routing now uses a mixed key:
+
+- `topic_id`
+- a stable **connection-scoped routing key**
+
+This preserves per-connection ordering while allowing many concurrent producers on the same topic to spread across actors.
+
+### Routing Rule
+`actor_id = hash(topic_id, routing_key) % actor_count`
+
+The routing key is assigned once per connection and attached to each `IngestionRequest`.
+
+### Replication/Follower Handling
+Because hot-topic sharding can produce multiple active segment streams per topic, follower enriched replication writer caches are keyed by:
+
+- `(topic_id, segment_name)`
+
+instead of only `topic_id`. This prevents writer-state collisions when applying leader-dictated segment streams.
+
+### Operational Note
+This change improves ingest parallelism under single-topic load, but consistency/visibility under election churn is still governed by Raft commit/apply convergence and topic-metadata replay logic. Stability validation remains required with repeated benchmark + chaos cycles.
+## Topic Create Convergence for Existing Local Names (Cluster Mode)
+
+### Problem
+Under election churn, a node can retain stale local topic-name mappings that are not fully converged through committed Raft topic operations. A naive local duplicate check (`topic already exists`) can then return unusable metadata to clients, causing later `Unknown topic` errors on ingest/fetch after leader changes.
+
+### Change
+For clustered `CreateTopic` and `CreateTopicWithRetention`:
+
+- if the topic name already exists locally, the server now attempts **replicated idempotent convergence** using `TopicOperation::Create` with the existing `(topic_id, name, created_at)` instead of returning a fast local duplicate error;
+- success path materializes/reconciles local metadata with `create_topic_with_id`; retention is re-applied where relevant.
+
+### Intent
+This converts local duplicate detection into a convergence operation so topic creation semantics remain cluster-authoritative and reduces stale-name-induced integrity failures (`Unknown topic` after apparent successful setup).
+## Higher-Term Response Demotion and Heartbeat Response Draining
+
+### Problem
+The leader heartbeat path previously fire-and-forgot `AppendEntries` RPCs and did not react to follower responses carrying a higher term. That can prolong stale leadership windows during churn and amplify metadata inconsistency symptoms (including `Unknown topic` bursts).
+
+### Change
+- Heartbeat RPCs are now drained in-process (JoinSet) rather than detached fire-and-forget tasks.
+- Any observed higher-term `AppendEntriesResponse` now triggers immediate Raft demotion (`observe_remote_term`) and emits `LostLeadership`.
+- The same higher-term guard is applied in synchronous topic-op and enriched data replication response loops to fail fast on stale leaders.
+
+### Safety/Intent
+This aligns response handling with Raft term monotonicity expectations: once a higher term is observed, the sender must stop acting as leader immediately. The expected effect is reduced stale-leader write windows and tighter control-plane convergence under chaos churn.
+## Integrity Model Shift: Topic Identity Epoch (Planned/Active)
+
+### Decision
+Given persistent chaos-time `Unknown topic` storms after leader demotion and metadata replay hardening, we are beginning a model-level change: **topic identity epoching**.
+
+### Goal
+Introduce an epoch/generation for topic identity so stale topic-id usage can be deterministically detected and rejected, forcing metadata refresh instead of ambiguous `Unknown topic` failure loops.
+
+### Phase 1 Scope (starting now)
+- Track epoch in server-side topic metadata.
+- Surface epoch in topic metadata responses.
+- Prepare stale-id rejection hooks in ingest/read command paths.
+
+### Expected Follow-up
+Phase 2 will wire epoch into client/server request validation paths so stale producer/consumer handles can self-heal via topic refresh under election churn.
+## Topic Identity Epoch Phase 1 Implementation Status
+
+### Current wiring
+- `TopicRegistry` now exposes `validate_topic_identity(topic_id, expected_epoch)` with typed outcomes:
+  - `UnknownTopic`
+  - `StaleEpoch { expected, actual }`
+- In **ingest** command handling, topic existence checks are routed through `validate_topic_identity(..., None)`.
+- In **fetch/read** command handling, topic existence checks are routed through `validate_topic_identity(..., None)`.
+
+### Why this matters
+This completes the Phase-1 "hook preparation" requirement without changing wire compatibility yet:
+- server metadata still carries `topic_epoch`
+- topic responses still surface `topic_epoch`
+- request-path call sites are now ready for Phase-2 strict stale-epoch rejection once epoch is carried in request metadata.
+
+### Behavior impact (phase 1)
+- No protocol break.
+- No mandatory client changes.
+- Existing unknown-topic convergence behavior remains unchanged (`CATCHING_UP`/retryable forwarding semantics in cluster mode).
+## Leader Readiness Gate (Elected vs Authoritative)
+
+### Problem
+Raft election victory alone (`state == Leader`) does not guarantee this node has applied all committed entries into the local state machine yet. During this warm-up window, serving authoritative metadata/write paths can surface transient `Unknown topic` gaps.
+
+### Change
+A readiness gate now separates:
+- **Elected leader** (`RaftState::Leader`)
+- **Authoritative leader** (`Leader && last_applied >= commit_index`)
+
+Implementation highlights:
+- `ClusterCoordinator::is_leader_authoritative()` now requires both elected-leader status and readiness.
+- Readiness is recomputed from commit/apply convergence in the coordination loop and commit-notify path.
+- On election win, node starts as **not ready**, replicates No-Op, and transitions to ready only after apply lag reaches zero.
+- Write/control request paths return retryable `FORWARD_FAILED: Leader not ready (apply/metadata catch-up)` while elected-but-not-ready.
+
+### Metrics added
+- `lance_cluster_leader_ready` (gauge)
+- `lance_cluster_leader_ready_transition_ms` (gauge)
+- `lance_cluster_elected_not_ready_rejects_total` (counter)
+- `lance_cluster_apply_lag_entries` (gauge)
+- `lance_cluster_apply_lag_at_election` (gauge)
+
+### Intent
+This prevents newly elected leaders from becoming authoritative before their local state machine is converged, reducing churn-time metadata gaps and `Unknown topic` bursts without changing Raft vote wire semantics.
+## Client-Owned Topic Convergence for Validation Tools
+
+Bench/chaos topic setup now relies on `lnc-client` convergence behavior rather than embedding create/list retry loops in application code.
+
+### Client API
+- `LanceClient::ensure_topic(name, max_attempts, base_backoff_ms)`
+- `LanceClient::ensure_topic_default(name)`
+
+Behavior:
+1. Attempt `create_topic`.
+2. Fallback to `list_topics` lookup by name.
+3. Apply attempt-based backoff.
+4. Reconnect between attempts to improve leader convergence across elections/readiness transitions.
+
+### Intent
+Keep benchmark/chaos apps intentionally thin/dumb while centralizing transient control-plane handling (leader churn, forwarding, readiness windows) inside the client library.
+## Coordinator Stability Telemetry and Readiness Separation
+
+Added control-plane stability telemetry to support leader-tenure analysis and election-storm diagnosis under no-load vs load:
+
+- New Raft tenure/election metrics:
+  - `lance_raft_leader_tenure_ended_total`
+  - `lance_raft_leader_tenure_last_ms`
+  - `lance_raft_leader_tenure_avg_ms`
+  - `lance_raft_leader_tenure_ms` (histogram)
+  - `lance_raft_election_storms_total`
+  - `lance_raft_election_window_count`
+- New cluster control-plane readiness gauge:
+  - `lance_cluster_coordinator_ready`
+
+Coordinator behavior updates:
+- Election starts are tracked in a rolling window (30s) and flagged as storm when count crosses threshold.
+- Leadership loss now records completed tenure duration.
+- Coordinator readiness is emitted separately from data-plane readiness:
+  - follower: quorum-available
+  - leader: quorum-available AND leader-authoritative
+
+Health endpoint updates:
+- `/health/ready` now returns both `data_plane_ready` and `coordinator_ready`.
+- `/health` now includes both readiness dimensions and computes aggregate readiness from both.
+
+Intent: make coordinator instability visible independently from ingest/read pressure and provide measurable evidence for process-level control/data plane decoupling work.
+## Follower Catch-up Recovery Fix (AppendEntries prev_log_term)
+
+Root cause found in leader replication request construction for topic/data entries:
+
+- `prev_log_term` was populated from `current_term` instead of the actual previous entry term.
+- During/after leadership churn, followers at matching `prev_log_index` but different term correctly rejected AppendEntries per Raft log-matching, causing persistent heartbeat/data rejection loops and stalled catch-up.
+
+Fix applied:
+- Added `RaftNode::last_log_term()` accessor.
+- Updated both replication paths to set `prev_log_term = raft.last_log_term()` before advancing leader log:
+  - topic operation replication path
+  - enriched data replication path
+
+Outcome from validation:
+- Cassa build: pass
+- Cassa test (`./test.sh`): pass in latest run
+
+This change aligns AppendEntries metadata with Raft consistency requirements and prevents false divergence under term transitions.
+## Hot-Path Lock Removal in Async io_uring Backend
+
+To satisfy Engineering Standards §1 (No lock primitives on hot path crates), `lnc-io/src/uring.rs` was updated in the async backend path:
+
+- Replaced `Arc<Mutex<IoUring>>` with `Arc<RingAccess>`.
+- `RingAccess` uses `UnsafeCell<IoUring>` guarded by an `AtomicBool` admission gate (`compare_exchange` + `spin_loop`) to serialize mutable ring access without lock primitives.
+- Submission and completion harvesting now run through `RingAccess::with_ring(...)`.
+
+Behavioral intent remains unchanged:
+- submit path still pushes SQEs and conditionally wakes SQPOLL thread.
+- completion path still drains CQEs then resolves in-flight futures.
+
+Validation:
+- Local hot-path audit grep (`Mutex|RwLock` over `lnc-core`/`lnc-io`) now returns no matches.
+- Cassa build remains green after the change.
+## Hot-Path Dynamic Dispatch Removal for Async I/O Futures
+
+To satisfy Engineering Standards §1 (No Dynamic Dispatch on data plane), the async write completion contract in `lnc-io` was changed from a boxed trait-object future to a concrete future type.
+
+## Changes
+- `lnc-io/src/backend.rs`
+  - Replaced `type WriteFuture = Pin<Box<...>>` with concrete `WriteFuture` struct.
+  - `WriteFuture` now wraps a `tokio::sync::oneshot::Receiver<AsyncWriteResult>` and implements `Future` directly.
+  - Added constructors:
+    - `WriteFuture::from_receiver(...)`
+    - `WriteFuture::ready(...)` (for fast-path tests/mocks).
+
+- `lnc-io/src/uring.rs`
+  - Completion sender now transmits `AsyncWriteResult` directly.
+  - `submit_write` now returns `WriteFuture::from_receiver(rx)`.
+  - CQE processing translates kernel result codes into `Result<usize>` before send.
+
+- `lnc-io/src/fallback.rs`
+  - `submit_write` now schedules I/O work and resolves completion through oneshot.
+  - Returns concrete `WriteFuture` rather than boxed trait-object future.
+
+- `lnc-replication/src/ingestion.rs` tests
+  - Mock backend updated to use `WriteFuture::ready(...)`.
+
+## Outcome
+- Removes `dyn` usage from audited hot-path crates while keeping completion semantics unchanged.
+- Preserves batch ownership-return contract (`(LoanableBatch, Result<usize>)`) for pool recycling.
+
+## Control Plane vs Data Plane Architecture
+
+This section explains the fundamental architectural separation between control plane (Raft consensus) and data plane (independent replication) in LANCE, and how they interact to provide both high throughput and strong durability guarantees.
+
+### Core Principle
+
+LANCE employs a strict separation of concerns:
+
+- **Control Plane**: Uses Raft consensus for cluster metadata, leader election, and configuration changes. This is the "slow path" focused on consistency.
+- **Data Plane**: Uses independent replication for actual data writes, decoupled from Raft. This is the "fast path" focused on throughput.
+
+This separation allows the data plane to function behind load balancers and Kubernetes clusters without being blocked by Raft consensus operations.
+
+### Control Plane (Raft)
+
+**Responsibilities:**
+- Leader election and cluster membership
+- Topic metadata operations (CreateTopic, etc.)
+- Tracking the "latest offset" across the cluster via periodic reports
+- Determining which follower has the most up-to-date data for failover
+
+**Key Characteristics:**
+- Uses Raft log for consensus ( AppendEntries RPCs )
+- Does NOT carry actual data payloads (only metadata)
+- Followers report their max offset to the leader periodically (~50ms)
+- The "committed offset" is determined by Raft quorum (majority of nodes acknowledging)
+
+**Implementation Files:**
+- `lnc-replication/src/raft.rs` - Core Raft state machine
+- `lnc-replication/src/cluster.rs` - Cluster coordination via Raft
+
+### Data Plane (Independent Replication)
+
+**Responsibilities:**
+- Accepting and persisting actual data writes
+- Replicating data from leader to followers
+- Serving read requests from local storage
+- Managing catch-up during leadership changes
+
+**Key Characteristics:**
+- Completely separate from Raft connections
+- Leader writes locally, then replicates to followers
+- Followers ACK writes back to leader for client quorum
+- Can function independently (behind load balancers, etc.)
+- Uses its own network connections (not the Raft peer connections)
+
+**Implementation Files:**
+- `lance/src/server/connection.rs` - Client connection handling
+- `lnc-replication/src/quorum.rs` - Quorum tracking for data writes
+- `lance/src/server/mod.rs` - Data forwarder runtime
+
+### Write Flow (with Quorum)
+
+When a client sends a write request:
+
+1. **Receive**: If follower, forward to leader's data plane
+2. **Local Write**: Leader writes to local WAL + segment (immediate durability)
+3. **Quorum Registration**: Register write with `AsyncQuorumManager`
+4. **Replication**: Fire replication to all followers via data plane (concurrent)
+5. **Follower ACKs**: Followers receive data, write locally, ACK back to leader
+6. **Quorum Check**: Leader counts local write + follower ACKs
+7. **Client ACK**: Once quorum reached (e.g., 2/3 for 3-node cluster), ACK client
+8. **Background**: Control plane tracks offsets via periodic reports
+
+**Key Point**: The quorum wait happens in the data plane, NOT in Raft. The client ACK waits for data durability on a majority of nodes, not for Raft consensus.
+
+### Leadership Change & Catch-Up
+
+When leadership changes:
+
+1. New leader is elected via Raft (control plane)
+2. New leader queries Raft to find which node has the latest data offset
+3. New leader "subscribes" to that node's data plane to catch up
+4. Old leader continues serving reads/writes during catch-up
+5. Once caught up, new leader starts serving writes
+6. Old leader stops accepting writes, continues serving reads until drained
+
+**CATCHING_UP Protocol:**
+- During leadership transition, new leader returns `CATCHING_UP` to clients
+- Clients queue writes and retry until new leader is ready
+- This provides a graceful handoff without data loss
+
+### Why This Separation?
+
+**Without Separation (Raft for everything):**
+- Every write requires Raft consensus → high latency
+- Cannot work behind load balancers (requires direct peer connections)
+- Performance limited by Raft's synchronous nature
+
+**With Separation (LANCE model):**
+- Data plane achieves high throughput (no consensus blocking)
+- Works behind load balancers (data plane connections are independent)
+- Still provides strong durability (quorum waits for replication)
+- Control plane handles metadata consistency (Raft for cluster state)
+
+### Quorum Model
+
+**Client Write Quorum:**
+- For N nodes, requires (N/2 + 1) ACKs for client success
+- Leader's local write counts as 1 ACK
+- Follower ACKs are tracked via data plane responses
+- Quorum timeout prevents indefinite blocking (default: 5s)
+
+**Control Plane Quorum (Raft):**
+- Used for metadata operations (CreateTopic, etc.)
+- Requires majority of nodes for commit
+- Determines "committed offset" for cluster state
+
+**Interaction:**
+- Client quorum ensures data durability
+- Control plane quorum ensures cluster metadata consistency
+- They operate independently but complement each other
+
+### Implementation Notes
+
+**Data Plane Connections:**
+- Separate from Raft peer connections (`PeerManager` for Raft, different mechanism for data)
+- Currently the implementation uses the forwarder pattern in `lance/src/server/mod.rs`
+- Future: Dedicated data plane connections per follower
+
+**Quorum Tracking:**
+- `AsyncQuorumManager` tracks pending writes and ACKs
+- Leader records its own ACK immediately
+- Follower ACKs are recorded when replication succeeds
+- Client waits on `quorum_rx` channel for quorum result
+
+**Offset Tracking:**
+- Followers report max offset to control plane every ~50ms
+- Control plane determines which node has latest data
+- Used during failover to select catch-up source
+
+### Common Misunderstandings
+
+**Mistake 1: Using Raft connections for data replication**
+- WRONG: Using `PeerManager` connections to send data
+- CORRECT: Data plane uses separate connections/mechanism
+
+**Mistake 2: Blocking data plane on Raft consensus**
+- WRONG: Waiting for Raft commit before client ACK
+- CORRECT: Wait for data plane quorum (separate from Raft)
+
+**Mistake 3: Best-effort data replication**
+- WRONG: Fire-and-forget without ACKs
+- CORRECT: Wait for follower ACKs for quorum durability
+
+### Summary
+
+- **Control Plane (Raft)**: Cluster consensus, metadata, leadership elections
+- **Data Plane (Independent)**: High-throughput writes, quorum durability, client serving
+- **Separation**: Data plane does NOT use Raft connections or block on Raft
+- **Quorum**: Client ACKs wait for data plane quorum (2/3 nodes have data)
+- **Failover**: New leader catches up via data plane subscription to old leader
 ---
 
 [↑ Back to Top](#technical-design-project-lance) | [← Back to Docs Index](./README.md)

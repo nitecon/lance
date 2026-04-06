@@ -50,7 +50,7 @@
 //!     ).await?;
 //!     
 //!     loop {
-//!         if let Some(records) = consumer.poll().await? {
+//!         if let Some(records) = consumer.next_batch().await? {
 //!             // Process records
 //!             for chunk in records.data.chunks(256) {
 //!                 println!("Received {} bytes", chunk.len());
@@ -87,7 +87,7 @@
 //!     loop {
 //!         let topics: Vec<u32> = worker.assignments().to_vec();
 //!         for topic_id in topics {
-//!             if let Some(_records) = worker.poll(topic_id).await? {
+//!             if let Some(_records) = worker.next_batch(topic_id).await? {
 //!                 worker.commit(topic_id).await?;
 //!             }
 //!         }
@@ -140,7 +140,7 @@ pub use connection::{
 pub use consumer::{
     Consumer, ConsumerConfig, PollResult, SeekPosition, StreamingConsumer, StreamingConsumerConfig,
 };
-pub use error::{ClientError, parse_not_leader_error};
+pub use error::{ClientError, parse_not_leader_error, validate_topic_name};
 pub use grouped::{
     AssignmentStrategy, GroupConfig, GroupCoordinator, GroupedConsumer, WorkerConfig,
 };

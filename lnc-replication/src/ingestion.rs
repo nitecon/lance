@@ -85,7 +85,7 @@ impl IngestionHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lnc_core::DEFAULT_BATCH_SIZE;
+    use lnc_core::{LoanableBatch, DEFAULT_BATCH_SIZE};
 
     #[tokio::test]
     async fn test_ingestion_handler_creation() {

@@ -489,6 +489,7 @@ impl LogStore {
     ///
     /// **O(1) Segmented Architecture**: Deletes segments instead of rewriting.
     /// No IO spikes, no election timeouts.
+    #[track_caller]
     pub fn truncate_from(&mut self, from_index: u64) -> Result<()> {
         let first_index = self.first_index();
         if from_index < first_index {
@@ -505,6 +506,7 @@ impl LogStore {
             target: "lance::raft::log",
             from_index,
             new_last_index = self.last_index(),
+            caller = %std::panic::Location::caller(),
             "Truncated log via O(1) segment deletion"
         );
 

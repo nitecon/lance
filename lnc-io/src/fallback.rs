@@ -156,9 +156,9 @@ impl AsyncIoBackend for Pwritev2Backend {
     ) -> Result<WriteFuture> {
         // Clone the file handle (File is just a wrapper around an FD/Handle, cheap to clone)
         let file = self.file.try_clone().map_err(LanceError::Io)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
 
-        // Return a pinned boxed future that offloads blocking I/O
-        Ok(Box::pin(async move {
+        tokio::spawn(async move {
             // Offload the blocking I/O to Tokio's blocking thread pool
             let result = tokio::task::spawn_blocking(move || {
                 // --- BLOCKING CONTEXT START ---
@@ -219,17 +219,16 @@ impl AsyncIoBackend for Pwritev2Backend {
             .await;
 
             match result {
-                Ok((batch, io_result)) => {
-                    // Return batch with the I/O result
-                    (batch, io_result)
+                Ok((completed_batch, io_result)) => {
+                    let _ = tx.send((completed_batch, io_result));
                 },
                 Err(join_err) => {
-                    // Task panicked - we've lost the batch, this is a critical error
-                    // We can't return the batch, so we have to panic or create a dummy error
                     panic!("Blocking I/O task panicked: {}", join_err)
                 },
             }
-        }))
+        });
+
+        Ok(WriteFuture::from_receiver(rx))
     }
 }
 

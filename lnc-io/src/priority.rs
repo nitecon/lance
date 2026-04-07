@@ -67,7 +67,7 @@ impl IoPriority {
 
         match self {
             Self::Critical => IOPRIO_CLASS_RT << 13,
-            Self::High => (IOPRIO_CLASS_BE << 13) | 0,
+            Self::High => IOPRIO_CLASS_BE << 13,
             Self::Normal => (IOPRIO_CLASS_BE << 13) | 4,
             Self::Low | Self::Background => (IOPRIO_CLASS_IDLE << 13) | 7,
         }

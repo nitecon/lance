@@ -460,6 +460,7 @@ impl Segment {
 
         self.index.clear();
         let mut current_offset = 0u64;
+        let file_len = self.read_handle.metadata()?.len();
         let mut reader = BufReader::new(&self.read_handle);
 
         loop {
@@ -523,12 +524,26 @@ impl Segment {
                 header[7],
             ]);
 
+            // Detect torn payload/data CRC region before indexing this entry.
+            let entry_len = 29 + 4 + data_len + 4; // header + header_crc + data + data_crc
+            if current_offset + entry_len as u64 > file_len {
+                warn!(
+                    target: "lance::raft::segment",
+                    path = %self.path.display(),
+                    offset = current_offset,
+                    expected_entry_len = entry_len,
+                    file_len,
+                    "Torn write detected during data payload read - truncating segment"
+                );
+                self.truncate_at(current_offset)?;
+                break;
+            }
+
             // Skip data + data CRC (we don't need to validate data during index rebuild)
             let skip_len = data_len + 4; // data + data_crc
             reader.seek(SeekFrom::Current(skip_len as i64))?;
 
             // Add to index
-            let entry_len = 29 + 4 + data_len + 4; // header + header_crc + data + data_crc
             self.index.push(EntryIndex {
                 term,
                 offset: current_offset,
@@ -559,6 +574,9 @@ impl Segment {
         // Truncate the underlying file
         self.writer.get_ref().set_len(offset)?;
         self.writer.get_ref().sync_data()?;
+        // After truncation, reset the file cursor to the new EOF so subsequent
+        // appends continue from the truncated boundary instead of a stale offset.
+        self.writer.get_mut().seek(SeekFrom::Start(offset))?;
 
         self.file_size = offset;
 
@@ -1156,5 +1174,37 @@ mod tests {
         // Entry not found
         let result = manager.find_segment(500);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_build_index_truncates_partial_payload_entry() {
+        use crc32fast::Hasher;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("000001_1234567890.lnc");
+
+        // Build a single entry header that claims payload bytes, but omit payload+data_crc.
+        let mut header = [0u8; 29];
+        header[0..8].copy_from_slice(&1u64.to_le_bytes()); // term
+        header[8..16].copy_from_slice(&1u64.to_le_bytes()); // index
+        header[16..24].copy_from_slice(&0u64.to_le_bytes()); // hlc_raw
+        header[24] = 1; // entry type
+        header[25..29].copy_from_slice(&8u32.to_le_bytes()); // data_len (payload not present)
+
+        let mut hasher = Hasher::new();
+        hasher.update(&header);
+        let header_crc = hasher.finalize();
+
+        let mut torn_bytes = Vec::new();
+        torn_bytes.extend_from_slice(&header);
+        torn_bytes.extend_from_slice(&header_crc.to_le_bytes());
+        std::fs::write(&path, torn_bytes).unwrap();
+
+        let mut segment = Segment::open(path.clone()).unwrap();
+        segment.build_index().unwrap();
+
+        assert_eq!(segment.entry_count(), 0);
+        assert_eq!(segment.file_size, 0);
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
     }
 }

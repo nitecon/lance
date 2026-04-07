@@ -105,6 +105,20 @@ pub static RAFT_ELECTIONS_WON: AtomicU64 = AtomicU64::new(0);
 pub static RAFT_PRE_VOTES_REJECTED: AtomicU64 = AtomicU64::new(0);
 pub static RAFT_LEADER_STEPDOWNS: AtomicU64 = AtomicU64::new(0);
 pub static RAFT_FENCING_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+pub static RAFT_LEADER_TENURE_ENDED: AtomicU64 = AtomicU64::new(0);
+pub static RAFT_LEADER_TENURE_SUM_MS: AtomicU64 = AtomicU64::new(0);
+pub static RAFT_LEADER_TENURE_LAST_MS: AtomicU64 = AtomicU64::new(0);
+pub static RAFT_LEADER_TENURE_AVG_MS: AtomicU64 = AtomicU64::new(0);
+pub static RAFT_ELECTION_STORMS: AtomicU64 = AtomicU64::new(0);
+pub static RAFT_ELECTION_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static RAFT_ELECTION_ROUND_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+// Coordinator/election loop observability
+pub static CLUSTER_COORDINATOR_TICK_DRIFT_MS: AtomicU64 = AtomicU64::new(0);
+
+// Control-plane contention observability
+pub static CONTROL_RPC_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+pub static CONTROL_RPC_STARVATION: AtomicU64 = AtomicU64::new(0);
 
 // Consumer read path metrics (per Architecture §17.7)
 pub static READS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -119,6 +133,12 @@ pub static CLUSTER_NODE_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static CLUSTER_HEALTHY_NODES: AtomicU64 = AtomicU64::new(0);
 pub static CLUSTER_IS_LEADER: AtomicU64 = AtomicU64::new(0);
 pub static CLUSTER_QUORUM_AVAILABLE: AtomicU64 = AtomicU64::new(0);
+pub static CLUSTER_LEADER_READY: AtomicU64 = AtomicU64::new(0);
+pub static CLUSTER_LEADER_READY_TRANSITION_MS: AtomicU64 = AtomicU64::new(0);
+pub static CLUSTER_ELECTED_NOT_READY_REJECTS: AtomicU64 = AtomicU64::new(0);
+pub static CLUSTER_APPLY_LAG_ENTRIES: AtomicU64 = AtomicU64::new(0);
+pub static CLUSTER_APPLY_LAG_AT_ELECTION: AtomicU64 = AtomicU64::new(0);
+pub static CLUSTER_COORDINATOR_READY: AtomicU64 = AtomicU64::new(1);
 
 // Replication lag metrics (bytes behind leader, time since last sync)
 pub static REPLICATION_LAG_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -271,6 +291,48 @@ pub fn increment_raft_fencing_rejections() {
     RAFT_FENCING_REJECTIONS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record leader tenure end and update rolling gauges.
+#[inline]
+pub fn record_raft_leader_tenure_ms(ms: u64) {
+    RAFT_LEADER_TENURE_LAST_MS.store(ms, Ordering::Relaxed);
+    let ended = RAFT_LEADER_TENURE_ENDED.fetch_add(1, Ordering::Relaxed) + 1;
+    let sum = RAFT_LEADER_TENURE_SUM_MS.fetch_add(ms, Ordering::Relaxed) + ms;
+    let avg = if ended > 0 { sum / ended } else { 0 };
+    RAFT_LEADER_TENURE_AVG_MS.store(avg, Ordering::Relaxed);
+    metrics::histogram!("lance_raft_leader_tenure_ms").record(ms as f64);
+}
+
+/// Increment election storm detector counter.
+#[inline]
+pub fn increment_raft_election_storms() {
+    RAFT_ELECTION_STORMS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Set count of elections observed in current storm window.
+#[inline]
+pub fn set_raft_election_window_count(count: u64) {
+    RAFT_ELECTION_WINDOW_COUNT.store(count, Ordering::Relaxed);
+}
+
+/// Record election round wall-clock duration and publish histogram sample.
+#[inline]
+pub fn record_raft_election_round_ms(ms: u64) {
+    RAFT_ELECTION_ROUND_LAST_MS.store(ms, Ordering::Relaxed);
+    metrics::histogram!("lance_raft_election_round_ms").record(ms as f64);
+}
+
+/// Record a pre-vote RPC round-trip latency sample.
+#[inline]
+pub fn record_raft_pre_vote_rpc_latency_ms(ms: u64) {
+    metrics::histogram!("lance_raft_pre_vote_rpc_latency_ms").record(ms as f64);
+}
+
+/// Record a vote RPC round-trip latency sample.
+#[inline]
+pub fn record_raft_vote_rpc_latency_ms(ms: u64) {
+    metrics::histogram!("lance_raft_vote_rpc_latency_ms").record(ms as f64);
+}
+
 // Consumer read path functions
 
 /// Increment total read operations counter.
@@ -335,6 +397,54 @@ pub fn set_cluster_quorum_available(available: bool) {
     CLUSTER_QUORUM_AVAILABLE.store(if available { 1 } else { 0 }, Ordering::Relaxed);
 }
 
+/// Set whether this node is leader-ready (1 = yes, 0 = no).
+#[inline]
+pub fn set_cluster_leader_ready(ready: bool) {
+    CLUSTER_LEADER_READY.store(if ready { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// Set elapsed milliseconds from election win to ready-authoritative transition.
+#[inline]
+pub fn set_cluster_leader_ready_transition_ms(ms: u64) {
+    CLUSTER_LEADER_READY_TRANSITION_MS.store(ms, Ordering::Relaxed);
+}
+
+/// Increment counter for requests rejected while leader was elected but not ready.
+#[inline]
+pub fn increment_cluster_elected_not_ready_rejects() {
+    CLUSTER_ELECTED_NOT_READY_REJECTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Set current commit/apply lag (entries).
+#[inline]
+pub fn set_cluster_apply_lag_entries(entries: u64) {
+    CLUSTER_APPLY_LAG_ENTRIES.store(entries, Ordering::Relaxed);
+}
+
+/// Set apply lag captured at/after election while readiness is pending.
+#[inline]
+pub fn set_cluster_apply_lag_at_election(entries: u64) {
+    CLUSTER_APPLY_LAG_AT_ELECTION.store(entries, Ordering::Relaxed);
+}
+
+/// Set whether coordinator control-plane is healthy/readiness-eligible.
+#[inline]
+pub fn set_cluster_coordinator_ready(ready: bool) {
+    CLUSTER_COORDINATOR_READY.store(if ready { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// Set coordinator loop tick drift in milliseconds.
+#[inline]
+pub fn set_cluster_coordinator_tick_drift_ms(ms: u64) {
+    CLUSTER_COORDINATOR_TICK_DRIFT_MS.store(ms, Ordering::Relaxed);
+}
+
+/// Read current coordinator readiness as bool.
+#[inline]
+pub fn cluster_coordinator_ready() -> bool {
+    CLUSTER_COORDINATOR_READY.load(Ordering::Relaxed) == 1
+}
+
 // Replication lag metric functions
 
 /// Set the replication lag in bytes (how far behind the leader).
@@ -365,6 +475,24 @@ pub fn increment_replication_pending_ops() {
 #[inline]
 pub fn decrement_replication_pending_ops() {
     REPLICATION_PENDING_OPS.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Increment in-flight control RPCs.
+#[inline]
+pub fn increment_control_rpc_in_flight() {
+    CONTROL_RPC_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Decrement in-flight control RPCs.
+#[inline]
+pub fn decrement_control_rpc_in_flight() {
+    CONTROL_RPC_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Increment control RPC starvation/contention counter.
+#[inline]
+pub fn increment_control_rpc_starvation() {
+    CONTROL_RPC_STARVATION.fetch_add(1, Ordering::Relaxed);
 }
 
 // Resync protocol metric functions (§18.8)
@@ -426,6 +554,12 @@ pub struct MetricsSnapshot {
     pub raft_pre_votes_rejected: u64,
     pub raft_leader_stepdowns: u64,
     pub raft_fencing_rejections: u64,
+    pub raft_leader_tenure_ended: u64,
+    pub raft_leader_tenure_last_ms: u64,
+    pub raft_leader_tenure_avg_ms: u64,
+    pub raft_election_storms: u64,
+    pub raft_election_window_count: u64,
+    pub raft_election_round_last_ms: u64,
     // Consumer read path metrics
     pub reads_total: u64,
     pub read_bytes_total: u64,
@@ -438,6 +572,16 @@ pub struct MetricsSnapshot {
     pub cluster_healthy_nodes: u64,
     pub cluster_is_leader: u64,
     pub cluster_quorum_available: u64,
+    pub cluster_leader_ready: u64,
+    pub cluster_leader_ready_transition_ms: u64,
+    pub cluster_elected_not_ready_rejects: u64,
+    pub cluster_apply_lag_entries: u64,
+    pub cluster_apply_lag_at_election: u64,
+    pub cluster_coordinator_ready: u64,
+    pub cluster_coordinator_tick_drift_ms: u64,
+    // Control-plane contention metrics
+    pub control_rpc_in_flight: u64,
+    pub control_rpc_starvation: u64,
     // Replication lag metrics
     pub replication_lag_bytes: u64,
     pub replication_last_sync_ms: u64,
@@ -480,6 +624,12 @@ impl MetricsSnapshot {
             raft_pre_votes_rejected: RAFT_PRE_VOTES_REJECTED.load(Ordering::Relaxed),
             raft_leader_stepdowns: RAFT_LEADER_STEPDOWNS.load(Ordering::Relaxed),
             raft_fencing_rejections: RAFT_FENCING_REJECTIONS.load(Ordering::Relaxed),
+            raft_leader_tenure_ended: RAFT_LEADER_TENURE_ENDED.load(Ordering::Relaxed),
+            raft_leader_tenure_last_ms: RAFT_LEADER_TENURE_LAST_MS.load(Ordering::Relaxed),
+            raft_leader_tenure_avg_ms: RAFT_LEADER_TENURE_AVG_MS.load(Ordering::Relaxed),
+            raft_election_storms: RAFT_ELECTION_STORMS.load(Ordering::Relaxed),
+            raft_election_window_count: RAFT_ELECTION_WINDOW_COUNT.load(Ordering::Relaxed),
+            raft_election_round_last_ms: RAFT_ELECTION_ROUND_LAST_MS.load(Ordering::Relaxed),
             // Consumer read path metrics
             reads_total: READS_TOTAL.load(Ordering::Relaxed),
             read_bytes_total: READ_BYTES_TOTAL.load(Ordering::Relaxed),
@@ -492,6 +642,19 @@ impl MetricsSnapshot {
             cluster_healthy_nodes: CLUSTER_HEALTHY_NODES.load(Ordering::Relaxed),
             cluster_is_leader: CLUSTER_IS_LEADER.load(Ordering::Relaxed),
             cluster_quorum_available: CLUSTER_QUORUM_AVAILABLE.load(Ordering::Relaxed),
+            cluster_leader_ready: CLUSTER_LEADER_READY.load(Ordering::Relaxed),
+            cluster_leader_ready_transition_ms: CLUSTER_LEADER_READY_TRANSITION_MS
+                .load(Ordering::Relaxed),
+            cluster_elected_not_ready_rejects: CLUSTER_ELECTED_NOT_READY_REJECTS
+                .load(Ordering::Relaxed),
+            cluster_apply_lag_entries: CLUSTER_APPLY_LAG_ENTRIES.load(Ordering::Relaxed),
+            cluster_apply_lag_at_election: CLUSTER_APPLY_LAG_AT_ELECTION.load(Ordering::Relaxed),
+            cluster_coordinator_ready: CLUSTER_COORDINATOR_READY.load(Ordering::Relaxed),
+            cluster_coordinator_tick_drift_ms: CLUSTER_COORDINATOR_TICK_DRIFT_MS
+                .load(Ordering::Relaxed),
+            // Control-plane contention metrics
+            control_rpc_in_flight: CONTROL_RPC_IN_FLIGHT.load(Ordering::Relaxed),
+            control_rpc_starvation: CONTROL_RPC_STARVATION.load(Ordering::Relaxed),
             // Replication lag metrics
             replication_lag_bytes: REPLICATION_LAG_BYTES.load(Ordering::Relaxed),
             replication_last_sync_ms: REPLICATION_LAST_SYNC_MS.load(Ordering::Relaxed),
@@ -594,6 +757,46 @@ pub fn init_prometheus_exporter(
         "lance_raft_fencing_rejections_total",
         "Raft fencing token rejections"
     );
+    metrics::describe_counter!(
+        "lance_raft_leader_tenure_ended_total",
+        "Count of completed leader tenures"
+    );
+    metrics::describe_gauge!(
+        "lance_raft_leader_tenure_last_ms",
+        "Most recent completed leader tenure duration in milliseconds"
+    );
+    metrics::describe_gauge!(
+        "lance_raft_leader_tenure_avg_ms",
+        "Rolling average completed leader tenure in milliseconds"
+    );
+    metrics::describe_counter!(
+        "lance_raft_election_storms_total",
+        "Election-storm windows detected"
+    );
+    metrics::describe_gauge!(
+        "lance_raft_election_window_count",
+        "Elections observed in the active storm window"
+    );
+    metrics::describe_gauge!(
+        "lance_raft_election_round_last_ms",
+        "Most recent election round duration in milliseconds"
+    );
+    metrics::describe_histogram!(
+        "lance_raft_leader_tenure_ms",
+        "Histogram of completed leader tenure durations (milliseconds)"
+    );
+    metrics::describe_histogram!(
+        "lance_raft_election_round_ms",
+        "Histogram of election round durations (milliseconds)"
+    );
+    metrics::describe_histogram!(
+        "lance_raft_pre_vote_rpc_latency_ms",
+        "Histogram of pre-vote RPC round-trip latency (milliseconds)"
+    );
+    metrics::describe_histogram!(
+        "lance_raft_vote_rpc_latency_ms",
+        "Histogram of vote RPC round-trip latency (milliseconds)"
+    );
 
     // Consumer read path metrics
     metrics::describe_counter!("lance_reads_total", "Total read operations");
@@ -619,6 +822,43 @@ pub fn init_prometheus_exporter(
     metrics::describe_gauge!(
         "lance_cluster_quorum_available",
         "Whether quorum is available (1=yes, 0=no)"
+    );
+    metrics::describe_gauge!(
+        "lance_cluster_leader_ready",
+        "Whether this node is elected leader and apply-caught-up (1=yes, 0=no)"
+    );
+    metrics::describe_gauge!(
+        "lance_cluster_leader_ready_transition_ms",
+        "Milliseconds from election win to leader-ready transition"
+    );
+    metrics::describe_counter!(
+        "lance_cluster_elected_not_ready_rejects_total",
+        "Requests rejected while node was leader but not yet ready"
+    );
+    metrics::describe_gauge!(
+        "lance_cluster_apply_lag_entries",
+        "Current commit_index - last_applied lag in entries"
+    );
+    metrics::describe_gauge!(
+        "lance_cluster_apply_lag_at_election",
+        "Apply lag sampled during leader readiness warm-up"
+    );
+    metrics::describe_gauge!(
+        "lance_cluster_coordinator_ready",
+        "Whether coordinator control-plane is healthy/readiness-eligible (1=yes, 0=no)"
+    );
+    metrics::describe_gauge!(
+        "lance_cluster_coordinator_tick_drift_ms",
+        "Coordinator election-check tick drift in milliseconds"
+    );
+
+    metrics::describe_gauge!(
+        "lance_control_rpc_in_flight",
+        "Current in-flight control-plane RPC count"
+    );
+    metrics::describe_counter!(
+        "lance_control_rpc_starvation_total",
+        "Control-plane RPC lock-contention/starvation events"
     );
 
     // Replication lag metrics
@@ -740,6 +980,17 @@ pub fn export_to_prometheus() {
     metrics::counter!("lance_raft_leader_stepdowns_total").absolute(snapshot.raft_leader_stepdowns);
     metrics::counter!("lance_raft_fencing_rejections_total")
         .absolute(snapshot.raft_fencing_rejections);
+    metrics::counter!("lance_raft_leader_tenure_ended_total")
+        .absolute(snapshot.raft_leader_tenure_ended);
+    metrics::gauge!("lance_raft_leader_tenure_last_ms")
+        .set(snapshot.raft_leader_tenure_last_ms as f64);
+    metrics::gauge!("lance_raft_leader_tenure_avg_ms")
+        .set(snapshot.raft_leader_tenure_avg_ms as f64);
+    metrics::counter!("lance_raft_election_storms_total").absolute(snapshot.raft_election_storms);
+    metrics::gauge!("lance_raft_election_window_count")
+        .set(snapshot.raft_election_window_count as f64);
+    metrics::gauge!("lance_raft_election_round_last_ms")
+        .set(snapshot.raft_election_round_last_ms as f64);
 
     // Consumer read path metrics
     metrics::counter!("lance_reads_total").absolute(snapshot.reads_total);
@@ -754,6 +1005,23 @@ pub fn export_to_prometheus() {
     metrics::gauge!("lance_cluster_healthy_nodes").set(snapshot.cluster_healthy_nodes as f64);
     metrics::gauge!("lance_cluster_is_leader").set(snapshot.cluster_is_leader as f64);
     metrics::gauge!("lance_cluster_quorum_available").set(snapshot.cluster_quorum_available as f64);
+    metrics::gauge!("lance_cluster_leader_ready").set(snapshot.cluster_leader_ready as f64);
+    metrics::gauge!("lance_cluster_leader_ready_transition_ms")
+        .set(snapshot.cluster_leader_ready_transition_ms as f64);
+    metrics::counter!("lance_cluster_elected_not_ready_rejects_total")
+        .absolute(snapshot.cluster_elected_not_ready_rejects);
+    metrics::gauge!("lance_cluster_apply_lag_entries")
+        .set(snapshot.cluster_apply_lag_entries as f64);
+    metrics::gauge!("lance_cluster_apply_lag_at_election")
+        .set(snapshot.cluster_apply_lag_at_election as f64);
+    metrics::gauge!("lance_cluster_coordinator_ready")
+        .set(snapshot.cluster_coordinator_ready as f64);
+    metrics::gauge!("lance_cluster_coordinator_tick_drift_ms")
+        .set(snapshot.cluster_coordinator_tick_drift_ms as f64);
+
+    metrics::gauge!("lance_control_rpc_in_flight").set(snapshot.control_rpc_in_flight as f64);
+    metrics::counter!("lance_control_rpc_starvation_total")
+        .absolute(snapshot.control_rpc_starvation);
 
     // Replication lag metrics
     metrics::gauge!("lance_replication_lag_bytes").set(snapshot.replication_lag_bytes as f64);

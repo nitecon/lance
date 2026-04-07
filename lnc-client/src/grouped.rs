@@ -58,7 +58,7 @@
 //!         // Copy assignments to avoid borrow issues
 //!         let topics: Vec<u32> = worker.assignments().to_vec();
 //!         for topic_id in topics {
-//!             if let Some(_records) = worker.poll(topic_id).await? {
+//!             if let Some(_records) = worker.next_batch(topic_id).await? {
 //!                 // Process records
 //!                 worker.commit(topic_id).await?;
 //!             }
@@ -863,16 +863,28 @@ impl GroupedConsumer {
         self.generation
     }
 
-    /// Poll a specific assigned topic
-    pub async fn poll(&mut self, topic_id: u32) -> Result<Option<PollResult>> {
+    /// Receive the next batch for a specific assigned topic.
+    pub async fn next_batch(&mut self, topic_id: u32) -> Result<Option<PollResult>> {
         if let Some(consumer) = self.consumers.get_mut(&topic_id) {
-            consumer.poll().await
+            consumer.next_batch().await
         } else {
             Err(ClientError::InvalidResponse(format!(
                 "Topic {} not assigned to this worker",
                 topic_id
             )))
         }
+    }
+
+    /// Primary consume interface alias for a specific assigned topic.
+    #[inline]
+    pub async fn consume(&mut self, topic_id: u32) -> Result<Option<PollResult>> {
+        self.next_batch(topic_id).await
+    }
+
+    /// Compatibility wrapper for callers still using polling terminology.
+    #[inline]
+    pub async fn poll(&mut self, topic_id: u32) -> Result<Option<PollResult>> {
+        self.next_batch(topic_id).await
     }
 
     /// Commit offset for a specific topic

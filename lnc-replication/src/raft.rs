@@ -1,7 +1,35 @@
-//! Raft consensus protocol implementation with safety enhancements.
+//! Raft consensus protocol implementation with safety enhancements (CONTROL PLANE).
 //!
-//! This module implements the core Raft state machine with the following
-//! enhancements beyond the basic protocol:
+//! This module is part of the CONTROL PLANE, not the data plane.
+//! It implements the core Raft state machine for leader election, cluster
+//! membership, and metadata consensus. It does NOT handle actual data replication.
+//!
+//! # Architecture Note: Control Plane vs Data Plane
+//!
+//! LANCE separates control plane (Raft) from data plane (independent replication):
+//!
+//! - **Control Plane (this module)**: Uses Raft consensus for leader election,
+//!   cluster membership, and topic metadata. This is the "slow path" focused on
+//!   consistency. Raft log entries carry metadata only, NOT actual data payloads.
+//!
+//! - **Data Plane**: Uses independent replication for actual data writes.
+//!   Data plane replication is completely separate from Raft. The data plane
+//!   can function behind load balancers and does not block on Raft consensus.
+//!
+//! # Key Point
+//!
+//! Raft determines WHO is the leader, but data plane replication (not Raft)
+//! handles HOW data is replicated. Followers report their max offset to the
+//! control plane periodically (~50ms) so control plane knows which node has
+//! the latest data for failover decisions.
+//!
+//! For data plane implementation, see `lance/src/server/mod.rs` and
+//! `lnc-replication/src/quorum.rs`.
+//!
+//! See `docs/Architecture.md` section "Control Plane vs Data Plane Architecture"
+//! for detailed explanation.
+//!
+//! # Safety Enhancements
 //!
 //! - **Pre-Vote**: Prevents disruption from partitioned nodes rejoining
 //! - **Fencing tokens**: Revokes write authority from deposed leaders
@@ -216,6 +244,17 @@ impl RaftNode {
         self.current_term
     }
 
+    /// Observe a remote term discovered via RPC response handling.
+    ///
+    /// Returns `true` when this node had to step down to follower.
+    pub fn observe_remote_term(&mut self, remote_term: u64) -> bool {
+        if remote_term > self.current_term {
+            self.become_follower(remote_term);
+            return true;
+        }
+        false
+    }
+
     /// Get the current leader ID (if known).
     #[inline]
     #[must_use]
@@ -250,6 +289,13 @@ impl RaftNode {
         self.last_log_index
     }
 
+    /// Get the last log term.
+    #[inline]
+    #[must_use]
+    pub const fn last_log_term(&self) -> u64 {
+        self.last_log_term
+    }
+
     /// Get the last applied index.
     #[inline]
     #[must_use]
@@ -275,6 +321,22 @@ impl RaftNode {
     pub fn advance_log(&mut self, entry_count: u64) {
         self.last_log_index += entry_count;
         self.last_log_term = self.current_term;
+    }
+
+    /// Roll back follower log pointers if append durability fails after an
+    /// optimistic `handle_append_entries` accept path.
+    ///
+    /// This preserves RaftNode/log-store consistency by restoring in-memory
+    /// cursors to their pre-append values.
+    pub fn rollback_failed_append(
+        &mut self,
+        last_log_index: u64,
+        last_log_term: u64,
+        commit_index: u64,
+    ) {
+        self.last_log_index = last_log_index;
+        self.last_log_term = last_log_term;
+        self.commit_index = commit_index.min(last_log_index);
     }
 
     // =========================================================================
@@ -484,6 +546,16 @@ impl RaftNode {
         false
     }
 
+    /// Revert a candidate back to follower after a failed/aborted election round.
+    ///
+    /// This allows the coordinator to restart from a clean pre-vote state on the
+    /// next election timeout instead of staying in candidate mode indefinitely.
+    pub fn revert_candidate_after_failed_election(&mut self) {
+        if self.state == RaftState::Candidate {
+            self.become_follower(self.current_term);
+        }
+    }
+
     // =========================================================================
     // AppendEntries (Heartbeat + Log Replication)
     // =========================================================================
@@ -526,13 +598,40 @@ impl RaftNode {
             };
         }
 
-        // Valid leader heartbeat - reset election timeout
+        // Term-valid AppendEntries (heartbeat or replication) confirms leader liveness.
+        // Reset election timeout before log-matching checks so followers don't start
+        // elections while the leader is actively backtracking next_index.
         self.last_leader_contact = Instant::now();
         self.leader_id = Some(req.leader_id);
 
         // If we were candidate, step down
         if self.state == RaftState::Candidate {
             self.state = RaftState::Follower;
+        }
+
+        if req.prev_log_index > self.last_log_index {
+            return AppendEntriesResponse {
+                term: self.current_term,
+                success: false,
+                match_index: self.last_log_index,
+                follower_hlc: self.hlc.now(),
+                follower_id: self.node_id,
+            };
+        }
+
+        if let Some(first_entry) = req.entries.first() {
+            // Reject out-of-order appends that do not start immediately after prev_log_index.
+            // This prevents accepting index gaps when concurrent replication RPCs arrive
+            // out-of-order on followers.
+            if first_entry.index != req.prev_log_index + 1 {
+                return AppendEntriesResponse {
+                    term: self.current_term,
+                    success: false,
+                    match_index: self.last_log_index,
+                    follower_hlc: self.hlc.now(),
+                    follower_id: self.node_id,
+                };
+            }
         }
 
         // Advance log index based on the actual entries received.
@@ -542,9 +641,8 @@ impl RaftNode {
         // permanently stuck at 1. This caused the leader to believe followers were behind,
         // triggering infinite retries and memory leaks in AsyncQuorumManager.
         //
-        // The LogStore has already persisted these entries, so the in-memory state must
-        // reflect reality. Elections (§5.4.1) require accurate log indices to pick the
-        // follower with the most up-to-date log.
+        // Elections (§5.4.1) require accurate log indices to pick the follower
+        // with the most up-to-date log.
         if let Some(last_entry) = req.entries.last() {
             self.last_log_index = last_entry.index;
             self.last_log_term = last_entry.term;
@@ -905,6 +1003,9 @@ impl RaftNode {
 
         // Update the peer's match_index
         self.match_index.insert(peer_id, match_index);
+        // Successful replication means next probe can start after the acknowledged index.
+        self.next_index
+            .insert(peer_id, match_index.saturating_add(1));
 
         // Advance commit_index if a majority of peers have replicated up to some index N
         // Raft §5.3: Only commit entries from current term
@@ -933,6 +1034,42 @@ impl RaftNode {
         } else {
             None
         }
+    }
+
+    /// Return the leader-side replication cursor for a peer.
+    ///
+    /// If no cursor exists yet, default to `last_log_index + 1` per Raft §5.3.
+    pub fn next_index_for_peer(&self, peer_id: u16) -> Option<u64> {
+        if self.state != RaftState::Leader {
+            return None;
+        }
+
+        Some(
+            self.next_index
+                .get(&peer_id)
+                .copied()
+                .unwrap_or(self.last_log_index.saturating_add(1)),
+        )
+    }
+
+    /// Back off the peer replication cursor after a rejection.
+    ///
+    /// Followers report their local `match_index` on failure. We clamp to that
+    /// hint and never increase the cursor here.
+    pub fn backoff_next_index(&mut self, peer_id: u16, follower_match_index: u64) -> Option<u64> {
+        if self.state != RaftState::Leader {
+            return None;
+        }
+
+        let current = self
+            .next_index
+            .get(&peer_id)
+            .copied()
+            .unwrap_or(self.last_log_index.saturating_add(1));
+        let suggested = follower_match_index.saturating_add(1).max(1);
+        let new_next = current.min(suggested);
+        self.next_index.insert(peer_id, new_next);
+        Some(new_next)
     }
 
     /// Get the current commit index.
@@ -1062,6 +1199,23 @@ mod tests {
         assert_eq!(node.state, RaftState::Follower);
         assert_eq!(node.current_term, 2);
         assert!(node.fencing_token.is_none()); // Fencing token revoked
+    }
+
+    #[test]
+    fn test_observe_remote_term_steps_down_leader() {
+        let config = test_config();
+        let mut node = RaftNode::new(1, config, RaftConfig::default());
+
+        node.current_term = 3;
+        node.state = RaftState::Leader;
+        node.fencing_token = Some(FencingToken::new(3, 1));
+
+        let stepped_down = node.observe_remote_term(4);
+
+        assert!(stepped_down);
+        assert_eq!(node.state, RaftState::Follower);
+        assert_eq!(node.current_term, 4);
+        assert!(node.fencing_token.is_none());
     }
 
     #[test]

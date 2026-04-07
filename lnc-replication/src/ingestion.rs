@@ -83,9 +83,10 @@ impl IngestionHandler {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use lnc_core::{LoanableBatch, DEFAULT_BATCH_SIZE};
+    use lnc_core::{DEFAULT_BATCH_SIZE, LoanableBatch};
 
     #[tokio::test]
     async fn test_ingestion_handler_creation() {
@@ -108,7 +109,7 @@ mod tests {
             _priority: IoPriority,
         ) -> Result<lnc_io::WriteFuture> {
             let len = batch.len();
-            Ok(Box::pin(async move { (batch, Ok(len)) }))
+            Ok(lnc_io::WriteFuture::ready((batch, Ok(len))))
         }
     }
 }

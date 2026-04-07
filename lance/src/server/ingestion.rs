@@ -7,13 +7,44 @@ use bytes::Bytes;
 use lnc_core::{LanceError, Result, SortKey};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQUENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+fn payload_matches_existing_segment(
+    writer: &lnc_io::SegmentWriter,
+    offset: u64,
+    payload: &[u8],
+) -> Result<bool> {
+    if payload.is_empty() {
+        return Ok(true);
+    }
+
+    let mut file = std::fs::File::open(writer.path())?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut existing = vec![0u8; payload.len()];
+    if let Err(e) = file.read_exact(&mut existing) {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Ok(false);
+        }
+        return Err(e.into());
+    }
+    Ok(existing == payload)
+}
+
 /// Request to ingest data into a topic
+#[allow(dead_code)]
 pub struct IngestionRequest {
     pub topic_id: u32,
+    /// Connection-scoped routing key (retained for diagnostic tracing).
+    ///
+    /// Previously used to shard hot topics across actors, but this broke
+    /// per-topic ordering when writes were forwarded from followers via a
+    /// connection pool (each pooled connection had a different routing_key).
+    /// Actor dispatch now uses `topic_id` only — see `MultiActorSender::send`.
+    pub routing_key: u64,
     pub timestamp_ns: u64,
     pub record_count: u32,
     pub payload: Bytes,
@@ -104,18 +135,84 @@ pub fn write_replicated_data(
 /// - Write offset must match the follower's current segment position
 /// - Segment names are dictated by the leader — followers never create segments independently
 pub fn write_replicated_data_enriched(
-    config: &Config,
+    _config: &Config,
     topic_registry: &TopicRegistry,
-    topic_writers: &mut HashMap<u32, TopicWriter>,
+    topic_writers: &mut HashMap<(u32, String), TopicWriter>,
     entry: &lnc_replication::DataReplicationEntry,
 ) -> Result<()> {
     let topic_id = entry.topic_id;
-    let topic_dir = if topic_id == 0 {
-        config.data_dir.join("segments").join("0")
-    } else {
-        topic_registry.get_topic_dir(topic_id)
-    };
+    let writer_key = (topic_id, entry.segment_name.clone());
+    // Name-based storage: all topics resolve through the registry
+    let topic_dir = topic_registry.get_topic_dir(topic_id);
     std::fs::create_dir_all(&topic_dir)?;
+
+    fn find_closed_segment_variant(
+        topic_dir: &std::path::Path,
+        segment_name: &str,
+    ) -> Option<PathBuf> {
+        let stem = std::path::Path::new(segment_name).file_stem()?.to_str()?;
+        for entry in std::fs::read_dir(topic_dir).ok()? {
+            let path = entry.ok()?.path();
+            if path.extension().is_none_or(|ext| ext != "lnc") {
+                continue;
+            }
+            let file_stem = path.file_stem()?.to_str()?;
+            if file_stem.starts_with(stem) && file_stem.as_bytes().get(stem.len()) == Some(&b'-') {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    fn open_or_create_leader_segment(
+        topic_dir: &std::path::Path,
+        segment_name: &str,
+        leader_write_offset: u64,
+    ) -> Result<lnc_io::SegmentWriter> {
+        let segment_path = topic_dir.join(segment_name);
+        if segment_path.exists() {
+            return lnc_io::SegmentWriter::open(&segment_path);
+        }
+
+        if leader_write_offset > 0 {
+            if let Some(closed_path) = find_closed_segment_variant(topic_dir, segment_name) {
+                if !segment_path.exists() {
+                    match std::fs::rename(&closed_path, &segment_path) {
+                        Ok(()) => {
+                            tracing::debug!(
+                                target: "lance::ingestion",
+                                segment = %segment_name,
+                                from = %closed_path.display(),
+                                to = %segment_path.display(),
+                                "Renamed closed follower segment to leader canonical name"
+                            );
+                            return lnc_io::SegmentWriter::open(&segment_path);
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "lance::ingestion",
+                                segment = %segment_name,
+                                from = %closed_path.display(),
+                                to = %segment_path.display(),
+                                error = %e,
+                                "Failed to canonicalize closed follower segment name, reopening variant"
+                            );
+                        },
+                    }
+                }
+
+                tracing::debug!(
+                    target: "lance::ingestion",
+                    segment = %segment_name,
+                    closed_segment = %closed_path.display(),
+                    "Reopening closed follower segment for replay"
+                );
+                return lnc_io::SegmentWriter::open(&closed_path);
+            }
+        }
+
+        lnc_io::SegmentWriter::create_named(topic_dir, segment_name)
+    }
 
     // Handle NEW_SEGMENT flag: create the segment with the leader-dictated name
     if entry.flags.new_segment() {
@@ -126,10 +223,11 @@ pub fn write_replicated_data_enriched(
             "Creating leader-dictated segment (follower)"
         );
 
-        let writer = lnc_io::SegmentWriter::create_named(&topic_dir, &entry.segment_name)?;
+        let writer =
+            open_or_create_leader_segment(&topic_dir, &entry.segment_name, entry.write_offset)?;
         let index_builder = lnc_index::IndexBuilder::with_defaults();
         topic_writers.insert(
-            topic_id,
+            writer_key.clone(),
             TopicWriter {
                 writer,
                 index_builder,
@@ -138,7 +236,7 @@ pub fn write_replicated_data_enriched(
     }
 
     // Use Entry API to handle initialization atomically without double-lookup
-    let topic_writer = match topic_writers.entry(topic_id) {
+    let topic_writer = match topic_writers.entry(writer_key.clone()) {
         Entry::Occupied(o) => o.into_mut(),
         Entry::Vacant(v) => {
             tracing::warn!(
@@ -148,41 +246,8 @@ pub fn write_replicated_data_enriched(
                 "No active writer for topic, opening or creating segment from leader name"
             );
 
-            let segment_path = topic_dir.join(&entry.segment_name);
-            let mut writer = if segment_path.exists() {
-                tracing::debug!(
-                    target: "lance::ingestion",
-                    topic_id,
-                    segment = %entry.segment_name,
-                    "Opening existing segment file"
-                );
-                lnc_io::SegmentWriter::open(&segment_path)?
-            } else {
-                tracing::debug!(
-                    target: "lance::ingestion",
-                    topic_id,
-                    segment = %entry.segment_name,
-                    "Creating new segment file"
-                );
-                lnc_io::SegmentWriter::create_named(&topic_dir, &entry.segment_name)?
-            };
-
-            // ── CRITICAL FIX ──────────────────────────────────────────────
-            // Truncate BEFORE insertion to prevent the "append-error-retry" loop.
-            // This ensures the writer is in a valid state before being cached.
-            let current_offset = writer.write_offset();
-            if !entry.payload.is_empty() && entry.write_offset < current_offset {
-                tracing::warn!(
-                    target: "lance::ingestion",
-                    topic_id,
-                    segment = %entry.segment_name,
-                    current_offset,
-                    leader_offset = entry.write_offset,
-                    "Raft conflict detected on segment open, rewinding to match Raft log"
-                );
-                writer.truncate_to_offset(entry.write_offset)?;
-            }
-            // ──────────────────────────────────────────────────────────────
+            let writer =
+                open_or_create_leader_segment(&topic_dir, &entry.segment_name, entry.write_offset)?;
 
             let index_builder = lnc_index::IndexBuilder::with_defaults();
             v.insert(TopicWriter {
@@ -202,36 +267,76 @@ pub fn write_replicated_data_enriched(
                 actual = %current_name,
                 "Segment name mismatch — follower may need resync"
             );
-        }
-    }
 
-    // Check for Raft conflict even with cached writer (leader may have rolled back)
-    if !entry.payload.is_empty() {
-        let current_offset = topic_writer.writer.write_offset();
-        if entry.write_offset < current_offset {
-            tracing::warn!(
-                target: "lance::ingestion",
-                topic_id,
-                segment = %entry.segment_name,
-                current_offset,
-                leader_offset = entry.write_offset,
-                "Raft conflict detected on cached writer, rewinding to match Raft log"
-            );
-            // Truncate segment file to match leader's offset
-            topic_writer.writer.truncate_to_offset(entry.write_offset)?;
-
-            // SAFETY: Clear in-memory index to prevent corruption from ghost entries
-            // The index builder may contain entries for offsets we just truncated.
-            // Clearing ensures the .idx file won't have invalid pointers on rotation.
+            // Recover in-place by switching to the leader-dictated segment stream.
+            // Without this, followers can stay pinned to a stale writer key and repeatedly
+            // fail append catch-up for the same divergent segment lineage.
+            topic_writer.writer =
+                open_or_create_leader_segment(&topic_dir, &entry.segment_name, entry.write_offset)?;
             topic_writer.index_builder.clear();
         }
     }
 
-    // Write at the exact offset the leader specifies
+    // Check for Raft conflict even with cached writer (leader may have rolled back),
+    // while avoiding expensive rewind/rewrite on idempotent replay of already-applied
+    // entries (common during retries/catch-up).
+    let mut skip_payload_write = false;
     if !entry.payload.is_empty() {
+        let current_offset = topic_writer.writer.write_offset();
+        if entry.write_offset < current_offset {
+            let replay_end = entry
+                .write_offset
+                .saturating_add(entry.payload.len() as u64);
+            if replay_end <= current_offset
+                && payload_matches_existing_segment(
+                    &topic_writer.writer,
+                    entry.write_offset,
+                    &entry.payload,
+                )?
+            {
+                tracing::debug!(
+                    target: "lance::ingestion",
+                    topic_id,
+                    segment = %entry.segment_name,
+                    current_offset,
+                    leader_offset = entry.write_offset,
+                    replay_end,
+                    "Replicated entry already present on follower; skipping duplicate rewrite"
+                );
+                skip_payload_write = true;
+            } else {
+                tracing::warn!(
+                    target: "lance::ingestion",
+                    topic_id,
+                    segment = %entry.segment_name,
+                    current_offset,
+                    leader_offset = entry.write_offset,
+                    "Raft conflict detected on cached writer, rewinding to match Raft log"
+                );
+                // Truncate segment file to match leader's offset
+                topic_writer.writer.truncate_to_offset(entry.write_offset)?;
+
+                // SAFETY: Clear in-memory index to prevent corruption from ghost entries
+                // The index builder may contain entries for offsets we just truncated.
+                // Clearing ensures the .idx file won't have invalid pointers on rotation.
+                topic_writer.index_builder.clear();
+            }
+        }
+    }
+
+    // Write at the exact offset the leader specifies.
+    //
+    // IMPORTANT: followers already acknowledged the append based on durable
+    // Raft-log persistence in the replication plane. For data-file apply, a
+    // per-entry fsync (`save_at_offset`) creates heavy disk contention that can
+    // throttle subsequent AppendEntries RTTs (~tens of ms) even when quorum is
+    // healthy. We therefore apply via offset-validated write without immediate
+    // sync; crash recovery replays committed Raft log entries to reconstruct
+    // segment bytes.
+    if !entry.payload.is_empty() && !skip_payload_write {
         topic_writer
             .writer
-            .save_at_offset(entry.write_offset, &entry.payload)?;
+            .write_at_offset(entry.write_offset, &entry.payload)?;
 
         let timestamp_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -256,18 +361,17 @@ pub fn write_replicated_data_enriched(
             "Sealing segment after leader-dictated rotation (follower)"
         );
 
-        topic_writer.writer.fsync()?;
-
-        let end_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        let closed_path = topic_writer.writer.close(end_timestamp)?;
-        topic_writer.index_builder.write_indexes(&closed_path)?;
+        // Keep the original leader-dictated filename stable on followers.
+        // Replayed log entries may still reference `entry.segment_name`; renaming
+        // here can force a fresh file create at offset 0 and trigger repeated
+        // "Write offset mismatch" failures on catch-up/retry paths.
+        topic_writer.writer.seal()?;
+        let segment_path = topic_writer.writer.path().to_path_buf();
+        topic_writer.index_builder.write_indexes(&segment_path)?;
         topic_writer.index_builder.clear();
 
         // Remove the writer — next write with NEW_SEGMENT flag will create a new one
-        topic_writers.remove(&topic_id);
+        topic_writers.remove(&writer_key);
     }
 
     Ok(())

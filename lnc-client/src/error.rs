@@ -26,6 +26,8 @@ pub enum ClientError {
     },
     /// Server is applying backpressure, client should slow down
     ServerBackpressure,
+    /// M3: Operation would block (non-blocking mode), client buffer is full
+    WouldBlock,
     /// Server returned an error message
     ServerError(String),
     /// Server has not yet replicated to the requested offset — backoff and retry
@@ -40,6 +42,8 @@ pub enum ClientError {
     },
     /// TLS handshake or configuration error
     TlsError(String),
+    /// Topic name failed validation — must match `[a-zA-Z0-9-]+`
+    InvalidTopicName(String),
 }
 
 impl fmt::Display for ClientError {
@@ -59,6 +63,7 @@ impl fmt::Display for ClientError {
                 )
             },
             Self::ServerBackpressure => write!(f, "Server signaled backpressure"),
+            Self::WouldBlock => write!(f, "Operation would block (buffer full)"),
             Self::ServerError(msg) => write!(f, "Server error: {}", msg),
             Self::ServerCatchingUp { server_offset } => {
                 write!(f, "Server catching up (at offset {})", server_offset)
@@ -68,6 +73,9 @@ impl fmt::Display for ClientError {
                 None => write!(f, "Not leader, leader unknown"),
             },
             Self::TlsError(msg) => write!(f, "TLS error: {}", msg),
+            Self::InvalidTopicName(name) => {
+                write!(f, "Invalid topic name {:?}: must match [a-zA-Z0-9-]+", name)
+            },
         }
     }
 }
@@ -110,10 +118,46 @@ impl ClientError {
             // Server errors containing FORWARD_FAILED — leader unknown/unreachable
             // during election, retry after reconnect to potentially different node
             Self::ServerError(msg) => msg.contains("FORWARD_FAILED"),
-            // Non-retryable: ProtocolError, InvalidResponse, CrcMismatch, TlsError
+            // Non-retryable: ProtocolError, InvalidResponse, CrcMismatch, TlsError,
+            // InvalidTopicName (client-side validation failure)
             _ => false,
         }
     }
+}
+
+/// Validate that a topic name contains only `[a-zA-Z0-9-]` characters.
+///
+/// LANCE topic names are restricted to alphanumeric characters and hyphens so
+/// that they can be safely embedded in file paths and URL segments on all
+/// platforms supported by the server.
+///
+/// # Errors
+///
+/// Returns [`ClientError::InvalidTopicName`] when `name` is empty or contains
+/// any character outside `[a-zA-Z0-9-]`.
+///
+/// # Examples
+///
+/// ```rust
+/// use lnc_client::{ClientError, validate_topic_name};
+///
+/// assert!(validate_topic_name("my-topic").is_ok());
+/// assert!(validate_topic_name("rithmic-actions-v2").is_ok());
+/// assert!(validate_topic_name("topic123").is_ok());
+/// assert!(matches!(
+///     validate_topic_name("bad topic!"),
+///     Err(ClientError::InvalidTopicName(_))
+/// ));
+/// assert!(matches!(
+///     validate_topic_name(""),
+///     Err(ClientError::InvalidTopicName(_))
+/// ));
+/// ```
+pub fn validate_topic_name(name: &str) -> Result<()> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(ClientError::InvalidTopicName(name.to_owned()));
+    }
+    Ok(())
 }
 
 impl std::error::Error for ClientError {

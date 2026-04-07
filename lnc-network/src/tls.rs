@@ -187,6 +187,7 @@ impl TlsAcceptor {
 
     #[cfg(feature = "tls")]
     fn build_acceptor(config: &TlsConfig) -> TlsResult<tokio_rustls::TlsAcceptor> {
+        use rustls::crypto::ring::default_provider;
         use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
         let cert_path = config
@@ -213,7 +214,9 @@ impl TlsAcceptor {
             .map_err(|e| TlsError::KeyError(format!("{}: {}", key_path, e)))?;
 
         // Build server config
-        let server_config = rustls::ServerConfig::builder()
+        let server_config = rustls::ServerConfig::builder_with_provider(default_provider().into())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| TlsError::ConfigError(format!("Failed to build config: {}", e)))?
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| TlsError::ConfigError(format!("Failed to build config: {}", e)))?;
@@ -268,6 +271,7 @@ impl TlsConnector {
     #[cfg(feature = "tls")]
     fn build_connector(config: &TlsConfig) -> TlsResult<tokio_rustls::TlsConnector> {
         use rustls::RootCertStore;
+        use rustls::crypto::ring::default_provider;
         use rustls_pki_types::{CertificateDer, pem::PemObject};
 
         let mut root_store = RootCertStore::empty();
@@ -290,7 +294,9 @@ impl TlsConnector {
         }
 
         // Build client config
-        let client_config = rustls::ClientConfig::builder()
+        let client_config = rustls::ClientConfig::builder_with_provider(default_provider().into())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| TlsError::ConfigError(format!("Failed to build config: {}", e)))?
             .with_root_certificates(root_store)
             .with_no_client_auth();
 

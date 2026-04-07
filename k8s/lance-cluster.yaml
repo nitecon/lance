@@ -3,6 +3,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: lance-headless
+  namespace: lance
   labels:
     app: lance
 spec:
@@ -19,12 +20,19 @@ spec:
   - name: replication
     port: 1993
     targetPort: 1993
+  - name: resync
+    port: 1994
+    targetPort: 1994
+  - name: data-plane
+    port: 1995
+    targetPort: 1995
 ---
 # LoadBalancer service for external access
 apiVersion: v1
 kind: Service
 metadata:
   name: lance
+  namespace: lance
   labels:
     app: lance
 spec:
@@ -46,6 +54,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: lance
+  namespace: lance
   labels:
     app: lance
 spec:
@@ -82,12 +91,18 @@ spec:
             --node-id "$NODE_ID" \
             --replication-mode l3 \
             --peers lance-0.lance-headless:1993,lance-1.lance-headless:1993,lance-2.lance-headless:1993 \
-            --data-dir /var/lib/lance
+            --data-dir /var/lib/lance \
+            --ingestion-actor-count 8 \
+            --replication-max-inflight 64
         ports:
         - containerPort: 1992
           name: client
         - containerPort: 1993
           name: replication
+        - containerPort: 1994
+          name: resync
+        - containerPort: 1995
+          name: data-plane
         - containerPort: 9090
           name: metrics
         - containerPort: 8080
@@ -96,23 +111,25 @@ spec:
           httpGet:
             path: /health/live
             port: 8080
-          initialDelaySeconds: 5
+          initialDelaySeconds: 20
+          timeoutSeconds: 5
           periodSeconds: 10
-          failureThreshold: 3
+          failureThreshold: 6
         readinessProbe:
           httpGet:
             path: /health/ready
             port: 8080
-          initialDelaySeconds: 3
+          initialDelaySeconds: 10
+          timeoutSeconds: 3
           periodSeconds: 5
-          failureThreshold: 2
+          failureThreshold: 6
         resources:
           requests:
             memory: "512Mi"
-            cpu: "100m"
+            cpu: "2000m"
           limits:
             memory: "16Gi"
-            cpu: "500m"
+            cpu: "4000m"
         volumeMounts:
         - name: data
           mountPath: /var/lib/lance

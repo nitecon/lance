@@ -53,17 +53,17 @@ This document provides step-by-step procedures for recovering LANCE from various
 
 ```bash
 # 1. Identify the corrupt segment
-lnc verify-data --path /data/lance --topic <topic_id>
+lnc verify-data --path /data/lance --topic <topic_name>
 
 # 2. If recoverable, repair the segment
-lnc repair --path /data/lance/topic_<id>/<segment>.lnc
+lnc repair --path /data/lance/segments/<topic_name>/<segment>.lnc
 
 # 3. If not recoverable, truncate to last valid offset
-lnc scan --path /data/lance/topic_<id>/<segment>.lnc
+lnc scan --path /data/lance/segments/<topic_name>/<segment>.lnc
 # Note the last valid offset, then truncate
 
 # 4. Rebuild the index
-lnc rebuild-index --path /data/lance/topic_<id>
+lnc rebuild-index --path /data/lance/segments/<topic_name>
 ```
 
 ### 2.2 Lost Index File
@@ -77,10 +77,10 @@ lnc rebuild-index --path /data/lance/topic_<id>
 
 ```bash
 # Rebuild index from segment data
-lnc rebuild-index --path /data/lance/topic_<id>
+lnc rebuild-index --path /data/lance/segments/<topic_name>
 
 # Verify the rebuilt index
-lnc inspect-index --path /data/lance/topic_<id>/index.idx
+lnc inspect-index --path /data/lance/segments/<topic_name>/index.idx
 ```
 
 ### 2.3 WAL Corruption
@@ -115,17 +115,17 @@ systemctl start lance
 
 ```bash
 # Verify all data for a topic
-lnc verify-data --path /data/lance --topic <topic_id>
+lnc verify-data --path /data/lance --topic <topic_name>
 
 # Stop on first error (for scripting)
-lnc verify-data --path /data/lance --topic <topic_id> --fail-fast
+lnc verify-data --path /data/lance --topic <topic_name> --fail-fast
 ```
 
 ### 3.2 Segment-Level Verification
 
 ```bash
 # Scan individual segment
-lnc scan --path /data/lance/topic_<id>/<segment>.lnc
+lnc scan --path /data/lance/segments/<topic_name>/<segment>.lnc
 
 # Output includes:
 # - Record count
@@ -138,8 +138,8 @@ lnc scan --path /data/lance/topic_<id>/<segment>.lnc
 For production, run periodic verification:
 
 ```bash
-# Cron job (daily at 3 AM)
-0 3 * * * /usr/local/bin/lnc verify-data --path /data/lance --topic 1 >> /var/log/lance-verify.log 2>&1
+# Cron job (daily at 3 AM) — replace <topic_name> with your topic name
+0 3 * * * /usr/local/bin/lnc verify-data --path /data/lance --topic <topic_name> >> /var/log/lance-verify.log 2>&1
 ```
 
 ---
@@ -152,12 +152,12 @@ When a segment has corruption at the end (common after crash):
 
 ```bash
 # 1. Find last valid record
-lnc scan --path /data/lance/topic_<id>/<segment>.lnc
+lnc scan --path /data/lance/segments/<topic_name>/<segment>.lnc
 
 # 2. Note the offset of last valid record
 
 # 3. Truncate using repair
-lnc repair --path /data/lance/topic_<id>/<segment>.lnc
+lnc repair --path /data/lance/segments/<topic_name>/<segment>.lnc
 ```
 
 ### 4.2 Remove Corrupt Segment
@@ -166,13 +166,13 @@ If a segment is completely unrecoverable:
 
 ```bash
 # 1. Backup the corrupt segment
-mv /data/lance/topic_<id>/<segment>.lnc /data/lance/quarantine/
+mv /data/lance/segments/<topic_name>/<segment>.lnc /data/lance/quarantine/
 
 # 2. Update metadata to skip the segment
 # This creates a gap in offsets - consumers must handle this
 
 # 3. Rebuild index to reflect changes
-lnc rebuild-index --path /data/lance/topic_<id>
+lnc rebuild-index --path /data/lance/segments/<topic_name>
 ```
 
 ---
@@ -251,7 +251,7 @@ lnc cluster-status --server <any_node>:1992
 systemctl stop lance  # on stale nodes
 
 # 3. Export any unique data from stale partition
-lnc export-topic --path /data/lance --topic <id> --output /backup/stale_data.lance
+lnc export-topic --path /data/lance --topic <topic_name> --output /backup/stale_data.lance
 
 # 4. Wipe stale partition data
 rm -rf /data/lance/*
@@ -289,11 +289,11 @@ systemctl restart lance
 
 ```bash
 # Export single topic
-lnc export-topic --path /data/lance --topic <id> --output /backup/topic_<id>.lance
+lnc export-topic --path /data/lance --topic <topic_name> --output /backup/<topic_name>.lance
 
 # Export all topics (script)
-for topic in $(lnc list-topics --server localhost:1992 | jq -r '.[] .id'); do
-    lnc export-topic --path /data/lance --topic $topic --output /backup/topic_$topic.lance
+for topic in $(lnc list-topics --server localhost:1992 | jq -r '.[].name'); do
+    lnc export-topic --path /data/lance --topic "$topic" --output "/backup/${topic}.lance"
 done
 ```
 
@@ -301,10 +301,10 @@ done
 
 ```bash
 # Restore single topic
-lnc import-topic --path /data/lance --name "restored_topic" --input /backup/topic.lance
+lnc import-topic --path /data/lance --name <topic_name> --input /backup/<topic_name>.lance
 
 # Verify restored data
-lnc verify-data --path /data/lance --topic <new_id>
+lnc verify-data --path /data/lance --topic <topic_name>
 ```
 
 ### 7.3 Backup Best Practices

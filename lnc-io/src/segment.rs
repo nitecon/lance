@@ -308,6 +308,11 @@ impl SegmentWriter {
     /// dictated by the leader, ensuring byte-identical segment layouts.
     pub fn create_named(dir: &Path, segment_name: &str) -> Result<Self> {
         let path = dir.join(segment_name);
+        if path.exists() {
+            // Follower recovery path: segment already exists on disk, so resume
+            // from current EOF instead of truncating and resetting offset to 0.
+            return Self::open(&path);
+        }
         Self::create(&path)
     }
 

@@ -33,6 +33,7 @@ use lnc_replication::{
     create_leader_pool, create_replication_channel,
 };
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, trace, warn};
@@ -165,7 +166,7 @@ pub async fn run(
         // Use persistent log storage for durable Raft state (term, voted_for, log entries).
         // Falls back to in-memory-only mode if persistence fails (e.g. first run, permissions).
         let coordinator =
-            match ClusterCoordinator::with_persistence(cluster_config.clone(), &config.data_dir) {
+            match ClusterCoordinator::with_log_store(cluster_config.clone(), &config.data_dir) {
                 Ok(c) => {
                     info!(
                         target: "lance::server",
@@ -335,6 +336,95 @@ pub async fn run(
             }
         });
 
+        // Start data plane listener for replication on port 1995
+        let data_plane_listen_addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+            1995,
+        );
+        let data_plane_topic_registry = Arc::clone(&topic_registry);
+        let data_plane_config = config.clone();
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(data_plane_listen_addr).await {
+                Ok(l) => {
+                    info!(
+                        target: "lance::data_plane",
+                        addr = %data_plane_listen_addr,
+                        "Data plane listener started"
+                    );
+                    l
+                },
+                Err(e) => {
+                    error!(
+                        target: "lance::data_plane",
+                        addr = %data_plane_listen_addr,
+                        error = %e,
+                        "Failed to bind data plane listener"
+                    );
+                    return;
+                },
+            };
+
+            loop {
+                match listener.accept().await {
+                    Ok((mut stream, addr)) => {
+                        let topic_registry = Arc::clone(&data_plane_topic_registry);
+                        let config = data_plane_config.clone();
+                        tokio::spawn(async move {
+                            let write_callback = |entry: &lnc_replication::DataReplicationEntry| -> std::result::Result<(), std::io::Error> {
+                                ingestion::write_replicated_data_enriched(
+                                    &config,
+                                    &topic_registry,
+                                    &mut std::collections::HashMap::new(),
+                                    entry,
+                                )
+                                .map_err(|e| std::io::Error::other(format!("Write failed: {}", e)))
+                            };
+
+                            // Keep handling multiple requests on the same connection
+                            loop {
+                                match lnc_replication::FollowerAckHandler::handle_replication_request(
+                                    &mut stream,
+                                    &write_callback,
+                                )
+                                .await
+                                {
+                                    Ok(_) => {
+                                        // Successfully handled request, continue to next
+                                        trace!(
+                                            target: "lance::data_plane",
+                                            peer = %addr,
+                                            "Data plane request handled, waiting for next"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // Connection closed or error - exit the loop
+                                        if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                                            warn!(
+                                                target: "lance::data_plane",
+                                                peer = %addr,
+                                                error = %e,
+                                                "Data plane connection error"
+                                            );
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                    },
+                    Err(e) => {
+                        warn!(
+                            target: "lance::data_plane",
+                            error = %e,
+                            "Failed to accept data plane connection"
+                        );
+                    },
+                }
+            }
+        });
+
+        // Subscribe to event channel and start handler BEFORE cluster loop to ensure receiver is active
+
         // Subscribe to event channel and start handler BEFORE cluster loop to ensure receiver is active
         let mut event_rx = coordinator.subscribe();
         let event_registry = Arc::clone(&topic_registry);
@@ -347,8 +437,20 @@ pub async fn run(
         tokio::spawn(async move {
             // Track last known leader for change detection
             let mut last_leader = event_coord.leader_addr();
+            // Throttle repeated follower resync attempts for the same leader to
+            // avoid tight retry loops under churn (e.g. repeated BecameFollower / Lagged).
+            let mut last_resync_attempt: Option<Instant> = None;
+            let mut last_resync_leader: Option<u16> = None;
+            let resync_min_interval = Duration::from_secs(5);
             // Topic writers for follower data replication (only used by followers)
-            let mut follower_writers: std::collections::HashMap<u32, writer::TopicWriter> =
+            // Enriched L3 path uses (topic_id, segment_name) to support concurrent
+            // segment streams for hot topics without offset collisions.
+            let mut follower_writers_enriched: std::collections::HashMap<
+                (u32, String),
+                writer::TopicWriter,
+            > = std::collections::HashMap::new();
+            // Legacy path keeps topic-scoped writer cache.
+            let mut follower_writers_legacy: std::collections::HashMap<u32, writer::TopicWriter> =
                 std::collections::HashMap::new();
             // Resync actor for bulk segment transfer when follower is too far behind
             let mut resync_actor =
@@ -406,7 +508,8 @@ pub async fn run(
                                 );
                             }
                             // Remove any cached writer for deleted topic
-                            follower_writers.remove(&topic_id);
+                            follower_writers_legacy.remove(&topic_id);
+                            follower_writers_enriched.retain(|(tid, _), _| *tid != topic_id);
                         },
                     },
                     Ok(ClusterEvent::DataReceivedEnriched(entry)) => {
@@ -415,7 +518,7 @@ pub async fn run(
                         if let Err(e) = ingestion::write_replicated_data_enriched(
                             &event_config,
                             &event_registry,
-                            &mut follower_writers,
+                            &mut follower_writers_enriched,
                             &entry,
                         ) {
                             warn!(
@@ -425,7 +528,8 @@ pub async fn run(
                                 error = %e,
                                 "Failed to write enriched replicated data"
                             );
-                            follower_writers.remove(&topic_id);
+                            follower_writers_enriched
+                                .remove(&(topic_id, entry.segment_name.clone()));
                         }
                     },
                     Ok(ClusterEvent::DataReceived { topic_id, payload }) => {
@@ -433,7 +537,7 @@ pub async fn run(
                         if let Err(e) = ingestion::write_replicated_data(
                             &event_config,
                             &event_registry,
-                            &mut follower_writers,
+                            &mut follower_writers_legacy,
                             topic_id,
                             &payload,
                         ) {
@@ -444,7 +548,7 @@ pub async fn run(
                                 error = %e,
                                 "Failed to write replicated data (legacy)"
                             );
-                            follower_writers.remove(&topic_id);
+                            follower_writers_legacy.remove(&topic_id);
                         }
                     },
                     Ok(ClusterEvent::BecameLeader { term, .. }) => {
@@ -454,42 +558,56 @@ pub async fn run(
                         info!(
                             target: "lance::server",
                             term,
-                            writers = follower_writers.len(),
+                            writers = follower_writers_legacy.len() + follower_writers_enriched.len(),
                             "BecameLeader — closing follower writer segments"
                         );
 
-                        // Sync all local topics to followers to ensure cluster-wide consistency
-                        // This is critical because each pod has its own persistent volume
-                        let local_topics = event_registry.list_topics();
-                        if !local_topics.is_empty() {
-                            info!(
-                                target: "lance::server",
-                                topic_count = local_topics.len(),
-                                "Syncing local topics to followers after becoming leader"
-                            );
-                            for topic in local_topics {
-                                let op = TopicOperation::Create {
-                                    topic_id: topic.id,
-                                    name: topic.name.clone(),
-                                    created_at: topic.created_at,
-                                };
-                                if let Err(e) = event_coord.replicate_topic_op(op).await {
-                                    warn!(
-                                        target: "lance::server",
-                                        topic_id = topic.id,
-                                        topic_name = %topic.name,
-                                        error = %e,
-                                        "Failed to sync topic to followers"
-                                    );
-                                }
-                            }
-                        }
+                        // Re-emit committed topic operations to self-heal local topic
+                        // registry state after election churn / receiver lag.
+                        event_coord.reemit_committed_topic_ops().await;
+
+                        // IMPORTANT: do not fan-out local topic registry state here.
+                        // Per-node disk state can be stale under churn; propagating it
+                        // can overwrite authoritative committed metadata.
+                        // Metadata convergence is driven by committed TopicOp replay.
 
                         let end_ts = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_nanos() as u64)
                             .unwrap_or(0);
-                        for (topic_id, mut tw) in follower_writers.drain() {
+                        for (topic_id, mut tw) in follower_writers_legacy.drain() {
+                            if let Err(e) = tw.writer.fsync() {
+                                warn!(
+                                    target: "lance::server",
+                                    topic_id,
+                                    error = %e,
+                                    "Failed to fsync follower segment on leader transition"
+                                );
+                                continue;
+                            }
+                            match tw.writer.close(end_ts) {
+                                Ok(closed_path) => {
+                                    let _ = tw.index_builder.write_indexes(&closed_path);
+                                    debug!(
+                                        target: "lance::server",
+                                        topic_id,
+                                        segment = %closed_path.display(),
+                                        "Closed follower segment on leader transition"
+                                    );
+                                },
+                                Err(e) => {
+                                    warn!(
+                                        target: "lance::server",
+                                        topic_id,
+                                        error = %e,
+                                        "Failed to close follower segment on leader transition"
+                                    );
+                                },
+                            }
+                        }
+
+                        for ((topic_id, _segment_name), mut tw) in follower_writers_enriched.drain()
+                        {
                             if let Err(e) = tw.writer.fsync() {
                                 warn!(
                                     target: "lance::server",
@@ -534,6 +652,19 @@ pub async fn run(
                         // segments via manifest exchange — we only need to decide
                         // whether to attempt the resync connection at all.
                         if !resync_actor.is_active() {
+                            let throttled = last_resync_leader == Some(leader_id)
+                                && last_resync_attempt
+                                    .is_some_and(|t| t.elapsed() < resync_min_interval);
+                            if throttled {
+                                debug!(
+                                    target: "lance::resync",
+                                    leader_id,
+                                    min_retry_secs = resync_min_interval.as_secs(),
+                                    "Skipping follower bulk resync (cooldown active)"
+                                );
+                                continue;
+                            }
+
                             if let Some(leader_repl_addr) = event_coord.peer_addr(leader_id).await {
                                 // Compute local offset from segment files
                                 let local_data_dir = event_config.data_dir.clone();
@@ -554,28 +685,29 @@ pub async fn run(
                                 .await
                                 .unwrap_or(0);
 
-                                // Fresh node (no data) — always attempt resync to bootstrap.
-                                // initiate_resync handles the full protocol: connect to
-                                // leader's resync port (repl_port + port_offset), exchange
-                                // manifest, stream missing segments, and rebuild indices.
-                                if local_offset == 0 {
-                                    info!(
+                                // Always attempt bounded bulk resync on follower transition.
+                                // This allows non-fresh nodes with divergent/stale local data
+                                // to converge via manifest-guided transfer instead of looping
+                                // on AppendEntries catch-up failures.
+                                info!(
+                                    target: "lance::resync",
+                                    leader_id,
+                                    leader_addr = %leader_repl_addr,
+                                    local_offset,
+                                    "Follower transition detected, initiating bulk resync"
+                                );
+                                last_resync_attempt = Some(Instant::now());
+                                last_resync_leader = Some(leader_id);
+                                if let Err(e) = resync_actor
+                                    .initiate_resync(leader_repl_addr, local_offset)
+                                    .await
+                                {
+                                    warn!(
                                         target: "lance::resync",
-                                        leader_id,
-                                        leader_addr = %leader_repl_addr,
-                                        "Fresh node detected, initiating bulk resync"
+                                        error = %e,
+                                        "Bulk resync failed"
                                     );
-                                    if let Err(e) = resync_actor
-                                        .initiate_resync(leader_repl_addr, local_offset)
-                                        .await
-                                    {
-                                        warn!(
-                                            target: "lance::resync",
-                                            error = %e,
-                                            "Bulk resync failed"
-                                        );
-                                        resync_actor.reset();
-                                    }
+                                    resync_actor.reset();
                                 }
                             }
                         }
@@ -594,6 +726,60 @@ pub async fn run(
                             skipped = n,
                             "Cluster event receiver lagged"
                         );
+
+                        // We may have missed topic/data apply events. Reconcile metadata
+                        // and clear cached follower writers so future enriched writes reopen
+                        // from disk instead of using stale in-memory offsets.
+                        event_coord.reemit_committed_topic_ops().await;
+                        follower_writers_legacy.clear();
+                        follower_writers_enriched.clear();
+
+                        // Proactively request bulk resync from current leader to recover
+                        // any missed data-plane events from channel lag.
+                        if !resync_actor.is_active() {
+                            if let Some(leader_id) = event_coord.leader_id().await {
+                                if leader_id != event_config.node_id {
+                                    let throttled = last_resync_leader == Some(leader_id)
+                                        && last_resync_attempt
+                                            .is_some_and(|t| t.elapsed() < resync_min_interval);
+                                    if throttled {
+                                        debug!(
+                                            target: "lance::resync",
+                                            skipped = n,
+                                            leader_id,
+                                            min_retry_secs = resync_min_interval.as_secs(),
+                                            "Skipping lag-triggered resync (cooldown active)"
+                                        );
+                                        continue;
+                                    }
+
+                                    if let Some(leader_repl_addr) =
+                                        event_coord.peer_addr(leader_id).await
+                                    {
+                                        warn!(
+                                            target: "lance::resync",
+                                            skipped = n,
+                                            leader_id,
+                                            leader_addr = %leader_repl_addr,
+                                            "Lagged apply receiver - initiating follower bulk resync"
+                                        );
+                                        last_resync_attempt = Some(Instant::now());
+                                        last_resync_leader = Some(leader_id);
+                                        if let Err(e) =
+                                            resync_actor.initiate_resync(leader_repl_addr, 0).await
+                                        {
+                                            warn!(
+                                                target: "lance::resync",
+                                                skipped = n,
+                                                error = %e,
+                                                "Bulk resync after lagged receiver failed"
+                                            );
+                                            resync_actor.reset();
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     },
                     Err(broadcast::error::RecvError::Closed) => {
                         debug!(target: "lance::server", "Cluster event channel closed");
@@ -630,7 +816,7 @@ pub async fn run(
             // total_nodes = peers + self
             let total_nodes = peer_count + 1;
             let qm_config = QuorumConfig::new(total_nodes)
-                .with_timeout(config.replication_quorum_timeout_ms.unwrap_or(1000));
+                .with_timeout(config.replication_quorum_timeout_ms.unwrap_or(5000));
             info!(
                 target: "lance::server",
                 total_nodes,

@@ -45,7 +45,8 @@ struct ConnectionContext<'a, S> {
     quorum_manager: &'a Option<Arc<AsyncQuorumManager>>,
     /// This node's ID (for recording leader's own quorum ACK)
     node_id: u16,
-    /// Stable connection-scoped key for hot-topic actor sharding.
+    /// Stable connection-scoped key (retained for diagnostic tracing).
+    /// Actor dispatch now uses topic_id only for per-topic ordering.
     routing_key: u64,
 }
 
@@ -216,8 +217,17 @@ where
     while *read_offset - cursor >= LWP_HEADER_SIZE {
         match parse_frame(&buffer[cursor..*read_offset])? {
             Some((frame, frame_len)) => {
-                let action =
-                    dispatch_frame(&mut ctx, &frame, buffer, frame_len, *read_offset).await;
+                // Pass cursor-adjusted sub-slice so forwarding paths send the
+                // correct frame bytes (not stale data from buffer offset 0).
+                let effective_read_offset = *read_offset - cursor;
+                let action = dispatch_frame(
+                    &mut ctx,
+                    &frame,
+                    &mut buffer[cursor..],
+                    frame_len,
+                    effective_read_offset,
+                )
+                .await;
 
                 match action {
                     FrameAction::Continue | FrameAction::Forwarded => {
@@ -271,20 +281,35 @@ where
 
                 let batch_id = p.batch_id;
 
-                // CONTROL PLANE DECOUPLING: ACK after local durability only.
-                // Replication happens asynchronously via the control plane.
-                // The data plane should not block on Raft quorum - this is the
-                // fundamental decoupling required for low-latency writes.
-                // Quorum tracking still happens in background for leader election
-                // consistency, but client ACK is immediate after local write.
-                if let Some((write_id, _rx)) = p.quorum_rx {
-                    // Fire-and-forget: let the quorum manager track replication
-                    // asynchronously. The write is durable locally (WAL + segment).
-                    // Replication will catch up via heartbeat-driven AppendEntries.
-                    let _ = write_id; // Suppress unused warning
+                // L3 QUORUM DURABILITY: Wait for quorum before ACKing client.
+                // This ensures writes are replicated to majority before client
+                // considers them committed, preventing data loss during failover.
+                if let Some((_write_id, rx)) = p.quorum_rx {
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+                        Ok(Ok(result)) => {
+                            if !result.is_success() {
+                                return (
+                                    idx,
+                                    Err(LanceError::QuorumNotReached {
+                                        required: 2,
+                                        received: 1,
+                                    }),
+                                );
+                            }
+                        },
+                        _ => {
+                            return (
+                                idx,
+                                Err(LanceError::QuorumNotReached {
+                                    required: 2,
+                                    received: 1,
+                                }),
+                            );
+                        },
+                    }
                 }
 
-                // Return batch_id on local durability success
+                // Return batch_id on quorum durability success
                 (idx, Ok(batch_id))
             });
         }
@@ -666,7 +691,7 @@ async fn try_forward_to_leader<S>(
     ctx: &mut ConnectionContext<'_, S>,
     buffer: &mut [u8],
     consumed: usize,
-    read_offset: usize,
+    _read_offset: usize,
 ) -> Option<FrameAction>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -686,7 +711,7 @@ where
         match pool.forward_write(&buffer[..consumed]).await {
             Ok(response) => {
                 if ctx.stream.write_all(&response).await.is_ok() {
-                    buffer.copy_within(consumed..read_offset, 0);
+                    // Buffer shift is handled by process_frames cursor logic.
                     return Some(FrameAction::Forwarded);
                 }
             },
@@ -696,14 +721,12 @@ where
                     match pool.forward_write(&buffer[..consumed]).await {
                         Ok(response) => {
                             if ctx.stream.write_all(&response).await.is_ok() {
-                                buffer.copy_within(consumed..read_offset, 0);
                                 return Some(FrameAction::Forwarded);
                             }
                         },
                         Err(e) => {
                             warn!(target: "lance::server", error = %e, "Write forwarding to leader failed");
                             let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
-                            buffer.copy_within(consumed..read_offset, 0);
                             return Some(FrameAction::Forwarded);
                         },
                     }
@@ -711,7 +734,6 @@ where
 
                 warn!(target: "lance::server", "Write forwarding to leader failed: leader address unknown");
                 let _ = send_error(ctx.stream, "FORWARD_FAILED: Leader address unknown").await;
-                buffer.copy_within(consumed..read_offset, 0);
                 return Some(FrameAction::Forwarded);
             },
             Err(e) => {
@@ -723,7 +745,6 @@ where
                     match pool.forward_write(&buffer[..consumed]).await {
                         Ok(response) => {
                             if ctx.stream.write_all(&response).await.is_ok() {
-                                buffer.copy_within(consumed..read_offset, 0);
                                 return Some(FrameAction::Forwarded);
                             }
                         },
@@ -735,7 +756,6 @@ where
 
                 warn!(target: "lance::server", error = %e, "Write forwarding to leader failed");
                 let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
-                buffer.copy_within(consumed..read_offset, 0);
                 return Some(FrameAction::Forwarded);
             },
         }
@@ -746,7 +766,6 @@ where
             None => "NOT_LEADER: leader unknown".to_string(),
         };
         let _ = send_error(ctx.stream, &err_msg).await;
-        buffer.copy_within(consumed..read_offset, 0);
         return Some(FrameAction::Forwarded);
     }
 
@@ -759,7 +778,7 @@ async fn try_forward_control_to_leader<S>(
     command: ControlCommand,
     buffer: &mut [u8],
     consumed: usize,
-    read_offset: usize,
+    _read_offset: usize,
 ) -> Option<FrameAction>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -785,7 +804,7 @@ where
             "FORWARD_FAILED: Leader not ready (apply/metadata catch-up)",
         )
         .await;
-        buffer.copy_within(consumed..read_offset, 0);
+        // Buffer shift is handled by process_frames cursor logic.
         return Some(FrameAction::Forwarded);
     }
 
@@ -793,7 +812,6 @@ where
         match pool.forward_write(&buffer[..consumed]).await {
             Ok(response) => {
                 if ctx.stream.write_all(&response).await.is_ok() {
-                    buffer.copy_within(consumed..read_offset, 0);
                     return Some(FrameAction::Forwarded);
                 }
             },
@@ -803,14 +821,12 @@ where
                     match pool.forward_write(&buffer[..consumed]).await {
                         Ok(response) => {
                             if ctx.stream.write_all(&response).await.is_ok() {
-                                buffer.copy_within(consumed..read_offset, 0);
                                 return Some(FrameAction::Forwarded);
                             }
                         },
                         Err(e) => {
                             warn!(target: "lance::server", error = %e, "Control command forwarding to leader failed");
                             let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
-                            buffer.copy_within(consumed..read_offset, 0);
                             return Some(FrameAction::Forwarded);
                         },
                     }
@@ -818,7 +834,6 @@ where
 
                 warn!(target: "lance::server", "Control command forwarding to leader failed: leader address unknown");
                 let _ = send_error(ctx.stream, "FORWARD_FAILED: Leader address unknown").await;
-                buffer.copy_within(consumed..read_offset, 0);
                 return Some(FrameAction::Forwarded);
             },
             Err(e) => {
@@ -828,7 +843,6 @@ where
                     match pool.forward_write(&buffer[..consumed]).await {
                         Ok(response) => {
                             if ctx.stream.write_all(&response).await.is_ok() {
-                                buffer.copy_within(consumed..read_offset, 0);
                                 return Some(FrameAction::Forwarded);
                             }
                         },
@@ -840,7 +854,6 @@ where
 
                 warn!(target: "lance::server", error = %e, "Control command forwarding to leader failed");
                 let _ = send_error(ctx.stream, &format!("FORWARD_FAILED: {}", e)).await;
-                buffer.copy_within(consumed..read_offset, 0);
                 return Some(FrameAction::Forwarded);
             },
         }
@@ -945,12 +958,8 @@ fn handle_fetch_request(
 ) -> lnc_network::Frame {
     let topic_id = fetch_req.topic_id;
 
-    // Get topic directory
-    let topic_dir = if topic_id == 0 {
-        topic_registry.data_dir().join("segments").join("0")
-    } else {
-        topic_registry.get_topic_dir(topic_id)
-    };
+    // Name-based storage: all topics resolve through the registry
+    let topic_dir = topic_registry.get_topic_dir(topic_id);
 
     if !topic_dir.exists() {
         return lnc_network::Frame::new_error_response("Topic not found");

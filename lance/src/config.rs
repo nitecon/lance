@@ -266,6 +266,11 @@ impl Config {
                 size: args.wal_size,
                 path: Some(args.data_dir.join("wal")),
             },
+            ingestion: IngestionSettings {
+                actor_count: args.ingestion_actor_count.max(1),
+                ..Default::default()
+            },
+            replication_max_inflight: args.replication_max_inflight.max(1),
             consumer_rate_limit_bytes_per_sec: args.consumer_rate_limit,
             ..Default::default()
         }

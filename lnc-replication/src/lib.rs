@@ -6,6 +6,7 @@ mod actor;
 mod audit;
 mod cluster;
 mod codec;
+mod data_plane;
 mod discovery;
 mod follower;
 mod forward;
@@ -29,6 +30,9 @@ pub use codec::{
     EntryType, InstallSnapshotRequest, InstallSnapshotResponse, LogEntry, MessageType, NodeRole,
     PreVoteRequest, PreVoteResponse, ReplicationAck, ReplicationAckStatus, ReplicationCodec,
     ReplicationFlags, ReplicationMessage, TopicOperation, VoteRequest, VoteResponse,
+};
+pub use data_plane::{
+    DataPlaneConfig, DataPlaneConnection, DataPlaneManager, DataPlaneState, FollowerAckHandler,
 };
 pub use discovery::{
     ClusterConfig as DiscoveryClusterConfig, DiscoveryMethod, PeerDiscovery, PeerInfo,

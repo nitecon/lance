@@ -4,7 +4,7 @@
 //! In standalone mode, each consumer operates independently without coordination
 //! with other consumers. This is the simplest consumption pattern.
 //!
-//! # Example
+//! # Example — name-based (recommended)
 //!
 //! ```rust,no_run
 //! use lnc_client::{StandaloneConsumer, StandaloneConfig};
@@ -12,15 +12,39 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Connect and start consuming
+//!     // Pass a topic *name*; the client resolves it to a numeric ID automatically.
 //!     let mut consumer = StandaloneConsumer::connect(
 //!         "127.0.0.1:1992",
-//!         StandaloneConfig::new("my-topic-id", 1)
-//!             .with_consumer_id("my-consumer")
+//!         StandaloneConfig::with_topic_name("my-consumer", "my-topic")
 //!             .with_offset_dir(Path::new("/var/lib/lance/offsets")),
 //!     ).await?;
 //!
 //!     // Receive records
+//!     loop {
+//!         if let Some(records) = consumer.next_batch().await? {
+//!             for record in records.data.chunks(256) {
+//!                 // Process record
+//!             }
+//!             consumer.commit().await?;
+//!         }
+//!     }
+//! }
+//! ```
+//!
+//! # Example — ID-based (legacy / backward-compatible)
+//!
+//! ```rust,no_run
+//! use lnc_client::{StandaloneConsumer, StandaloneConfig};
+//! use std::path::Path;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let mut consumer = StandaloneConsumer::connect(
+//!         "127.0.0.1:1992",
+//!         StandaloneConfig::new("my-consumer", 1)
+//!             .with_offset_dir(Path::new("/var/lib/lance/offsets")),
+//!     ).await?;
+//!
 //!     loop {
 //!         if let Some(records) = consumer.next_batch().await? {
 //!             for record in records.data.chunks(256) {
@@ -40,16 +64,38 @@ use std::time::{Duration, Instant};
 
 use crate::client::{ClientConfig, LanceClient};
 use crate::consumer::{PollResult, SeekPosition, StreamingConsumer, StreamingConsumerConfig};
-use crate::error::Result;
+use crate::error::{Result, validate_topic_name};
 use crate::offset::{LockFileOffsetStore, MemoryOffsetStore, OffsetStore};
 
 /// Configuration for standalone consumer mode
+///
+/// There are three ways to specify which topic to consume:
+///
+/// 1. **Name-based (recommended)** — pass only the topic name via
+///    [`StandaloneConfig::with_topic_name`].  The consumer resolves the name
+///    to a numeric ID automatically by calling `create_topic` (which is
+///    idempotent) on connect.
+///
+/// 2. **ID + name** — use [`StandaloneConfig::new_with_id`] when you already
+///    hold a resolved `TopicInfo` and want to skip the extra round-trip.
+///
+/// 3. **ID-only (legacy)** — use [`StandaloneConfig::new`] with a numeric ID
+///    directly.  This preserves backward compatibility with existing callers.
 #[derive(Debug, Clone)]
 pub struct StandaloneConfig {
     /// Identifier for this consumer (used for offset storage)
     pub consumer_id: String,
-    /// Topic ID to consume from
+    /// Topic ID to consume from.
+    ///
+    /// When this is `0` and [`topic_name`](Self::topic_name) is `Some`, the consumer will
+    /// resolve the name to an ID on the first call to
+    /// [`StandaloneConsumer::connect`].
     pub topic_id: u32,
+    /// Human-readable topic name.
+    ///
+    /// When set and `topic_id == 0`, `StandaloneConsumer::connect` resolves
+    /// the name to an ID via `create_topic` (idempotent).
+    pub topic_name: Option<String>,
     /// Maximum bytes to fetch per poll
     pub max_fetch_bytes: u32,
     /// Starting position if no stored offset exists
@@ -65,12 +111,96 @@ pub struct StandaloneConfig {
 }
 
 impl StandaloneConfig {
-    /// Create a new standalone config for the given topic
+    /// Create a standalone config using a numeric topic ID.
+    ///
+    /// This is the **legacy constructor** and is kept for backward
+    /// compatibility. Prefer [`StandaloneConfig::with_topic_name`] for new
+    /// code — it lets the client resolve the name automatically and avoids
+    /// coupling call sites to numeric IDs.
     pub fn new(consumer_id: impl Into<String>, topic_id: u32) -> Self {
         Self {
             consumer_id: consumer_id.into(),
             topic_id,
+            topic_name: None,
             max_fetch_bytes: 1_048_576, // 1MB default
+            start_position: SeekPosition::Beginning,
+            offset_dir: None,
+            auto_commit_interval: Some(Duration::from_secs(5)),
+            connect_timeout: Duration::from_secs(30),
+            poll_timeout: Duration::from_millis(100),
+        }
+    }
+
+    /// Create a standalone config using only the topic **name**.
+    ///
+    /// When this config is passed to [`StandaloneConsumer::connect`], the
+    /// consumer calls `create_topic` (idempotent) to resolve the name to a
+    /// numeric ID before subscribing.  No extra setup code is required on the
+    /// call site.
+    ///
+    /// The name must match `[a-zA-Z0-9-]+`; an error is returned at connect
+    /// time if validation fails.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use lnc_client::{StandaloneConsumer, StandaloneConfig};
+    ///
+    /// # #[tokio::main] async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut consumer = StandaloneConsumer::connect(
+    ///     "127.0.0.1:1992",
+    ///     StandaloneConfig::with_topic_name("my-consumer", "rithmic-actions"),
+    /// ).await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn with_topic_name(consumer_id: impl Into<String>, topic_name: impl Into<String>) -> Self {
+        Self {
+            consumer_id: consumer_id.into(),
+            topic_id: 0,
+            topic_name: Some(topic_name.into()),
+            max_fetch_bytes: 1_048_576,
+            start_position: SeekPosition::Beginning,
+            offset_dir: None,
+            auto_commit_interval: Some(Duration::from_secs(5)),
+            connect_timeout: Duration::from_secs(30),
+            poll_timeout: Duration::from_millis(100),
+        }
+    }
+
+    /// Create a standalone config with both a topic name and a pre-resolved
+    /// numeric ID.
+    ///
+    /// Use this when you already have a [`TopicInfo`] from a prior
+    /// `create_topic` call and want to avoid the extra round-trip that
+    /// [`StandaloneConfig::with_topic_name`] performs on connect.
+    ///
+    /// [`TopicInfo`]: crate::TopicInfo
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use lnc_client::{ClientConfig, LanceClient, StandaloneConsumer, StandaloneConfig};
+    ///
+    /// # #[tokio::main] async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut mgmt = LanceClient::connect(ClientConfig::new("127.0.0.1:1992")).await?;
+    /// let info = mgmt.create_topic("rithmic-actions").await?;
+    ///
+    /// let mut consumer = StandaloneConsumer::connect(
+    ///     "127.0.0.1:1992",
+    ///     StandaloneConfig::new_with_id("my-consumer", &info.name, info.id),
+    /// ).await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn new_with_id(
+        consumer_id: impl Into<String>,
+        topic_name: impl Into<String>,
+        topic_id: u32,
+    ) -> Self {
+        Self {
+            consumer_id: consumer_id.into(),
+            topic_id,
+            topic_name: Some(topic_name.into()),
+            max_fetch_bytes: 1_048_576,
             start_position: SeekPosition::Beginning,
             offset_dir: None,
             auto_commit_interval: Some(Duration::from_secs(5)),
@@ -149,24 +279,39 @@ pub struct StandaloneConsumer {
 }
 
 impl StandaloneConsumer {
-    /// Connect to a LANCE server and start consuming
+    /// Connect to a LANCE server and start consuming.
     ///
     /// This will:
-    /// 1. Establish connection to the server
-    /// 2. Load any previously committed offset from storage
-    /// 3. Subscribe to the topic starting from the stored offset (or start_position)
+    /// 1. Validate the topic name if one is supplied (must match `[a-zA-Z0-9-]+`)
+    /// 2. Resolve the topic name to a numeric ID via `create_topic` (idempotent)
+    ///    when the config was created with [`StandaloneConfig::with_topic_name`]
+    /// 3. Establish the consumer connection
+    /// 4. Load any previously committed offset from storage
+    /// 5. Subscribe to the topic starting from the stored offset (or `start_position`)
     ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The topic name is invalid (contains characters outside `[a-zA-Z0-9-]`)
     /// - Connection to the server fails
+    /// - Topic name resolution fails
     /// - Offset store cannot be initialized
     /// - Subscription fails
-    pub async fn connect(addr: &str, config: StandaloneConfig) -> Result<Self> {
+    pub async fn connect(addr: &str, mut config: StandaloneConfig) -> Result<Self> {
         let mut client_config = ClientConfig::new(addr);
         client_config.connect_timeout = config.connect_timeout;
 
-        let client = LanceClient::connect(client_config).await?;
+        let mut client = LanceClient::connect(client_config).await?;
+
+        // Resolve topic name to ID when the caller used the name-based constructor.
+        if config.topic_id == 0 {
+            if let Some(ref name) = config.topic_name.clone() {
+                validate_topic_name(name)?;
+                let topic_info = client.create_topic(name).await?;
+                config.topic_id = topic_info.id;
+            }
+        }
+
         Self::from_client(client, config).await
     }
 
@@ -425,10 +570,31 @@ impl StandaloneConsumerBuilder {
         self
     }
 
-    /// Build a consumer for a specific topic
+    /// Build a consumer for a specific topic ID (legacy).
     pub async fn build_for_topic(&self, topic_id: u32) -> Result<StandaloneConsumer> {
         let mut config = self.base_config.clone();
         config.topic_id = topic_id;
+        StandaloneConsumer::connect(&self.addr, config).await
+    }
+
+    /// Build a consumer for a topic identified by **name**.
+    ///
+    /// The name is validated and then resolved to a numeric ID via
+    /// `create_topic` (idempotent) before the consumer connects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::InvalidTopicName`](crate::ClientError::InvalidTopicName) if `topic_name` contains
+    /// characters outside `[a-zA-Z0-9-]` or is empty.
+    pub async fn build_for_topic_name(
+        &self,
+        topic_name: impl Into<String>,
+    ) -> Result<StandaloneConsumer> {
+        let name = topic_name.into();
+        validate_topic_name(&name)?;
+        let mut config = self.base_config.clone();
+        config.topic_id = 0;
+        config.topic_name = Some(name);
         StandaloneConsumer::connect(&self.addr, config).await
     }
 }
@@ -437,6 +603,7 @@ impl StandaloneConsumerBuilder {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::error::validate_topic_name;
 
     #[test]
     fn test_standalone_config_defaults() {
@@ -447,6 +614,7 @@ mod tests {
         assert_eq!(config.max_fetch_bytes, 1_048_576);
         assert!(config.offset_dir.is_none());
         assert!(config.auto_commit_interval.is_some());
+        assert!(config.topic_name.is_none());
     }
 
     #[test]
@@ -468,5 +636,112 @@ mod tests {
             .with_auto_commit_interval(Some(Duration::from_secs(10)));
 
         assert_eq!(config.auto_commit_interval, Some(Duration::from_secs(10)));
+    }
+
+    // -------------------------------------------------------------------------
+    // Name-based constructor tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_with_topic_name_sets_name_and_zero_id() {
+        let config = StandaloneConfig::with_topic_name("my-consumer", "rithmic-actions");
+
+        assert_eq!(config.consumer_id, "my-consumer");
+        assert_eq!(config.topic_name.as_deref(), Some("rithmic-actions"));
+        // topic_id starts at 0 — resolved on connect
+        assert_eq!(config.topic_id, 0);
+    }
+
+    #[test]
+    fn test_new_with_id_sets_both_name_and_id() {
+        let config = StandaloneConfig::new_with_id("my-consumer", "rithmic-actions", 42);
+
+        assert_eq!(config.consumer_id, "my-consumer");
+        assert_eq!(config.topic_name.as_deref(), Some("rithmic-actions"));
+        assert_eq!(config.topic_id, 42);
+    }
+
+    #[test]
+    fn test_with_topic_name_builder_chain() {
+        let config = StandaloneConfig::with_topic_name("consumer-1", "data-stream")
+            .with_max_fetch_bytes(256 * 1024)
+            .with_manual_commit()
+            .with_start_position(SeekPosition::End);
+
+        assert_eq!(config.topic_name.as_deref(), Some("data-stream"));
+        assert_eq!(config.topic_id, 0);
+        assert_eq!(config.max_fetch_bytes, 256 * 1024);
+        assert!(config.auto_commit_interval.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // validate_topic_name tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_topic_name_accepts_valid_names() {
+        let valid = &[
+            "rithmic-actions",
+            "data",
+            "topic-123",
+            "MyTopic",
+            "ABC",
+            "a-b-c-1-2-3",
+        ];
+        for name in valid {
+            assert!(
+                validate_topic_name(name).is_ok(),
+                "Expected {:?} to be valid",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_topic_name_rejects_empty() {
+        let result = validate_topic_name("");
+        assert!(
+            matches!(result, Err(crate::ClientError::InvalidTopicName(_))),
+            "Empty name should be invalid"
+        );
+    }
+
+    #[test]
+    fn test_validate_topic_name_rejects_spaces() {
+        let result = validate_topic_name("bad topic");
+        assert!(
+            matches!(result, Err(crate::ClientError::InvalidTopicName(_))),
+            "Name with space should be invalid"
+        );
+    }
+
+    #[test]
+    fn test_validate_topic_name_rejects_special_chars() {
+        let invalid = &[
+            "topic!",
+            "topic/sub",
+            "topic.name",
+            "topic_name",
+            "topic@v2",
+        ];
+        for name in invalid {
+            assert!(
+                matches!(
+                    validate_topic_name(name),
+                    Err(crate::ClientError::InvalidTopicName(_))
+                ),
+                "Expected {:?} to be invalid",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_topic_name_rejects_unicode() {
+        let result = validate_topic_name("tópico");
+        assert!(
+            matches!(result, Err(crate::ClientError::InvalidTopicName(_))),
+            "Name with unicode should be invalid"
+        );
     }
 }

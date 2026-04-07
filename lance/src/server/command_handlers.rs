@@ -115,6 +115,14 @@ impl<'a> ControlCommandDispatcher<'a> {
     }
 
     /// Execute fetch request against topic registry
+    ///
+    /// Handles the tail sentinel (`u64::MAX`) used by clients seeking to
+    /// the end of a topic.  When the sentinel is received the server
+    /// resolves it to the current data-end offset and returns an empty
+    /// fetch response so the client can begin tailing from that position.
+    /// Without this, the CATCHING_UP heuristic would fire for every empty
+    /// or partially-filled topic, trapping consumers in an infinite
+    /// backoff loop.
     fn handle_fetch_request(&self, req: &FetchRequest) -> Frame {
         if matches!(
             self.ctx
@@ -133,6 +141,23 @@ impl<'a> ControlCommandDispatcher<'a> {
             }
 
             return Frame::new_error_response(&format!("Topic {} not found", req.topic_id));
+        }
+
+        // Handle the tail sentinel (u64::MAX) used by consumers seeking to
+        // the end of a topic (SeekPosition::End).  Resolve it to the
+        // current data-end offset and return an empty response so the
+        // client can begin tailing without triggering the CATCHING_UP
+        // heuristic.
+        if req.start_offset == u64::MAX {
+            let total = self.ctx.topic_registry.total_data_size(req.topic_id);
+            debug!(
+                target: "lance::server",
+                topic_id = req.topic_id,
+                resolved_offset = total,
+                "Fetch: resolved tail sentinel (u64::MAX) to current end offset"
+            );
+            let response = FetchResponse::new(total, 0, Bytes::new());
+            return Frame::new_fetch_response(Bytes::from(response.encode()));
         }
 
         match self.ctx.topic_registry.read_from_offset(
@@ -169,13 +194,15 @@ impl<'a> ControlCommandDispatcher<'a> {
     }
 }
 
-/// Check if a command is topic metadata operation requiring leader-authoritative handling.
-/// This includes read + write metadata commands to avoid stale follower views.
+/// Check if a command is a topic metadata *write* operation requiring
+/// leader-authoritative handling.  Read-only operations like `ListTopics`
+/// are excluded so that every node can serve its local topic registry
+/// without forwarding to the leader — improving availability during
+/// elections and leadership transitions.
 pub fn is_topic_metadata_operation(command: ControlCommand) -> bool {
     matches!(
         command,
         ControlCommand::CreateTopic
-            | ControlCommand::ListTopics
             | ControlCommand::GetTopic
             | ControlCommand::DeleteTopic
             | ControlCommand::SetRetention
@@ -802,7 +829,9 @@ mod tests {
         assert!(is_topic_metadata_operation(
             ControlCommand::CreateTopicWithRetention
         ));
-        assert!(is_topic_metadata_operation(ControlCommand::ListTopics));
+        // ListTopics is read-only and excluded from leader-authoritative gating
+        // so followers can serve their local topic list during elections.
+        assert!(!is_topic_metadata_operation(ControlCommand::ListTopics));
         assert!(is_topic_metadata_operation(ControlCommand::GetTopic));
         assert!(!is_topic_metadata_operation(ControlCommand::Fetch));
         assert!(!is_topic_metadata_operation(ControlCommand::Subscribe));
@@ -886,5 +915,138 @@ mod tests {
             frame.frame_type,
             lnc_network::FrameType::Control(ControlCommand::ErrorResponse)
         ));
+    }
+
+    /// Regression test: tail sentinel (u64::MAX) on an empty topic must return
+    /// a normal (empty) FetchResponse, NOT a CATCHING_UP frame.
+    ///
+    /// Before the fix, `start_offset = u64::MAX` with `total = 0` triggered
+    /// the `start_offset > total` heuristic and returned CATCHING_UP,
+    /// trapping consumers in an infinite backoff loop.
+    #[test]
+    fn test_fetch_tail_sentinel_empty_topic_returns_fetch_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = TopicRegistry::new(dir.path().to_path_buf()).unwrap();
+        // Create an empty topic (no data produced)
+        let topic_meta = registry.create_topic("empty-topic").unwrap();
+
+        let rate_limiter = ConsumerRateLimiter::disabled();
+        let sub_manager = SubscriptionManager::new();
+        let cluster: Option<Arc<ClusterCoordinator>> = None;
+
+        let ctx = CommandContext {
+            topic_registry: &registry,
+            rate_limiter: &rate_limiter,
+            subscription_manager: &sub_manager,
+            cluster: &cluster,
+        };
+
+        let dispatcher = ControlCommandDispatcher::new(&ctx);
+
+        // Build a FetchRequest with the tail sentinel
+        let req = FetchRequest {
+            topic_id: topic_meta.id,
+            start_offset: u64::MAX,
+            max_bytes: 65536,
+        };
+
+        let frame = dispatcher.handle_fetch_request(&req);
+
+        // Must be a FetchResponse, not CatchingUp
+        assert!(
+            matches!(
+                frame.frame_type,
+                lnc_network::FrameType::Control(ControlCommand::FetchResponse)
+            ),
+            "Tail sentinel on empty topic must return FetchResponse, got: {:?}",
+            frame.frame_type
+        );
+    }
+
+    /// Verify that a concrete offset beyond total data still returns
+    /// CATCHING_UP in cluster mode (normal replication-lag behavior).
+    #[test]
+    fn test_fetch_concrete_offset_beyond_total_returns_catching_up_in_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = TopicRegistry::new(dir.path().to_path_buf()).unwrap();
+        let topic_meta = registry.create_topic("test-topic").unwrap();
+        let topic_id = topic_meta.id;
+
+        let rate_limiter = ConsumerRateLimiter::disabled();
+        let sub_manager = SubscriptionManager::new();
+        // No cluster -- CATCHING_UP logic only applies when cluster is Some,
+        // but the `start_offset > total` check is hit regardless of cluster
+        // membership for the replication-lag heuristic.
+        let cluster: Option<Arc<ClusterCoordinator>> = None;
+
+        let ctx = CommandContext {
+            topic_registry: &registry,
+            rate_limiter: &rate_limiter,
+            subscription_manager: &sub_manager,
+            cluster: &cluster,
+        };
+
+        let dispatcher = ControlCommandDispatcher::new(&ctx);
+
+        // Concrete offset that is beyond the empty topic's total (0)
+        let req = FetchRequest {
+            topic_id,
+            start_offset: 1024,
+            max_bytes: 65536,
+        };
+
+        let frame = dispatcher.handle_fetch_request(&req);
+
+        // Should return CATCHING_UP since 1024 > 0 (topic total) and the
+        // offset is a concrete value (not the tail sentinel)
+        assert!(
+            matches!(
+                frame.frame_type,
+                lnc_network::FrameType::Control(ControlCommand::CatchingUp)
+            ),
+            "Concrete offset beyond total should return CatchingUp, got: {:?}",
+            frame.frame_type
+        );
+    }
+
+    /// Verify that a fetch at offset 0 on an empty topic returns an empty
+    /// FetchResponse (not CATCHING_UP).
+    #[test]
+    fn test_fetch_offset_zero_empty_topic_returns_fetch_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = TopicRegistry::new(dir.path().to_path_buf()).unwrap();
+        let topic_meta = registry.create_topic("empty-topic").unwrap();
+        let topic_id = topic_meta.id;
+
+        let rate_limiter = ConsumerRateLimiter::disabled();
+        let sub_manager = SubscriptionManager::new();
+        let cluster: Option<Arc<ClusterCoordinator>> = None;
+
+        let ctx = CommandContext {
+            topic_registry: &registry,
+            rate_limiter: &rate_limiter,
+            subscription_manager: &sub_manager,
+            cluster: &cluster,
+        };
+
+        let dispatcher = ControlCommandDispatcher::new(&ctx);
+
+        let req = FetchRequest {
+            topic_id,
+            start_offset: 0,
+            max_bytes: 65536,
+        };
+
+        let frame = dispatcher.handle_fetch_request(&req);
+
+        // Offset 0 on an empty topic should return a normal (empty) response
+        assert!(
+            matches!(
+                frame.frame_type,
+                lnc_network::FrameType::Control(ControlCommand::FetchResponse)
+            ),
+            "Offset 0 on empty topic must return FetchResponse, got: {:?}",
+            frame.frame_type
+        );
     }
 }

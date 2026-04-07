@@ -140,7 +140,7 @@ pub use connection::{
 pub use consumer::{
     Consumer, ConsumerConfig, PollResult, SeekPosition, StreamingConsumer, StreamingConsumerConfig,
 };
-pub use error::{ClientError, parse_not_leader_error};
+pub use error::{ClientError, parse_not_leader_error, validate_topic_name};
 pub use grouped::{
     AssignmentStrategy, GroupConfig, GroupCoordinator, GroupedConsumer, WorkerConfig,
 };

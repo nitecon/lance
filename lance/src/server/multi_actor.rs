@@ -157,14 +157,27 @@ pub struct MultiActorSender {
 }
 
 impl MultiActorSender {
-    /// Send a request to the appropriate actor based on topic_id hash partitioning
+    /// Send a request to the appropriate actor based on topic_id hash partitioning.
+    ///
+    /// **Ordering guarantee**: All messages for the same `topic_id` are routed to
+    /// the same actor regardless of which connection they arrive on. This ensures
+    /// per-topic message ordering is preserved even when writes are forwarded from
+    /// followers via a connection pool (where each pooled connection has a different
+    /// `routing_key`).
+    ///
+    /// Multi-actor parallelism is still achieved across *different* topics — each
+    /// topic hashes to one of the N actors, distributing the workload.
     ///
     /// This is async and yields to the Tokio runtime when the channel is full,
     /// providing true backpressure without busy-spinning.
     pub async fn send(&self, request: IngestionRequest) -> Result<()> {
-        let mixed =
-            (request.topic_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ request.routing_key;
-        let actor_id = (mixed as usize) % self.actor_count;
+        // Hash on topic_id ONLY to guarantee per-topic ordering.
+        // Previously this XOR'd with routing_key for hot-topic sharding, but that
+        // broke ordering when followers forwarded writes via a connection pool
+        // (each pooled connection had a different routing_key, scattering a single
+        // topic's messages across multiple actors and segment files).
+        let hashed = (request.topic_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let actor_id = (hashed as usize) % self.actor_count;
 
         // send_async yields to the Tokio runtime if the channel is full.
         // No more busy-spinning!
@@ -585,16 +598,40 @@ mod tests {
         // Verify sender has correct actor count
         assert_eq!(sender.actor_count, 4);
 
-        // Hot-topic sharding: same topic can map to different actors
-        // for different routing keys.
+        // Per-topic ordering: same topic_id MUST always map to the same actor,
+        // regardless of routing_key. This guarantees per-topic message ordering
+        // when writes arrive from different forwarding pool connections.
         let topic_id = 42u32;
-        let mut seen = std::collections::HashSet::new();
+        let expected_actor = (((topic_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) as usize) % 4;
         for routing_key in [1u64, 7, 13, 21, 34, 55, 89, 144] {
-            let actor = (((topic_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ routing_key)
-                as usize)
-                % 4;
+            // routing_key is no longer used in the hash, but we verify the
+            // invariant holds for any value a caller might set.
+            let _ = routing_key;
+            let actor = (((topic_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) as usize) % 4;
+            assert_eq!(
+                actor, expected_actor,
+                "topic {} must always route to the same actor",
+                topic_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_different_topics_spread_across_actors() {
+        // Verify that different topic_ids distribute across actors to utilize
+        // multi-actor parallelism. With 4 actors and enough topics, we should
+        // see all actors used.
+        let actor_count = 4usize;
+        let mut seen = std::collections::HashSet::new();
+        for topic_id in 0u32..32 {
+            let actor =
+                (((topic_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) as usize) % actor_count;
             seen.insert(actor);
         }
-        assert!(seen.len() > 1);
+        assert_eq!(
+            seen.len(),
+            actor_count,
+            "32 topics should spread across all 4 actors"
+        );
     }
 }

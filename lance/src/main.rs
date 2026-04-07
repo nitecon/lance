@@ -61,6 +61,16 @@ struct Args {
     /// Example: --consumer-rate-limit 104857600  (100 MB/s)
     #[arg(long, value_name = "BYTES_PER_SEC")]
     consumer_rate_limit: Option<u64>,
+
+    /// Number of ingestion actors for parallel write processing.
+    /// Higher values improve multi-core throughput. Default: 1
+    #[arg(long, default_value = "1")]
+    ingestion_actor_count: usize,
+
+    /// Maximum concurrent replication batches in flight.
+    /// Higher values improve replication throughput. Default: 8
+    #[arg(long, default_value = "8")]
+    replication_max_inflight: usize,
 }
 
 #[tokio::main]

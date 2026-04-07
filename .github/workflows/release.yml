@@ -121,7 +121,7 @@ jobs:
           tar -czvf lance-${VERSION}-linux-x86_64.tar.gz lance lnc LICENSE
           rm lance lnc LICENSE
           
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: lance-linux-x86_64
           path: dist/*.tar.gz
@@ -161,7 +161,7 @@ jobs:
           tar -czvf lance-${VERSION}-linux-aarch64.tar.gz lance lnc LICENSE
           rm lance lnc LICENSE
           
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: lance-linux-aarch64
           path: dist/*.tar.gz
@@ -194,7 +194,7 @@ jobs:
           tar -czvf lance-${VERSION}-macos-x86_64.tar.gz lance lnc LICENSE
           rm lance lnc LICENSE
           
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: lance-macos-x86_64
           path: dist/*.tar.gz
@@ -227,7 +227,7 @@ jobs:
           tar -czvf lance-${VERSION}-macos-aarch64.tar.gz lance lnc LICENSE
           rm lance lnc LICENSE
           
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: lance-macos-aarch64
           path: dist/*.tar.gz

@@ -275,7 +275,7 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
             
       - name: Build and push with attestations
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64

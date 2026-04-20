@@ -1486,8 +1486,9 @@ impl ResyncServer {
             offset += n as u64;
 
             // Bandwidth throttling (leader side)
-            if let Some(expected_duration_ns) =
-                (n as u64 * 1_000_000_000).checked_div(max_bw).filter(|&d| d > 0)
+            if let Some(expected_duration_ns) = (n as u64 * 1_000_000_000)
+                .checked_div(max_bw)
+                .filter(|&d| d > 0)
             {
                 tokio::time::sleep(Duration::from_nanos(expected_duration_ns)).await;
             }

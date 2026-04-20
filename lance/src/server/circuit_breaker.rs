@@ -220,17 +220,15 @@ impl CircuitBreaker {
 
                 self.last_failure_at.store(now, Ordering::Relaxed);
             },
-            2 => {
+            2 if self
+                .state
+                .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok() =>
+            {
                 // In half-open state, any failure reopens the circuit
-                if self
-                    .state
-                    .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    self.opened_at.store(now, Ordering::Relaxed);
-                    self.success_count.store(0, Ordering::Relaxed);
-                    tracing::warn!(target: "lance::circuit_breaker", "Circuit reopened after half-open failure");
-                }
+                self.opened_at.store(now, Ordering::Relaxed);
+                self.success_count.store(0, Ordering::Relaxed);
+                tracing::warn!(target: "lance::circuit_breaker", "Circuit reopened after half-open failure");
             },
             _ => {},
         }

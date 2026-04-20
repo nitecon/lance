@@ -299,9 +299,7 @@ async fn producer_task(
     ready: Arc<Notify>,
 ) {
     let msgs_per_sec = rate.max(1) / 60;
-    let interval_us = 1_000_000u64
-        .checked_div(msgs_per_sec)
-        .unwrap_or(10_000); // default 100/s
+    let interval_us = 1_000_000u64.checked_div(msgs_per_sec).unwrap_or(10_000); // default 100/s
     info!(
         msgs_per_sec,
         interval_us,

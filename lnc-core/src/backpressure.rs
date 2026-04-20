@@ -167,11 +167,7 @@ impl BackpressureMonitor {
         let mem_bytes = self.memory_bytes.load(Ordering::Relaxed);
         let mem_total = self.memory_total.load(Ordering::Relaxed);
         #[allow(clippy::cast_possible_truncation)]
-        let mem_pct = if mem_total > 0 {
-            ((mem_bytes * 100) / mem_total) as u8
-        } else {
-            0
-        };
+        let mem_pct = (mem_bytes * 100).checked_div(mem_total).unwrap_or(0) as u8;
 
         // Check critical thresholds first
         if queue >= self.config.queue_depth_critical
@@ -246,8 +242,7 @@ impl BackpressureMonitor {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_nanos() as u64)
     }
 
     /// Should we sample metrics now? (lock-free implementation)
@@ -293,11 +288,7 @@ impl BackpressureSnapshot {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn memory_pct(&self) -> u8 {
-        if self.memory_total > 0 {
-            ((self.memory_bytes * 100) / self.memory_total) as u8
-        } else {
-            0
-        }
+        (self.memory_bytes * 100).checked_div(self.memory_total).unwrap_or(0) as u8
     }
 }
 

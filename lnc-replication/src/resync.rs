@@ -472,11 +472,7 @@ const BULK_RESYNC_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 /// Analyze the gap between follower and leader to determine resync strategy.
 pub fn detect_gap(follower_offset: u64, leader_offset: u64, avg_segment_size: u64) -> GapAnalysis {
     let gap_bytes = leader_offset.saturating_sub(follower_offset);
-    let estimated_missing_segments = if avg_segment_size > 0 {
-        gap_bytes / avg_segment_size
-    } else {
-        0
-    };
+    let estimated_missing_segments = gap_bytes.checked_div(avg_segment_size).unwrap_or(0);
 
     let requires_bulk_resync = gap_bytes > BULK_RESYNC_THRESHOLD_BYTES;
 
@@ -1490,11 +1486,10 @@ impl ResyncServer {
             offset += n as u64;
 
             // Bandwidth throttling (leader side)
-            if max_bw > 0 {
-                let expected_duration_ns = (n as u64 * 1_000_000_000) / max_bw;
-                if expected_duration_ns > 0 {
-                    tokio::time::sleep(Duration::from_nanos(expected_duration_ns)).await;
-                }
+            if let Some(expected_duration_ns) =
+                (n as u64 * 1_000_000_000).checked_div(max_bw).filter(|&d| d > 0)
+            {
+                tokio::time::sleep(Duration::from_nanos(expected_duration_ns)).await;
             }
         }
 

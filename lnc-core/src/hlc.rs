@@ -288,13 +288,11 @@ impl HybridLogicalClock {
     /// Get current wall clock time in milliseconds since Unix epoch.
     #[inline]
     fn wall_clock_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| {
-                #[allow(clippy::cast_possible_truncation)]
-                let ms = d.as_millis() as u64;
-                ms
-            })
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+            #[allow(clippy::cast_possible_truncation)]
+            let ms = d.as_millis() as u64;
+            ms
+        })
     }
 }
 

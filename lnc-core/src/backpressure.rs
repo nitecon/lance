@@ -288,7 +288,9 @@ impl BackpressureSnapshot {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn memory_pct(&self) -> u8 {
-        (self.memory_bytes * 100).checked_div(self.memory_total).unwrap_or(0) as u8
+        (self.memory_bytes * 100)
+            .checked_div(self.memory_total)
+            .unwrap_or(0) as u8
     }
 }
 

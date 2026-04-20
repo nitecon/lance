@@ -297,7 +297,7 @@ pub fn record_raft_leader_tenure_ms(ms: u64) {
     RAFT_LEADER_TENURE_LAST_MS.store(ms, Ordering::Relaxed);
     let ended = RAFT_LEADER_TENURE_ENDED.fetch_add(1, Ordering::Relaxed) + 1;
     let sum = RAFT_LEADER_TENURE_SUM_MS.fetch_add(ms, Ordering::Relaxed) + ms;
-    let avg = if ended > 0 { sum / ended } else { 0 };
+    let avg = sum.checked_div(ended).unwrap_or(0);
     RAFT_LEADER_TENURE_AVG_MS.store(avg, Ordering::Relaxed);
     metrics::histogram!("lance_raft_leader_tenure_ms").record(ms as f64);
 }

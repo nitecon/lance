@@ -73,8 +73,7 @@ impl NumaTopology {
 
     #[cfg(target_os = "linux")]
     fn detect_cpu_count() -> usize {
-        std::thread::available_parallelism()
-            .map_or(1, std::num::NonZero::get)
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
     }
 
     #[cfg(target_os = "linux")]

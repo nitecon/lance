@@ -300,11 +300,10 @@ impl RateTracker {
         let last_val = self.last_value.load(Ordering::Relaxed);
 
         let elapsed_ms = current_time_ms.saturating_sub(last_ms);
-        if elapsed_ms > 0 {
-            let delta = current_value.saturating_sub(last_val);
-            // Rate = delta / elapsed_seconds = (delta * 1000) / elapsed_ms
-            // Scale by 1000 for precision
-            let rate = (delta * 1_000_000) / elapsed_ms;
+        let delta = current_value.saturating_sub(last_val);
+        // Rate = delta / elapsed_seconds = (delta * 1000) / elapsed_ms
+        // Scale by 1000 for precision
+        if let Some(rate) = (delta * 1_000_000).checked_div(elapsed_ms) {
             self.rate_scaled.store(rate, Ordering::Relaxed);
         }
 

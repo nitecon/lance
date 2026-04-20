@@ -225,7 +225,7 @@ impl TieredStorageManager {
         }
 
         // Sort by age (oldest first)
-        segments.sort_by(|a, b| b.age.cmp(&a.age));
+        segments.sort_by_key(|s| std::cmp::Reverse(s.age));
 
         Ok(segments)
     }

@@ -64,7 +64,7 @@ tempfile = "3.27"
 rayon = "1.12"
 socket2 = "0.5"
 io-uring = "0.7"
-dashmap = "6.1"
+dashmap = "6.2"
 parking_lot = "0.12"
 
 [profile.release]

@@ -454,7 +454,7 @@ cargo run --release -p lnc-chaos -- \
 
 ### Prerequisites
 
-- **Rust**: 2024 edition (1.85+) - Required for `gen` blocks, `async` closures, and Linux-specific features
+- **Rust**: 2024 edition (1.88+) - Required for `gen` blocks, `async` closures, and Linux-specific features
 - **Linux**: 5.15+ (io_uring with `IORING_OP_SEND_ZC`, `IORING_OP_TEE`)
 - **Hardware**: NVMe SSD, 10G+ NIC recommended
 

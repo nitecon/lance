@@ -23,7 +23,7 @@ ARG CARGO_BUILD_JOBS=1
 # =============================================================================
 # Stage 1: Builder
 # =============================================================================
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 
 ARG BUILD_MODE
 ARG FEATURES

@@ -15,6 +15,12 @@ updates:
       - "rust"
     commit-message:
       prefix: "deps"
+    ignore:
+      # The `futures` meta-crate triggers an upstream dependabot-core
+      # `unknown_error` during rust-minor group filtering
+      # (dependency_change_builder.rb:155). Ignoring it unblocks the rest of
+      # the weekly group. See PR for details / upstream issue tracking.
+      - dependency-name: "futures"
     groups:
       # Group minor/patch updates to reduce PR noise
       rust-minor:

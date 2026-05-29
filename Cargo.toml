@@ -62,7 +62,7 @@ opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "metrics"] }
 tonic = "0.14"
 tempfile = "3.27"
 rayon = "1.12"
-socket2 = "0.5"
+socket2 = "0.6"
 io-uring = "0.7"
 dashmap = "6.2"
 parking_lot = "0.12"

@@ -1198,7 +1198,7 @@ dependencies = [
  "lnc-recovery",
  "rayon",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tempfile",
  "tokio",
  "tokio-rustls",

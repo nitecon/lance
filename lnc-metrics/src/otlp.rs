@@ -100,14 +100,14 @@ pub fn init_otlp_metrics(config: &OtlpConfig) -> Result<(), String> {
         .build()
         .map_err(|e| format!("Failed to create OTLP exporter: {}", e))?;
 
-    // Create periodic reader that exports metrics on interval
-    // Uses tokio runtime for async export
-    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(
-        exporter,
-        opentelemetry_sdk::runtime::Tokio,
-    )
-    .with_interval(config.export_interval)
-    .build();
+    // Create periodic reader that exports metrics on interval.
+    //
+    // Since opentelemetry_sdk 0.30 the periodic reader runs on its own
+    // dedicated background thread and no longer takes an async-runtime
+    // argument; `PeriodicReader::builder` now accepts only the exporter.
+    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
+        .with_interval(config.export_interval)
+        .build();
 
     // Build the meter provider
     let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()

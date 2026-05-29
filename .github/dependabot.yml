@@ -18,9 +18,15 @@ updates:
     ignore:
       # The `futures` meta-crate triggers an upstream dependabot-core
       # `unknown_error` during rust-minor group filtering
-      # (dependency_change_builder.rb:155). Ignoring it unblocks the rest of
-      # the weekly group. See PR for details / upstream issue tracking.
+      # (dependency_change_builder.rb:155). `futures` is kept current
+      # manually (last bumped to 0.3.32 alongside the opentelemetry 0.32
+      # migration); this ignore is NARROWED to only suppress the minor/patch
+      # updates that re-trigger the upstream updater crash, so that
+      # SECURITY/major advisories on `futures` are still surfaced.
       - dependency-name: "futures"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
     groups:
       # Group minor/patch updates to reduce PR noise
       rust-minor:

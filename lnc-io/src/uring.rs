@@ -2002,15 +2002,15 @@ impl AsyncIoPoller {
         cpu_affinity: Option<usize>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            if let Some(cpu) = cpu_affinity {
-                if let Err(e) = lnc_core::pin_thread_to_cpu(cpu) {
-                    tracing::warn!(
-                        target: "lance::io",
-                        cpu,
-                        error = %e,
-                        "Failed to pin poller thread to CPU"
-                    );
-                }
+            if let Some(cpu) = cpu_affinity
+                && let Err(e) = lnc_core::pin_thread_to_cpu(cpu)
+            {
+                tracing::warn!(
+                    target: "lance::io",
+                    cpu,
+                    error = %e,
+                    "Failed to pin poller thread to CPU"
+                );
             }
 
             self.run(poll_interval_us);

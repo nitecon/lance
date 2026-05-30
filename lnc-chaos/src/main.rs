@@ -527,7 +527,7 @@ async fn consumer_task(
             Ok(Some(result)) if !result.end_of_stream => {
                 seek_fetches += 1;
                 consecutive_idle = 0;
-                if seek_fetches % 100 == 0 {
+                if seek_fetches.is_multiple_of(100) {
                     info!(
                         offset = consumer.current_offset(),
                         seek_fetches, "[{label}] Still seeking to end of existing data..."
@@ -1062,10 +1062,10 @@ async fn reset_infrastructure(
                 ])
                 .output()
                 .await;
-            if let Ok(o) = out {
-                if o.status.success() {
-                    info!("║ Deleted service/{svc}");
-                }
+            if let Ok(o) = out
+                && o.status.success()
+            {
+                info!("║ Deleted service/{svc}");
             }
         }
     }

@@ -432,16 +432,16 @@ pub fn resolve_node_id() -> Option<u16> {
     }
 
     // Priority 2: Parse from hostname (StatefulSet pattern: lance-0, lance-1)
-    if let Ok(hostname) = std::env::var("HOSTNAME") {
-        if let Some(id) = parse_node_id_from_hostname(&hostname) {
-            tracing::info!(
-                target: "lance::discovery",
-                node_id = id,
-                hostname = %hostname,
-                "Node ID resolved from HOSTNAME env-var"
-            );
-            return Some(id);
-        }
+    if let Ok(hostname) = std::env::var("HOSTNAME")
+        && let Some(id) = parse_node_id_from_hostname(&hostname)
+    {
+        tracing::info!(
+            target: "lance::discovery",
+            node_id = id,
+            hostname = %hostname,
+            "Node ID resolved from HOSTNAME env-var"
+        );
+        return Some(id);
     }
 
     // Priority 3: Cannot determine
@@ -465,17 +465,16 @@ pub fn validate_node_id_consistency(configured_node_id: u16) -> Result<(), Strin
     }
 
     // Check hostname-derived ID
-    if let Ok(hostname) = std::env::var("HOSTNAME") {
-        if let Some(hostname_id) = parse_node_id_from_hostname(&hostname) {
-            if hostname_id != configured_node_id {
-                return Err(format!(
-                    "Node ID mismatch: configured node_id={} but hostname '{}' implies node_id={}. \
+    if let Ok(hostname) = std::env::var("HOSTNAME")
+        && let Some(hostname_id) = parse_node_id_from_hostname(&hostname)
+        && hostname_id != configured_node_id
+    {
+        return Err(format!(
+            "Node ID mismatch: configured node_id={} but hostname '{}' implies node_id={}. \
                      This will corrupt Raft persistent state. Either fix the StatefulSet ordinal \
                      or set LANCE_NODE_ID={} to override.",
-                    configured_node_id, hostname, hostname_id, configured_node_id
-                ));
-            }
-        }
+            configured_node_id, hostname, hostname_id, configured_node_id
+        ));
     }
 
     Ok(())

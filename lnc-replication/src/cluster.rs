@@ -356,16 +356,16 @@ impl ClusterCoordinator {
 
             // CONTROL PLANE DECOUPLING: Use try_write to avoid blocking control plane
             // heartbeats/elections. If contended, skip index update - heartbeat will fix it.
-            if response.term <= leader_term {
-                if let Ok(mut raft_guard) = raft.try_write() {
-                    if response.success {
-                        let _ = raft_guard.update_match_index(peer_id, response.match_index);
-                    } else {
-                        let _ = raft_guard.backoff_next_index(peer_id, response.match_index);
-                    }
+            if response.term <= leader_term
+                && let Ok(mut raft_guard) = raft.try_write()
+            {
+                if response.success {
+                    let _ = raft_guard.update_match_index(peer_id, response.match_index);
+                } else {
+                    let _ = raft_guard.backoff_next_index(peer_id, response.match_index);
                 }
-                // If try_write fails, heartbeat fanout will eventually update indices
             }
+            // If try_write fails, heartbeat fanout will eventually update indices
 
             Ok(response)
         }
@@ -594,14 +594,14 @@ impl ClusterCoordinator {
             }
         };
 
-        if let Some(handle) = finished {
-            if let Err(e) = handle.await {
-                warn!(
-                    target: "lance::cluster",
-                    error = %e,
-                    "Election round task terminated unexpectedly"
-                );
-            }
+        if let Some(handle) = finished
+            && let Err(e) = handle.await
+        {
+            warn!(
+                target: "lance::cluster",
+                error = %e,
+                "Election round task terminated unexpectedly"
+            );
         }
     }
 
@@ -903,11 +903,11 @@ impl ClusterCoordinator {
             }
 
             // Re-resolve DNS
-            if let Ok(mut addrs) = tokio::net::lookup_host(&host_port).await {
-                if let Some(addr) = addrs.next() {
-                    // add_peer now upserts — updates address if changed
-                    self.peers.add_peer(node_id, addr).await;
-                }
+            if let Ok(mut addrs) = tokio::net::lookup_host(&host_port).await
+                && let Some(addr) = addrs.next()
+            {
+                // add_peer now upserts — updates address if changed
+                self.peers.add_peer(node_id, addr).await;
             }
         }
     }
@@ -981,25 +981,24 @@ impl ClusterCoordinator {
             if *peer_id == my_node_id {
                 continue;
             }
-            if data_plane_ids.contains(peer_id) {
-                if let Some(control_addr) = self.peers.get_peer_addr(*peer_id).await {
-                    let expected_dp_addr = SocketAddr::new(control_addr.ip(), 1995);
-                    if let Some(current_dp_addr) =
-                        self.data_plane_manager.get_follower_addr(*peer_id).await
-                    {
-                        if current_dp_addr != expected_dp_addr {
-                            info!(
-                                target: "lance::cluster",
-                                node_id = peer_id,
-                                old_addr = %current_dp_addr,
-                                new_addr = %expected_dp_addr,
-                                "Updating stale data plane address for follower"
-                            );
-                            self.data_plane_manager
-                                .update_follower_address(*peer_id, expected_dp_addr)
-                                .await;
-                        }
-                    }
+            if data_plane_ids.contains(peer_id)
+                && let Some(control_addr) = self.peers.get_peer_addr(*peer_id).await
+            {
+                let expected_dp_addr = SocketAddr::new(control_addr.ip(), 1995);
+                if let Some(current_dp_addr) =
+                    self.data_plane_manager.get_follower_addr(*peer_id).await
+                    && current_dp_addr != expected_dp_addr
+                {
+                    info!(
+                        target: "lance::cluster",
+                        node_id = peer_id,
+                        old_addr = %current_dp_addr,
+                        new_addr = %expected_dp_addr,
+                        "Updating stale data plane address for follower"
+                    );
+                    self.data_plane_manager
+                        .update_follower_address(*peer_id, expected_dp_addr)
+                        .await;
                 }
             }
         }
@@ -1634,17 +1633,17 @@ impl ClusterCoordinator {
             };
 
             // Emit to broadcast channel if we have an event
-            if let Some(evt) = event {
-                if self.event_tx.send(evt).is_err() {
-                    // No active receivers — stop applying to avoid unbounded work.
-                    // The Applier will retry on the next commit_notify signal.
-                    trace!(
-                        target: "lance::apply",
-                        index = entry.index,
-                        "No active event subscribers, pausing apply loop"
-                    );
-                    break;
-                }
+            if let Some(evt) = event
+                && self.event_tx.send(evt).is_err()
+            {
+                // No active receivers — stop applying to avoid unbounded work.
+                // The Applier will retry on the next commit_notify signal.
+                trace!(
+                    target: "lance::apply",
+                    index = entry.index,
+                    "No active event subscribers, pausing apply loop"
+                );
+                break;
             }
 
             // Advance last_applied entry-by-entry for crash safety.
@@ -2260,15 +2259,15 @@ impl ClusterCoordinator {
                             Ok(response) => {
                                 // CONTROL PLANE DECOUPLING: Use try_write to avoid blocking
                                 // other heartbeat tasks. If contended, skip - next tick will fix.
-                                if response.term <= leader_term {
-                                    if let Ok(mut raft_guard) = raft.try_write() {
-                                        if response.success {
-                                            let _ = raft_guard
-                                                .update_match_index(peer_id, response.match_index);
-                                        } else {
-                                            let _ = raft_guard
-                                                .backoff_next_index(peer_id, response.match_index);
-                                        }
+                                if response.term <= leader_term
+                                    && let Ok(mut raft_guard) = raft.try_write()
+                                {
+                                    if response.success {
+                                        let _ = raft_guard
+                                            .update_match_index(peer_id, response.match_index);
+                                    } else {
+                                        let _ = raft_guard
+                                            .backoff_next_index(peer_id, response.match_index);
                                     }
                                 }
                                 Ok(response)
@@ -2772,34 +2771,34 @@ async fn handle_peer_connection(
                 // IMPORTANT: We only persist when Raft accepted the append. Persisting
                 // rejected requests (stale term / mismatched prev_log) can incorrectly
                 // truncate follower logs and violate committed-entry safety.
-                if resp.success && !req.entries.is_empty() {
-                    if let Err(e) = persist_append_entries_blocking(
+                if resp.success
+                    && !req.entries.is_empty()
+                    && let Err(e) = persist_append_entries_blocking(
                         log_store.clone(),
                         req.prev_log_index,
                         req.prev_log_term,
                         req.entries.clone(),
                     )
                     .await
-                    {
-                        warn!(
-                            target: "lance::cluster",
-                            error = %e,
-                            "Failed to persist accepted append entries"
-                        );
-                        // Do not acknowledge success if durability failed.
-                        resp.success = false;
-                        // On conflict/mismatch we must report the last index *before* the
-                        // rejected prev_log so leaders can backtrack next_index. Returning
-                        // old_last_log_index here can pin retries to the same mismatched
-                        // prev_log_index and exhaust catch-up budget.
-                        resp.match_index = req.prev_log_index.saturating_sub(1);
-                        let mut raft_guard = raft.write().await;
-                        raft_guard.rollback_failed_append(
-                            old_last_log_index,
-                            old_last_log_term,
-                            old_commit,
-                        );
-                    }
+                {
+                    warn!(
+                        target: "lance::cluster",
+                        error = %e,
+                        "Failed to persist accepted append entries"
+                    );
+                    // Do not acknowledge success if durability failed.
+                    resp.success = false;
+                    // On conflict/mismatch we must report the last index *before* the
+                    // rejected prev_log so leaders can backtrack next_index. Returning
+                    // old_last_log_index here can pin retries to the same mismatched
+                    // prev_log_index and exhaust catch-up budget.
+                    resp.match_index = req.prev_log_index.saturating_sub(1);
+                    let mut raft_guard = raft.write().await;
+                    raft_guard.rollback_failed_append(
+                        old_last_log_index,
+                        old_last_log_term,
+                        old_commit,
+                    );
                 }
 
                 // If commit_index advanced, wake the Apply Loop immediately

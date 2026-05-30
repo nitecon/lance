@@ -162,12 +162,11 @@ impl ReplicationActor {
     }
 
     pub fn update_follower_health(&mut self, node_id: u16, latency: Duration) {
-        if let Some(follower) = self.followers.get_mut(&node_id) {
-            if let Some(new_status) = follower.record_latency(latency) {
-                if new_status == FollowerStatus::Evicted || new_status == FollowerStatus::Healthy {
-                    self.recalculate_quorum();
-                }
-            }
+        if let Some(follower) = self.followers.get_mut(&node_id)
+            && let Some(new_status) = follower.record_latency(latency)
+            && (new_status == FollowerStatus::Evicted || new_status == FollowerStatus::Healthy)
+        {
+            self.recalculate_quorum();
         }
     }
 

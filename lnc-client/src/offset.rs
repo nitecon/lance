@@ -189,14 +189,14 @@ impl LockFileOffsetStore {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".offset") {
-                    // Parse topic-{id}-consumer-{id}.offset
-                    if let Some((topic_id, consumer_id)) = Self::parse_offset_filename(name) {
-                        if let Ok(offset) = Self::read_offset_file(&path) {
-                            cache.insert((topic_id, consumer_id), offset);
-                        }
-                    }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.ends_with(".offset")
+            {
+                // Parse topic-{id}-consumer-{id}.offset
+                if let Some((topic_id, consumer_id)) = Self::parse_offset_filename(name)
+                    && let Ok(offset) = Self::read_offset_file(&path)
+                {
+                    cache.insert((topic_id, consumer_id), offset);
                 }
             }
         }
@@ -457,10 +457,10 @@ impl<S: OffsetStore> OffsetStore for HookedOffsetStore<S> {
         let offset = self.inner.load(topic_id, consumer_id)?;
 
         // Track for previous_offset in commits
-        if let Some(off) = offset {
-            if let Ok(mut prev) = self.previous_offsets.write() {
-                prev.insert((topic_id, consumer_id), off);
-            }
+        if let Some(off) = offset
+            && let Ok(mut prev) = self.previous_offsets.write()
+        {
+            prev.insert((topic_id, consumer_id), off);
         }
 
         Ok(offset)

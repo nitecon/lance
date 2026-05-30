@@ -338,31 +338,31 @@ impl TopicRegistry {
 
             // Reconcile stale mappings after election churn / partial ops:
             // if this name currently points at a different ID, remove old ID row.
-            if let Some(existing_id_for_name) = by_name.get(name).copied() {
-                if existing_id_for_name != id {
-                    by_id.remove(&existing_id_for_name);
-                    warn!(
-                        target: "lance::topic",
-                        topic_name = %name,
-                        old_topic_id = existing_id_for_name,
-                        new_topic_id = id,
-                        "Replacing stale replicated topic mapping by name"
-                    );
-                }
+            if let Some(existing_id_for_name) = by_name.get(name).copied()
+                && existing_id_for_name != id
+            {
+                by_id.remove(&existing_id_for_name);
+                warn!(
+                    target: "lance::topic",
+                    topic_name = %name,
+                    old_topic_id = existing_id_for_name,
+                    new_topic_id = id,
+                    "Replacing stale replicated topic mapping by name"
+                );
             }
 
             // If this ID was previously associated to another name, remove that name mapping.
-            if let Some(existing_meta_for_id) = by_id.get(&id) {
-                if existing_meta_for_id.name != name {
-                    by_name.remove(&existing_meta_for_id.name);
-                    warn!(
-                        target: "lance::topic",
-                        topic_id = id,
-                        old_topic_name = %existing_meta_for_id.name,
-                        new_topic_name = %name,
-                        "Replacing stale replicated topic mapping by id"
-                    );
-                }
+            if let Some(existing_meta_for_id) = by_id.get(&id)
+                && existing_meta_for_id.name != name
+            {
+                by_name.remove(&existing_meta_for_id.name);
+                warn!(
+                    target: "lance::topic",
+                    topic_id = id,
+                    old_topic_name = %existing_meta_for_id.name,
+                    new_topic_name = %name,
+                    "Replacing stale replicated topic mapping by id"
+                );
             }
 
             by_name.insert(name.to_string(), id);
@@ -413,13 +413,13 @@ impl TopicRegistry {
             .get_topic_by_id(id)
             .ok_or(TopicIdentityError::UnknownTopic)?;
 
-        if let Some(expected) = expected_epoch {
-            if metadata.topic_epoch != expected {
-                return Err(TopicIdentityError::StaleEpoch {
-                    expected,
-                    actual: metadata.topic_epoch,
-                });
-            }
+        if let Some(expected) = expected_epoch
+            && metadata.topic_epoch != expected
+        {
+            return Err(TopicIdentityError::StaleEpoch {
+                expected,
+                actual: metadata.topic_epoch,
+            });
         }
 
         Ok(metadata)
@@ -512,11 +512,11 @@ impl TopicRegistry {
             if !metadata_path.exists() {
                 continue;
             }
-            if let Ok(meta) = TopicMetadata::load(&metadata_path) {
-                if meta.id == id {
-                    found_metadata = Some(meta);
-                    break;
-                }
+            if let Ok(meta) = TopicMetadata::load(&metadata_path)
+                && meta.id == id
+            {
+                found_metadata = Some(meta);
+                break;
             }
         }
 
@@ -547,15 +547,15 @@ impl TopicRegistry {
             },
         };
 
-        if let Some(existing_id_for_name) = by_name.get(&metadata.name).copied() {
-            if existing_id_for_name != metadata.id {
-                by_id.remove(&existing_id_for_name);
-            }
+        if let Some(existing_id_for_name) = by_name.get(&metadata.name).copied()
+            && existing_id_for_name != metadata.id
+        {
+            by_id.remove(&existing_id_for_name);
         }
-        if let Some(existing_meta_for_id) = by_id.get(&metadata.id) {
-            if existing_meta_for_id.name != metadata.name {
-                by_name.remove(&existing_meta_for_id.name);
-            }
+        if let Some(existing_meta_for_id) = by_id.get(&metadata.id)
+            && existing_meta_for_id.name != metadata.name
+        {
+            by_name.remove(&existing_meta_for_id.name);
         }
 
         by_name.insert(metadata.name.clone(), metadata.id);
@@ -602,10 +602,10 @@ impl TopicRegistry {
     /// numeric ID for backwards compatibility with legacy data.
     pub fn get_topic_dir(&self, topic_id: u32) -> PathBuf {
         // Resolve topic name from the in-memory registry
-        if let Ok(by_id) = self.topics_by_id.read() {
-            if let Some(meta) = by_id.get(&topic_id) {
-                return self.data_dir.join("segments").join(&meta.name);
-            }
+        if let Ok(by_id) = self.topics_by_id.read()
+            && let Some(meta) = by_id.get(&topic_id)
+        {
+            return self.data_dir.join("segments").join(&meta.name);
         }
         // Fallback: topic not yet registered (shouldn't happen in normal
         // operation but keeps callers from panicking during startup races).
@@ -954,17 +954,16 @@ impl TopicRegistry {
             let index_path = topic_dir.join("sparse.idx");
 
             // Touch the index file to update modification time
-            if index_path.exists() {
-                if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&index_path) {
-                    if file.sync_all().is_ok() {
-                        flushed_count += 1;
-                        debug!(
-                            target: "lance::topic",
-                            topic_id = topic_id,
-                            "Flushed sparse index"
-                        );
-                    }
-                }
+            if index_path.exists()
+                && let Ok(file) = std::fs::OpenOptions::new().write(true).open(&index_path)
+                && file.sync_all().is_ok()
+            {
+                flushed_count += 1;
+                debug!(
+                    target: "lance::topic",
+                    topic_id = topic_id,
+                    "Flushed sparse index"
+                );
             }
         }
 

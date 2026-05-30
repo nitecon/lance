@@ -143,13 +143,13 @@ impl SubscriptionManager {
         }
 
         // Also update the subscription's current offset if it exists
-        if let Ok(mut subs) = self.subscriptions.write() {
-            if let Some(info) = subs.get_mut(&key) {
-                if offset > info.current_offset {
-                    info.current_offset = offset;
-                }
-                info.touch();
+        if let Ok(mut subs) = self.subscriptions.write()
+            && let Some(info) = subs.get_mut(&key)
+        {
+            if offset > info.current_offset {
+                info.current_offset = offset;
             }
+            info.touch();
         }
 
         debug!(

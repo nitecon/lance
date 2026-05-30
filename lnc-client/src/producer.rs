@@ -603,10 +603,10 @@ impl Producer {
             batches.remove(&topic_id)
         };
 
-        if let Some(batch) = batch {
-            if !batch.is_empty() {
-                self.send_batch(batch).await?;
-            }
+        if let Some(batch) = batch
+            && !batch.is_empty()
+        {
+            self.send_batch(batch).await?;
         }
 
         Ok(())
@@ -738,10 +738,10 @@ impl Producer {
                 batches_write.remove(&topic_id)
             };
 
-            if let Some(batch) = batch {
-                if !batch.is_empty() {
-                    Self::send_batch_static(client, metrics, batch).await?;
-                }
+            if let Some(batch) = batch
+                && !batch.is_empty()
+            {
+                Self::send_batch_static(client, metrics, batch).await?;
             }
         }
 

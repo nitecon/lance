@@ -580,12 +580,11 @@ where
     // metadata visibility during leadership churn / follower catch-up windows.
     let should_forward_to_leader =
         command_handlers::is_topic_metadata_operation(command) || command == ControlCommand::Fetch;
-    if should_forward_to_leader {
-        if let Some(action) =
+    if should_forward_to_leader
+        && let Some(action) =
             try_forward_control_to_leader(ctx, command, buffer, consumed, read_offset).await
-        {
-            return action;
-        }
+    {
+        return action;
     }
 
     // Handle locally
@@ -899,22 +898,20 @@ where
 {
     // Topic metadata commands are leader-authoritative to avoid stale
     // follower registry responses during startup/election churn.
-    if command_handlers::is_topic_metadata_operation(command) {
-        if let Some(coord) = cluster {
-            if !coord.is_leader_authoritative() {
-                if coord.is_leader() {
-                    lnc_metrics::increment_cluster_elected_not_ready_rejects();
-                    return send_error(
-                        stream,
-                        "FORWARD_FAILED: Leader not ready (apply/metadata catch-up)",
-                    )
-                    .await;
-                }
-
-                return send_not_leader_error(stream, coord.leader_addr().map(|a| a.to_string()))
-                    .await;
-            }
+    if command_handlers::is_topic_metadata_operation(command)
+        && let Some(coord) = cluster
+        && !coord.is_leader_authoritative()
+    {
+        if coord.is_leader() {
+            lnc_metrics::increment_cluster_elected_not_ready_rejects();
+            return send_error(
+                stream,
+                "FORWARD_FAILED: Leader not ready (apply/metadata catch-up)",
+            )
+            .await;
         }
+
+        return send_not_leader_error(stream, coord.leader_addr().map(|a| a.to_string())).await;
     }
 
     // Build context for handlers

@@ -79,12 +79,11 @@ impl Wal {
 
         if let Ok(entries) = std::fs::read_dir(&self.config.dir) {
             for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if let Some(id_str) = name.strip_suffix(".wal") {
-                        if let Ok(id) = id_str.parse::<u64>() {
-                            max_segment_id = max_segment_id.max(id);
-                        }
-                    }
+                if let Some(name) = entry.file_name().to_str()
+                    && let Some(id_str) = name.strip_suffix(".wal")
+                    && let Ok(id) = id_str.parse::<u64>()
+                {
+                    max_segment_id = max_segment_id.max(id);
                 }
             }
         }

@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn test_aligned_buffer_creation() {
         let buffer = AlignedBuffer::new(8192).unwrap();
-        assert!(buffer.as_ptr() as usize % PAGE_SIZE == 0);
+        assert!((buffer.as_ptr() as usize).is_multiple_of(PAGE_SIZE));
         assert!(buffer.capacity() >= 8192);
     }
 

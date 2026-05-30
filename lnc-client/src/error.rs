@@ -91,10 +91,10 @@ pub fn parse_not_leader_error(msg: &str) -> Option<Option<SocketAddr>> {
     }
 
     // Parse "NOT_LEADER: redirect to X.X.X.X:PORT"
-    if let Some(addr_str) = msg.strip_prefix("NOT_LEADER: redirect to ") {
-        if let Ok(addr) = addr_str.trim().parse::<SocketAddr>() {
-            return Some(Some(addr));
-        }
+    if let Some(addr_str) = msg.strip_prefix("NOT_LEADER: redirect to ")
+        && let Ok(addr) = addr_str.trim().parse::<SocketAddr>()
+    {
+        return Some(Some(addr));
     }
 
     Some(None)

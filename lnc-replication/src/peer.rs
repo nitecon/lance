@@ -669,15 +669,16 @@ impl PeerManager {
 
         for (peer_id, conn) in peers {
             let mut conn = conn.lock().await;
-            if !conn.is_connected() && conn.should_reconnect() {
-                if let Err(e) = conn.connect().await {
-                    warn!(
-                        target: "lance::replication",
-                        peer_id,
-                        error = %e,
-                        "Failed to connect to peer"
-                    );
-                }
+            if !conn.is_connected()
+                && conn.should_reconnect()
+                && let Err(e) = conn.connect().await
+            {
+                warn!(
+                    target: "lance::replication",
+                    peer_id,
+                    error = %e,
+                    "Failed to connect to peer"
+                );
             }
         }
     }

@@ -297,10 +297,10 @@ fn collect_segments(topic_dir: &Path) -> Result<Vec<SegmentInfo>> {
         let entry = entry?;
         let path = entry.path();
 
-        if path.extension().is_some_and(|ext| ext == "lnc") {
-            if let Some(info) = SegmentInfo::from_path(&path) {
-                segments.push(info);
-            }
+        if path.extension().is_some_and(|ext| ext == "lnc")
+            && let Some(info) = SegmentInfo::from_path(&path)
+        {
+            segments.push(info);
         }
     }
 

@@ -119,10 +119,10 @@ impl BackpressureMonitor {
                 for line in content.lines() {
                     if line.starts_with("MemTotal:") {
                         let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 2 {
-                            if let Ok(kb) = parts[1].parse::<u64>() {
-                                return kb * 1024;
-                            }
+                        if parts.len() >= 2
+                            && let Ok(kb) = parts[1].parse::<u64>()
+                        {
+                            return kb * 1024;
                         }
                     }
                 }

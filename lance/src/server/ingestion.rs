@@ -174,41 +174,41 @@ pub fn write_replicated_data_enriched(
             return lnc_io::SegmentWriter::open(&segment_path);
         }
 
-        if leader_write_offset > 0 {
-            if let Some(closed_path) = find_closed_segment_variant(topic_dir, segment_name) {
-                if !segment_path.exists() {
-                    match std::fs::rename(&closed_path, &segment_path) {
-                        Ok(()) => {
-                            tracing::debug!(
-                                target: "lance::ingestion",
-                                segment = %segment_name,
-                                from = %closed_path.display(),
-                                to = %segment_path.display(),
-                                "Renamed closed follower segment to leader canonical name"
-                            );
-                            return lnc_io::SegmentWriter::open(&segment_path);
-                        },
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "lance::ingestion",
-                                segment = %segment_name,
-                                from = %closed_path.display(),
-                                to = %segment_path.display(),
-                                error = %e,
-                                "Failed to canonicalize closed follower segment name, reopening variant"
-                            );
-                        },
-                    }
+        if leader_write_offset > 0
+            && let Some(closed_path) = find_closed_segment_variant(topic_dir, segment_name)
+        {
+            if !segment_path.exists() {
+                match std::fs::rename(&closed_path, &segment_path) {
+                    Ok(()) => {
+                        tracing::debug!(
+                            target: "lance::ingestion",
+                            segment = %segment_name,
+                            from = %closed_path.display(),
+                            to = %segment_path.display(),
+                            "Renamed closed follower segment to leader canonical name"
+                        );
+                        return lnc_io::SegmentWriter::open(&segment_path);
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "lance::ingestion",
+                            segment = %segment_name,
+                            from = %closed_path.display(),
+                            to = %segment_path.display(),
+                            error = %e,
+                            "Failed to canonicalize closed follower segment name, reopening variant"
+                        );
+                    },
                 }
-
-                tracing::debug!(
-                    target: "lance::ingestion",
-                    segment = %segment_name,
-                    closed_segment = %closed_path.display(),
-                    "Reopening closed follower segment for replay"
-                );
-                return lnc_io::SegmentWriter::open(&closed_path);
             }
+
+            tracing::debug!(
+                target: "lance::ingestion",
+                segment = %segment_name,
+                closed_segment = %closed_path.display(),
+                "Reopening closed follower segment for replay"
+            );
+            return lnc_io::SegmentWriter::open(&closed_path);
         }
 
         lnc_io::SegmentWriter::create_named(topic_dir, segment_name)
@@ -258,23 +258,24 @@ pub fn write_replicated_data_enriched(
     };
 
     // Verify the segment name matches what the leader expects
-    if let Some(current_name) = topic_writer.writer.filename() {
-        if current_name != entry.segment_name && !entry.flags.new_segment() {
-            tracing::warn!(
-                target: "lance::ingestion",
-                topic_id,
-                expected = %entry.segment_name,
-                actual = %current_name,
-                "Segment name mismatch — follower may need resync"
-            );
+    if let Some(current_name) = topic_writer.writer.filename()
+        && current_name != entry.segment_name
+        && !entry.flags.new_segment()
+    {
+        tracing::warn!(
+            target: "lance::ingestion",
+            topic_id,
+            expected = %entry.segment_name,
+            actual = %current_name,
+            "Segment name mismatch — follower may need resync"
+        );
 
-            // Recover in-place by switching to the leader-dictated segment stream.
-            // Without this, followers can stay pinned to a stale writer key and repeatedly
-            // fail append catch-up for the same divergent segment lineage.
-            topic_writer.writer =
-                open_or_create_leader_segment(&topic_dir, &entry.segment_name, entry.write_offset)?;
-            topic_writer.index_builder.clear();
-        }
+        // Recover in-place by switching to the leader-dictated segment stream.
+        // Without this, followers can stay pinned to a stale writer key and repeatedly
+        // fail append catch-up for the same divergent segment lineage.
+        topic_writer.writer =
+            open_or_create_leader_segment(&topic_dir, &entry.segment_name, entry.write_offset)?;
+        topic_writer.index_builder.clear();
     }
 
     // Check for Raft conflict even with cached writer (leader may have rolled back),

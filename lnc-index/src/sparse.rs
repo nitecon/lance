@@ -123,7 +123,7 @@ impl SparseIndexWriter {
     }
 
     pub fn maybe_add_entry(&mut self, sort_key: SortKey, byte_offset: u64) -> bool {
-        if self.record_count % self.interval == 0 {
+        if self.record_count.is_multiple_of(self.interval) {
             self.entries.push(IndexEntry::new(sort_key, byte_offset));
             self.record_count += 1;
             true

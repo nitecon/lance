@@ -245,12 +245,12 @@ pub fn read_segment_zero_copy(
     // Try zero-copy path first (mmap on Linux)
     // Uses Arc-based mmap sharing - no data copy, only refcount increment
     #[cfg(target_os = "linux")]
-    if reader.supports_zero_copy() {
-        if let Some(data) = reader.slice_bytes(offset, to_read) {
-            let next_offset = offset + to_read as u64;
-            lnc_metrics::increment_zero_copy_sends();
-            return Ok((data, next_offset));
-        }
+    if reader.supports_zero_copy()
+        && let Some(data) = reader.slice_bytes(offset, to_read)
+    {
+        let next_offset = offset + to_read as u64;
+        lnc_metrics::increment_zero_copy_sends();
+        return Ok((data, next_offset));
     }
 
     // Fallback: read into buffer

@@ -304,12 +304,12 @@ impl StandaloneConsumer {
         let mut client = LanceClient::connect(client_config).await?;
 
         // Resolve topic name to ID when the caller used the name-based constructor.
-        if config.topic_id == 0 {
-            if let Some(ref name) = config.topic_name.clone() {
-                validate_topic_name(name)?;
-                let topic_info = client.create_topic(name).await?;
-                config.topic_id = topic_info.id;
-            }
+        if config.topic_id == 0
+            && let Some(ref name) = config.topic_name.clone()
+        {
+            validate_topic_name(name)?;
+            let topic_info = client.create_topic(name).await?;
+            config.topic_id = topic_info.id;
         }
 
         Self::from_client(client, config).await
@@ -505,14 +505,14 @@ impl StandaloneConsumer {
 
     /// Check and perform auto-commit if interval has elapsed
     async fn maybe_auto_commit(&mut self) -> Result<()> {
-        if let Some(interval) = self.config.auto_commit_interval {
-            if self.last_commit_time.elapsed() >= interval {
-                if self.pending_offset > self.committed_offset {
-                    self.commit().await?;
-                } else {
-                    // Update time even if no commit needed
-                    self.last_commit_time = Instant::now();
-                }
+        if let Some(interval) = self.config.auto_commit_interval
+            && self.last_commit_time.elapsed() >= interval
+        {
+            if self.pending_offset > self.committed_offset {
+                self.commit().await?;
+            } else {
+                // Update time even if no commit needed
+                self.last_commit_time = Instant::now();
             }
         }
         Ok(())

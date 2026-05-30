@@ -1029,18 +1029,16 @@ impl ResyncActor {
             }
 
             // Bandwidth throttling
-            if self.config.max_bandwidth_bytes_per_sec > 0 {
-                if let Some(ref progress) = self.progress {
-                    if progress.transfer_rate_bps > self.config.max_bandwidth_bytes_per_sec as f64 {
-                        let overshoot = progress.transfer_rate_bps
-                            - self.config.max_bandwidth_bytes_per_sec as f64;
-                        let throttle_ms = (overshoot
-                            / self.config.max_bandwidth_bytes_per_sec as f64
-                            * 100.0) as u64;
-                        if throttle_ms > 0 {
-                            tokio::time::sleep(Duration::from_millis(throttle_ms.min(1000))).await;
-                        }
-                    }
+            if self.config.max_bandwidth_bytes_per_sec > 0
+                && let Some(ref progress) = self.progress
+                && progress.transfer_rate_bps > self.config.max_bandwidth_bytes_per_sec as f64
+            {
+                let overshoot =
+                    progress.transfer_rate_bps - self.config.max_bandwidth_bytes_per_sec as f64;
+                let throttle_ms =
+                    (overshoot / self.config.max_bandwidth_bytes_per_sec as f64 * 100.0) as u64;
+                if throttle_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(throttle_ms.min(1000))).await;
                 }
             }
         }

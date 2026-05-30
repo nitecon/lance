@@ -160,22 +160,22 @@ impl TieredStorageManager {
         // Ensure tier directories exist
         fs::create_dir_all(&config.hot.path)?;
 
-        if let Some(ref warm) = config.warm {
-            if warm.enabled {
-                fs::create_dir_all(&warm.path)?;
-            }
+        if let Some(ref warm) = config.warm
+            && warm.enabled
+        {
+            fs::create_dir_all(&warm.path)?;
         }
 
-        if let Some(ref cold) = config.cold {
-            if cold.enabled {
-                fs::create_dir_all(&cold.path)?;
-            }
+        if let Some(ref cold) = config.cold
+            && cold.enabled
+        {
+            fs::create_dir_all(&cold.path)?;
         }
 
-        if let Some(ref archive) = config.archive {
-            if archive.enabled {
-                fs::create_dir_all(&archive.path)?;
-            }
+        if let Some(ref archive) = config.archive
+            && archive.enabled
+        {
+            fs::create_dir_all(&archive.path)?;
         }
 
         Ok(Self { config })
@@ -278,10 +278,10 @@ impl TieredStorageManager {
         };
 
         // Check age threshold
-        if let Some(max_age) = tier_config.max_age {
-            if segment.age > max_age {
-                return true;
-            }
+        if let Some(max_age) = tier_config.max_age
+            && segment.age > max_age
+        {
+            return true;
         }
 
         false

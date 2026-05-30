@@ -368,18 +368,18 @@ impl AsyncQuorumManager {
     pub async fn record_nack(&self, write_id: u64, node_id: u16) {
         let mut shard = self.pending.shard_for(write_id).write().await;
 
-        if let Some(write) = shard.get_mut(&write_id) {
-            if let Some(result) = write.tracker.record_nack() {
-                tracing::warn!(
-                    target: "lance::replication",
-                    write_id,
-                    node_id,
-                    "Quorum failed - too many NACKs"
-                );
+        if let Some(write) = shard.get_mut(&write_id)
+            && let Some(result) = write.tracker.record_nack()
+        {
+            tracing::warn!(
+                target: "lance::replication",
+                write_id,
+                node_id,
+                "Quorum failed - too many NACKs"
+            );
 
-                if let Some(write) = shard.remove(&write_id) {
-                    let _ = write.result_tx.send(result);
-                }
+            if let Some(write) = shard.remove(&write_id) {
+                let _ = write.result_tx.send(result);
             }
         }
     }

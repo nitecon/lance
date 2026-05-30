@@ -681,11 +681,12 @@ impl GroupCoordinator {
         for (worker, old_topics) in existing {
             if assignments.contains_key(worker) {
                 for topic in old_topics {
-                    if topic_set.contains(topic) && !assigned.contains(topic) {
-                        if let Some(worker_topics) = assignments.get_mut(worker) {
-                            worker_topics.push(*topic);
-                            assigned.insert(*topic);
-                        }
+                    if topic_set.contains(topic)
+                        && !assigned.contains(topic)
+                        && let Some(worker_topics) = assignments.get_mut(worker)
+                    {
+                        worker_topics.push(*topic);
+                        assigned.insert(*topic);
                     }
                 }
             }
@@ -705,10 +706,10 @@ impl GroupCoordinator {
                 .min_by_key(|(_, topics)| topics.len())
                 .map(|(w, _)| w.clone());
 
-            if let Some(worker) = min_worker {
-                if let Some(worker_topics) = assignments.get_mut(&worker) {
-                    worker_topics.push(topic);
-                }
+            if let Some(worker) = min_worker
+                && let Some(worker_topics) = assignments.get_mut(&worker)
+            {
+                worker_topics.push(topic);
             }
         }
 

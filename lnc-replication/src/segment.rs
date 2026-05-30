@@ -721,13 +721,12 @@ impl SegmentManager {
     /// Find segment containing the given index
     pub fn find_segment(&self, index: u64) -> Option<(usize, usize)> {
         for (seg_idx, segment) in self.segments.iter().enumerate() {
-            if index >= segment.start_index() {
-                if let Some(end_idx) = segment.end_index() {
-                    if index <= end_idx {
-                        let local_offset = (index - segment.start_index()) as usize;
-                        return Some((seg_idx, local_offset));
-                    }
-                }
+            if index >= segment.start_index()
+                && let Some(end_idx) = segment.end_index()
+                && index <= end_idx
+            {
+                let local_offset = (index - segment.start_index()) as usize;
+                return Some((seg_idx, local_offset));
             }
         }
         None
@@ -787,10 +786,10 @@ impl SegmentManager {
 
         // Find segments that are entirely before to_index
         for (idx, segment) in self.segments.iter().enumerate() {
-            if let Some(end_idx) = segment.end_index() {
-                if end_idx < to_index {
-                    segments_to_remove.push(idx);
-                }
+            if let Some(end_idx) = segment.end_index()
+                && end_idx < to_index
+            {
+                segments_to_remove.push(idx);
             }
         }
 
@@ -886,10 +885,10 @@ impl SegmentManager {
                 // Update active segment index if we removed it
                 if Some(idx) == self.active_segment_idx {
                     self.active_segment_idx = None;
-                } else if let Some(active_idx) = self.active_segment_idx {
-                    if idx < active_idx {
-                        self.active_segment_idx = Some(active_idx - 1);
-                    }
+                } else if let Some(active_idx) = self.active_segment_idx
+                    && idx < active_idx
+                {
+                    self.active_segment_idx = Some(active_idx - 1);
                 }
             }
         }

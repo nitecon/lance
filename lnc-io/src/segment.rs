@@ -1109,19 +1109,19 @@ pub fn close_unclosed_segments(segments_dir: &Path) -> Result<Vec<PathBuf>> {
             continue;
         }
 
-        if path.extension().is_some_and(|ext| ext == "lnc") {
-            if let Some(filename) = path.file_stem().and_then(|s| s.to_str()) {
-                // Active segments don't have '-' in the name
-                if !filename.contains('-') {
-                    // Use current timestamp as end timestamp for unclosed segments
-                    let end_timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0);
+        if path.extension().is_some_and(|ext| ext == "lnc")
+            && let Some(filename) = path.file_stem().and_then(|s| s.to_str())
+        {
+            // Active segments don't have '-' in the name
+            if !filename.contains('-') {
+                // Use current timestamp as end timestamp for unclosed segments
+                let end_timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
 
-                    let new_path = rename_to_closed_segment(&path, end_timestamp)?;
-                    closed.push(new_path);
-                }
+                let new_path = rename_to_closed_segment(&path, end_timestamp)?;
+                closed.push(new_path);
             }
         }
     }

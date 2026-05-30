@@ -554,7 +554,7 @@ async fn producer_task(
                     Err(e) => {
                         let prev = m.total_errors.fetch_add(1, Ordering::Relaxed);
                         // Log first error and every 10000th to avoid spam
-                        if prev == 0 || prev % 10000 == 0 {
+                        if prev == 0 || prev.is_multiple_of(10000) {
                             warn!("send error (count={}): {}", prev + 1, e);
                         }
                         if matches!(e, lnc_client::ClientError::ServerBackpressure) {
@@ -564,7 +564,7 @@ async fn producer_task(
                 },
                 Err(_) => {
                     let prev = m.total_errors.fetch_add(1, Ordering::Relaxed);
-                    if prev == 0 || prev % 10000 == 0 {
+                    if prev == 0 || prev.is_multiple_of(10000) {
                         warn!(
                             "send timeout after {}s (count={})",
                             PRODUCE_TIMEOUT_SECS,

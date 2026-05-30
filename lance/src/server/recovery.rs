@@ -37,25 +37,24 @@ fn cleanup_empty_segments_recursive(dir: &std::path::Path) -> Result<()> {
             continue;
         }
 
-        if path.extension().is_some_and(|ext| ext == "lnc") {
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                if metadata.len() == 0 {
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        debug!(
-                            target: "lance::server",
-                            path = %path.display(),
-                            error = %e,
-                            "Failed to remove empty segment"
-                        );
-                    } else {
-                        removed_count += 1;
-                        debug!(
-                            target: "lance::server",
-                            path = %path.display(),
-                            "Removed empty segment file"
-                        );
-                    }
-                }
+        if path.extension().is_some_and(|ext| ext == "lnc")
+            && let Ok(metadata) = std::fs::metadata(&path)
+            && metadata.len() == 0
+        {
+            if let Err(e) = std::fs::remove_file(&path) {
+                debug!(
+                    target: "lance::server",
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to remove empty segment"
+                );
+            } else {
+                removed_count += 1;
+                debug!(
+                    target: "lance::server",
+                    path = %path.display(),
+                    "Removed empty segment file"
+                );
             }
         }
     }

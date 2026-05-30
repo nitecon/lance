@@ -98,14 +98,12 @@ pub fn find_next_segment_index(segments_dir: &std::path::Path) -> Result<u64> {
             let entry = entry?;
             let path = entry.path();
 
-            if path.extension().is_some_and(|ext| ext == "lnc") {
-                if let Some(filename) = path.file_stem().and_then(|s| s.to_str()) {
-                    if let Some(index_str) = filename.split('_').next() {
-                        if let Ok(index) = index_str.parse::<u64>() {
-                            max_index = Some(max_index.map_or(index, |cur: u64| cur.max(index)));
-                        }
-                    }
-                }
+            if path.extension().is_some_and(|ext| ext == "lnc")
+                && let Some(filename) = path.file_stem().and_then(|s| s.to_str())
+                && let Some(index_str) = filename.split('_').next()
+                && let Ok(index) = index_str.parse::<u64>()
+            {
+                max_index = Some(max_index.map_or(index, |cur: u64| cur.max(index)));
             }
         }
     }

@@ -673,10 +673,10 @@ pub async fn run(
                                     if let Ok(entries) = std::fs::read_dir(&local_data_dir) {
                                         for entry in entries.flatten() {
                                             let path = entry.path();
-                                            if path.extension().is_some_and(|ext| ext == "lnc") {
-                                                if let Ok(meta) = std::fs::metadata(&path) {
-                                                    total += meta.len();
-                                                }
+                                            if path.extension().is_some_and(|ext| ext == "lnc")
+                                                && let Ok(meta) = std::fs::metadata(&path)
+                                            {
+                                                total += meta.len();
                                             }
                                         }
                                     }
@@ -736,47 +736,44 @@ pub async fn run(
 
                         // Proactively request bulk resync from current leader to recover
                         // any missed data-plane events from channel lag.
-                        if !resync_actor.is_active() {
-                            if let Some(leader_id) = event_coord.leader_id().await {
-                                if leader_id != event_config.node_id {
-                                    let throttled = last_resync_leader == Some(leader_id)
-                                        && last_resync_attempt
-                                            .is_some_and(|t| t.elapsed() < resync_min_interval);
-                                    if throttled {
-                                        debug!(
-                                            target: "lance::resync",
-                                            skipped = n,
-                                            leader_id,
-                                            min_retry_secs = resync_min_interval.as_secs(),
-                                            "Skipping lag-triggered resync (cooldown active)"
-                                        );
-                                        continue;
-                                    }
+                        if !resync_actor.is_active()
+                            && let Some(leader_id) = event_coord.leader_id().await
+                            && leader_id != event_config.node_id
+                        {
+                            let throttled = last_resync_leader == Some(leader_id)
+                                && last_resync_attempt
+                                    .is_some_and(|t| t.elapsed() < resync_min_interval);
+                            if throttled {
+                                debug!(
+                                    target: "lance::resync",
+                                    skipped = n,
+                                    leader_id,
+                                    min_retry_secs = resync_min_interval.as_secs(),
+                                    "Skipping lag-triggered resync (cooldown active)"
+                                );
+                                continue;
+                            }
 
-                                    if let Some(leader_repl_addr) =
-                                        event_coord.peer_addr(leader_id).await
-                                    {
-                                        warn!(
-                                            target: "lance::resync",
-                                            skipped = n,
-                                            leader_id,
-                                            leader_addr = %leader_repl_addr,
-                                            "Lagged apply receiver - initiating follower bulk resync"
-                                        );
-                                        last_resync_attempt = Some(Instant::now());
-                                        last_resync_leader = Some(leader_id);
-                                        if let Err(e) =
-                                            resync_actor.initiate_resync(leader_repl_addr, 0).await
-                                        {
-                                            warn!(
-                                                target: "lance::resync",
-                                                skipped = n,
-                                                error = %e,
-                                                "Bulk resync after lagged receiver failed"
-                                            );
-                                            resync_actor.reset();
-                                        }
-                                    }
+                            if let Some(leader_repl_addr) = event_coord.peer_addr(leader_id).await {
+                                warn!(
+                                    target: "lance::resync",
+                                    skipped = n,
+                                    leader_id,
+                                    leader_addr = %leader_repl_addr,
+                                    "Lagged apply receiver - initiating follower bulk resync"
+                                );
+                                last_resync_attempt = Some(Instant::now());
+                                last_resync_leader = Some(leader_id);
+                                if let Err(e) =
+                                    resync_actor.initiate_resync(leader_repl_addr, 0).await
+                                {
+                                    warn!(
+                                        target: "lance::resync",
+                                        skipped = n,
+                                        error = %e,
+                                        "Bulk resync after lagged receiver failed"
+                                    );
+                                    resync_actor.reset();
                                 }
                             }
                         }
@@ -1039,7 +1036,7 @@ pub async fn run(
 
                 // Re-resolve peer DNS every 30s (60 ticks × 500ms) to handle pod IP changes
                 dns_refresh_counter += 1;
-                if dns_refresh_counter % 60 == 0 {
+                if dns_refresh_counter.is_multiple_of(60) {
                     coord_for_watcher.refresh_peer_addresses().await;
                 }
 

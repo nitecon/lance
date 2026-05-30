@@ -280,18 +280,18 @@ fn run_ingestion_actor_sync(
                     let write_done_tx = request.write_done_tx.take();
 
                     // WAL-first append
-                    if let Some(ref mut w) = wal {
-                        if let Err(e) = w.append(&payload) {
-                            tracing::error!(
-                                target: "lance::ingestion",
-                                actor_id,
-                                topic_id,
-                                error = %e,
-                                "WAL append failed — dropping request"
-                            );
-                            drop(write_done_tx);
-                            continue;
-                        }
+                    if let Some(ref mut w) = wal
+                        && let Err(e) = w.append(&payload)
+                    {
+                        tracing::error!(
+                            target: "lance::ingestion",
+                            actor_id,
+                            topic_id,
+                            error = %e,
+                            "WAL append failed — dropping request"
+                        );
+                        drop(write_done_tx);
+                        continue;
                     }
 
                     match process_request_sync(
@@ -479,29 +479,29 @@ fn flush_and_signal_sync(
     }
 
     // Sync WAL before segment fsyncs (batched, not per-append)
-    if let Some(w) = wal {
-        if let Err(e) = w.sync() {
-            tracing::error!(
-                target: "lance::ingestion",
-                error = %e,
-                "WAL batch sync failed"
-            );
-        }
+    if let Some(w) = wal
+        && let Err(e) = w.sync()
+    {
+        tracing::error!(
+            target: "lance::ingestion",
+            error = %e,
+            "WAL batch sync failed"
+        );
     }
     // If WAL is enabled and synced above, segment fsync is redundant on the ACK
     // hot path. Crash recovery can replay WAL + committed Raft log to rebuild
     // segment bytes, so we preserve durability while avoiding duplicate flush cost.
     if wal.is_none() {
         for topic_id in dirty_topics.iter() {
-            if let Some(tw) = topic_writers.get_mut(topic_id) {
-                if let Err(e) = tw.writer.fsync() {
-                    tracing::error!(
-                        target: "lance::ingestion",
-                        topic_id,
-                        error = %e,
-                        "Batch fsync failed"
-                    );
-                }
+            if let Some(tw) = topic_writers.get_mut(topic_id)
+                && let Err(e) = tw.writer.fsync()
+            {
+                tracing::error!(
+                    target: "lance::ingestion",
+                    topic_id,
+                    error = %e,
+                    "Batch fsync failed"
+                );
             }
         }
     }
